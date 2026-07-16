@@ -1,33 +1,156 @@
+<div align="center">
+
 # LumiMind
 
-Timeline-aware subjective minds for Lumiverse 1.0.6 and newer.
+**Timeline-aware subjective minds for Lumiverse.**
 
-LumiMind is a Lumiverse Spindle extension that maintains private, branch-aware mental continuity for character cards, the active persona, and named NPCs. It analyzes committed turns in the background, folds immutable controller deltas into the current timeline, and injects a compact private-state checkpoint before the next generation.
+[![Version](https://img.shields.io/badge/version-0.1.0-8b7cf6)](./spindle.json)
+[![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
+[![Status](https://img.shields.io/badge/status-beta-e6a45a)](https://github.com/Archkr/Lumiverse-LumiMind)
+[![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
 
-Chats are inactive until you explicitly enable them. Beliefs and secrets are collapsed in Mind Lens by default.
+*Let every character remember the same scene differently.*
 
-## What v0.1 includes
+</div>
 
-- Per-chat actor registry with stable character/persona IDs and timeline-local NPC UUIDs.
-- Optional persona minds for players who want LumiMind to model the active persona; disable them when the persona is exclusively player-controlled.
-- Actor-card and director-card roleplay modes. Director mode manages the named cast portrayed by the card without assigning a mind to the host card itself.
-- Subjective beliefs, secrets, goals, plans, emotions, relationships, awareness, and enduring core traits.
-- Evidence, confidence, message index, swipe, source, lock, and pin metadata for every mind entry.
-- Deterministic timeline replay across edits, deletions, swipe navigation, and forks.
-- Background controller analysis with tolerant structured-output parsing.
-- Explicit first-scene bootstrapping plus one bounded corrective pass when a substantive batch produces no usable mental-state changes.
-- Cached, generation-free prompt interception with an approximately 1,600-token default budget.
-- Mind Lens drawer with Cast, Scene, Changes, and Settings views.
-- Spoiler-safe beliefs and secrets, editable state, actor identity tools, provenance, pause/retry/rebuild, and live capability status.
-- Mind Seed character-editor tab with transient card baselines and review-before-save controller drafts.
-- Optional Memory Cortex identity import and confirmed-identity writeback.
-- Public and opt-in private shared RPC scene snapshots.
+LumiMind gives characters private, evolving points of view.
+
+One character can trust a lie. Another can notice the truth but keep it secret. A third can leave the room without magically learning what happened afterward. LumiMind follows those differences across the conversation and gives the model a compact reminder of what each character currently believes, wants, fears, notices, and conceals.
+
+It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
+
+> **Beta note:** LumiMind `0.1.0` is an early release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
+
+> **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
+
+---
+
+## Table of contents
+
+1. [At a glance](#at-a-glance)
+2. [Why LumiMind](#why-lumimind)
+3. [How it works](#how-it-works)
+4. [Compatibility](#compatibility)
+5. [Installation](#installation)
+6. [Quick start](#quick-start)
+7. [Choose your roleplay style](#choose-your-roleplay-style)
+8. [Mind Lens](#mind-lens)
+9. [Mind Seed](#mind-seed)
+10. [Timeline behavior](#timeline-behavior)
+11. [Settings reference](#settings-reference)
+12. [Controller usage and cost](#controller-usage-and-cost)
+13. [Permissions](#permissions)
+14. [Privacy](#privacy)
+15. [Extension interoperability](#extension-interoperability)
+16. [Tips](#tips)
+17. [Troubleshooting](#troubleshooting)
+18. [Development](#development)
+19. [License](#license)
+
+---
+
+## At a glance
+
+| | |
+|---|---|
+| **Subjective continuity** | Tracks what each actor personally believes, including uncertainty and false beliefs. |
+| **Evolving inner state** | Maintains emotions, goals, plans, fears, relationships, secrets, attention, and awareness. |
+| **Independent cast** | Supports character cards, the active persona, and named NPCs with separate identities. |
+| **Two card styles** | Use a card as one in-world actor or as a director that portrays many characters. |
+| **Player control** | Persona minds are optional. Turn them off when the player alone controls the persona. |
+| **Timeline aware** | Reconciles edits, deletions, swipes, regenerations, and chat forks. |
+| **Spoiler-safe lens** | Beliefs and secrets stay collapsed until you deliberately reveal them. |
+| **Editable state** | Correct, pin, lock, merge, split, rename, or remove inferred information. |
+| **Background analysis** | Uses a controller after committed turns without blocking normal generation. |
+| **Private injection** | Adds one compact cached system message before generation; the interceptor makes no model call. |
+| **Diagnostics** | Produces a privacy-safe report for controller and timeline troubleshooting. |
+
+---
+
+## Why LumiMind
+
+Most roleplay context describes the world from a shared, mostly objective point of view. That works until characters begin to disagree.
+
+Without separate minds, a model may:
+
+- let a character know something they never witnessed;
+- forget that a lie was believed;
+- reveal a secret without motivation;
+- flatten a complicated relationship back into a generic attitude;
+- abandon a goal between replies;
+- treat every character portrayed by a director card as one blended personality.
+
+LumiMind keeps a different continuity record for each actor. The model still writes the story, but it receives a small scene-specific reminder of the cast members whose inner state matters right now.
+
+The controller is evidence-bound. It may infer strong subtext, motives, emotions, or likely beliefs, but it is instructed not to invent objective events.
+
+---
+
+## How it works
+
+```text
+Completed turn
+      │
+      ▼
+Background controller analysis
+      │
+      ├── Aster believes the warning
+      ├── Mira suspects it is a trap
+      └── Rowan never heard it
+      │
+      ▼
+Branch-aware timeline checkpoint
+      │
+      ▼
+Next generation receives only the relevant compact minds
+```
+
+1. **You activate a chat.** New chats remain off until you explicitly enable them.
+2. **LumiMind reads committed history.** Existing messages are initialized in bounded background batches.
+3. **The controller returns evidence-linked changes.** Each accepted entry records its source message, swipe, confidence, and provenance.
+4. **The timeline is folded deterministically.** Current minds are rebuilt from the compatible records on the active branch.
+5. **The next reply gets a cached checkpoint.** LumiMind injects the target mind plus relevant scene actors—or an ensemble cast in Director mode.
+6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them.
+
+If a substantive batch produces no usable mental state, LumiMind performs at most one focused corrective pass. Continued empty or malformed results are surfaced in Mind Lens instead of being silently treated as healthy.
+
+---
+
+## Compatibility
+
+| Requirement | Value |
+|---|---|
+| Lumiverse | `1.0.6` or newer |
+| Extension version | `0.1.0` beta |
+| Required for automatic analysis | `generation`, `chat_mutation` |
+| Required for prompt injection | `interceptor` |
+| Controller connection | Dedicated connection or the active chat connection |
+| Build output | Committed `dist/backend.js` and `dist/frontend.js` |
+
+LumiMind degrades by capability. Optional identity, seed, and Memory Cortex features disappear when their permissions are unavailable without breaking normal Lumiverse chat.
+
+---
 
 ## Installation
 
-Install the repository URL from Lumiverse's Extensions panel, then grant the permissions needed for the features you want. The committed `dist/` directory allows Lumiverse to load the extension without building it during installation.
+### Install from GitHub
 
-For local development:
+```text
+1. Copy:    https://github.com/Archkr/Lumiverse-LumiMind
+2. Open:    Lumiverse → Extensions → Install
+3. Paste:   the URL into the repository field
+4. Press:   Install
+5. Enable:  LumiMind and grant the permissions you want to use
+6. Verify:  Mind Lens appears in the drawer and command palette
+```
+
+No local build is required for a normal installation because the release-ready `dist/` bundles are committed.
+
+### Update
+
+Use the update action on LumiMind’s entry in Lumiverse’s Extensions panel, then reload the extension if Lumiverse asks you to.
+
+### Local development checkout
 
 ```bash
 bun install
@@ -36,157 +159,461 @@ bun run test
 bun run build
 ```
 
-The manifest is [`spindle.json`](./spindle.json). Both runtime bundles are written to `dist/` and are intended to be committed.
+After rebuilding, reload LumiMind from Lumiverse. Development changes belong in the repository; do not edit an installed extension copy.
 
-## First use
+---
 
-1. Open a chat.
-2. Open **Mind Lens** from the Lumiverse drawer or command palette.
-3. Select **Activate Mind Lens**.
-4. LumiMind initializes the existing transcript in the background. Normal generation remains available while it works.
-5. Review the Cast and Scene views. Beliefs and secrets stay collapsed until you deliberately open them.
+## Quick start
 
-Activated forks inherit activation and compatible analysis through the fork point. Unrelated chats do not automatically share discovered NPC identities.
+| Step | Action | Where |
+|---|---|---|
+| 1 | Open a character or group chat | Lumiverse |
+| 2 | Open **Mind Lens** | Drawer or `Ctrl+K` |
+| 3 | Choose **Activate Mind Lens** | Mind Lens |
+| 4 | Select a controller connection, or keep the active-connection fallback | Settings |
+| 5 | Choose whether LumiMind may manage your persona | Settings → Roleplay behavior |
+| 6 | Enable Director mode if the card portrays a cast instead of itself | Settings → Roleplay behavior |
+| 7 | Let initialization finish while you continue chatting normally | Changes / status bar |
+| 8 | Review the resolved cast and current scene | Cast / Scene |
+
+Activated forks inherit activation and compatible analysis through the fork point. An unrelated chat receives its own timeline and does not automatically share discovered NPC identities.
+
+---
+
+## Choose your roleplay style
+
+LumiMind supports the two most common card patterns without asking you to restructure your cards.
+
+### Actor card — default
+
+Use this when the active character card represents one in-world character.
+
+- The card receives its own mind.
+- Solo and group generations target the exact selected character.
+- Roughly 60% of the prompt budget is reserved for that target.
+- Present secondary actors share the remaining space.
+
+### Director card
+
+Enable **Character card acts as director** when the card is a narrator, scenario engine, or multi-character director.
+
+- The host card is not treated as an in-world mind.
+- Named individuals portrayed inside assistant messages become independent NPC actors.
+- The normal target injection becomes an ensemble injection for the currently relevant cast.
+- The **Secondary actors** setting becomes **Director cast actors** and controls the ensemble size.
+
+### Persona control
+
+**Manage the active persona** is enabled by default for users who want persona continuity and impersonation support.
+
+Turn it off when you alone control the persona:
+
+- LumiMind stops analyzing or displaying a persona mind.
+- The persona is excluded from private state injection.
+- Impersonation receives no LumiMind persona injection.
+- Other characters may still hold beliefs and relationships about the persona.
+- The injected guidance tells the model not to decide the persona’s thoughts, feelings, dialogue, or actions.
+
+Changing either roleplay option invalidates the previous analysis policy. Activated timelines rebuild under the new policy when opened. Reviewed seeds and locked manual edits remain stored; controller-derived state is recomputed from committed history.
+
+---
 
 ## Mind Lens
 
-The drawer has four views:
+Mind Lens is LumiMind’s main drawer interface.
 
-- **Cast** — actor registry, core self, mental-state sections, evidence, confidence, lock/pin controls, and identity management.
-- **Scene** — actors marked present and their current non-spoiler attention, emotion, relationship, goal, plan, and awareness signals.
-- **Changes** — per-message analysis records, swipe provenance, checkpoint freshness, pause/resume, retry, and rebuild controls.
-- **Settings** — controller connection, analysis and injection budgets, privacy controls, Cortex behavior, interoperability, and live permissions.
+<details open>
+<summary><b>Cast</b> &mdash; inspect and correct individual minds</summary>
 
-Settings also includes a **Diagnostics** window. It summarizes frontend context, live permissions, controller availability, timeline health, aggregate actor/mind counts, recent analysis metadata, accepted mention/change counts, corrective attempts, normalization drops, and privacy-safe response lengths/hashes. **Copy report** produces formatted JSON suitable for a bug report while excluding story text, beliefs, secrets, raw controller output, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
+- Browse every managed card, persona, and discovered NPC.
+- Review core self-concept, values, desires, fears, and boundaries.
+- Inspect beliefs, secrets, goals, plans, emotions, relationships, and awareness.
+- See confidence, evidence, source message, and swipe provenance.
+- Add or edit state manually; user-authored entries are locked and pinned by default.
+- Rename actors, add aliases, confirm identities, merge duplicates, split mistakes, or remove actors from the timeline.
 
-When a substantive batch still produces no usable state after the corrective pass, Mind Lens shows an analysis-quality warning even though the compatible timeline checkpoint is technically current. Rebuild reruns committed history with the latest extraction rules.
+</details>
 
-User edits become locked manual overrides. Controller analysis cannot overwrite a locked item until it is unlocked.
+<details>
+<summary><b>Scene</b> &mdash; see who matters right now</summary>
 
-### Roleplay behavior
+- Shows actors currently marked present.
+- Summarizes non-spoiler attention and active signals.
+- Keeps beliefs and secrets out of the overview.
+- Falls back to the wider cast when no one has been marked present yet.
 
-- **Manage the active persona** — when enabled, LumiMind may track the persona's subjective state and inject it during impersonation. When disabled, the persona remains context for other characters but receives no managed mind or prompt injection.
-- **Character card acts as director** — when disabled, the host card is treated as the primary in-world actor. When enabled, the card is treated as a narrator/director and LumiMind instead tracks the individual named characters it portrays.
+</details>
 
-Changing either option invalidates the affected analysis policy. Activated timelines rebuild under the new mode when opened. Reviewed seeds and locked manual work remain stored; controller-inferred state is recomputed from committed history under the new policy.
+<details>
+<summary><b>Changes</b> &mdash; follow timeline health and controller results</summary>
 
-Actor tools support rename, alias add/remove, confirm, merge, split, timeline removal, and optional identity-only Cortex publication. Removing an actor from LumiMind does not delete a character card, persona, or Cortex entity.
+- View committed analysis records by message and swipe.
+- See accepted actor mentions, state changes, and quality warnings.
+- Pause or resume automatic analysis.
+- Retry a failed or stale suffix.
+- Rebuild committed history under the current rules and roleplay mode.
+
+</details>
+
+<details>
+<summary><b>Settings</b> &mdash; controller, roleplay, privacy, and diagnostics</summary>
+
+- Choose the controller connection and token budgets.
+- Toggle persona management and Director mode.
+- Configure spoiler safety and Memory Cortex behavior.
+- Enable private extension interoperability when desired.
+- Review live permission availability.
+- Open the privacy-safe Diagnostics window.
+
+</details>
+
+### Spoiler safety
+
+Beliefs and secrets are collapsed by default. They are revealed only when you deliberately open those sections.
+
+This protects the reading experience, not the files on disk. See [Privacy](#privacy).
+
+### Diagnostics
+
+Open **Mind Lens → Settings → Diagnostics** to inspect:
+
+- frontend and active-chat context;
+- granted permissions;
+- controller availability and provider metadata;
+- timeline freshness and health;
+- aggregate actor, mind, and record counts;
+- raw-versus-normalized structured-output counts;
+- accepted mentions and mental-state changes;
+- corrective attempts and retry failures;
+- privacy-safe response lengths and hashes.
+
+**Copy report** produces formatted JSON suitable for a bug report. It excludes story text, beliefs, secrets, raw controller output, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
+
+---
 
 ## Mind Seed
 
-The **Mind Seed** tab appears in Lumiverse's character editor when the `characters` permission is granted.
+Mind Seeds provide reusable starting characterization before timeline-specific events begin.
 
-- Without a reviewed seed, character description, personality, and creator notes form a transient baseline.
-- **Generate draft** asks the configured controller to extract enduring characterization from the card.
-- Generated drafts remain local to the open editor until you choose **Save reviewed seed**.
-- Reviewed data is stored at `character.extensions.lumi_mind.seed.v1`.
-- Removing a reviewed seed restores transient card-field fallback for future timelines; it does not erase existing chat history.
+Open a character’s editor, then scroll the top tab strip to the far right. **Mind Seed** appears after **Advanced** when the `characters` permission is granted.
 
-## Permissions and graceful degradation
+| Action | Behavior |
+|---|---|
+| No reviewed seed | Character description, personality, and creator notes form a transient baseline. |
+| **Generate draft** | The controller extracts an editable draft from the card fields. Nothing is saved automatically. |
+| **Save reviewed seed** | Stores the reviewed seed at `character.extensions.lumi_mind.seed.v1`. |
+| Remove reviewed seed | Future timelines return to transient card-field fallback; existing chat history remains intact. |
 
-| Permission | Used for | When unavailable |
-| --- | --- | --- |
-| `generation` | Quiet controller analysis and seed drafts | Analysis and draft generation show an inactive state. |
-| `interceptor` | Private checkpoint injection | No prompt injection is attempted. |
-| `chats` | Active chat/card enrichment | Timeline UI remains scoped to context supplied by the frontend. |
-| `chat_mutation` | Reading committed history and private RPC gating | Timeline analysis is disabled; the extension does not break normal chat. |
-| `characters` | Stable card identities and Mind Seed editing | Character enrichment and the editor tab are unavailable. |
+Seeds are for enduring characterization. Timeline state is for what this particular version of the character has experienced, inferred, and decided in one chat branch.
+
+---
+
+## Timeline behavior
+
+LumiMind is designed for conversations that do not stay perfectly linear.
+
+| Event | What LumiMind does |
+|---|---|
+| New committed turn | Analyzes the new suffix in the background. |
+| Regeneration or swipe | Restores a compatible cached checkpoint when possible and replays the affected suffix when needed. |
+| Message edit | Invalidates analysis from the earliest changed message forward. |
+| Message deletion | Rebuilds from the earliest affected point. |
+| Chat fork | Copies compatible records through the fork point, preserves actor IDs, then evolves independently. |
+| Rapid changes | Coalesces work through one serialized queue per chat. |
+| Controller delay | Keeps normal generation available and uses the last valid checkpoint. |
+| Controller error | Exposes stale/error status and retains recoverable state. |
+
+Controller results are stored as evidence-linked deltas rather than one repeatedly rewritten state blob. Manual locked edits are folded on top and survive deterministic rebuilds.
+
+---
+
+## Settings reference
+
+LumiMind settings are user-scoped and apply across chats.
+
+### Roleplay behavior
+
+| Setting | Default | What it does |
+|---|---:|---|
+| Manage the active persona | On | Allows persona analysis, display, secondary state, and impersonation injection. |
+| Character card acts as director | Off | Excludes host card minds and manages the named cast portrayed by the card. |
+
+### Analysis and injection
+
+| Setting | Default | What it does |
+|---|---:|---|
+| Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
+| Temperature | `0.1` | Sampling temperature for background controller calls. |
+| Analysis output tokens | `1,800` | Maximum controller output budget per analysis call. |
+| Injection token budget | `1,600` | Approximate cap for the private cached prompt block. |
+| Secondary actors | `4` | Maximum additional actor minds in Actor-card mode. |
+| Director cast actors | `4` | Maximum ensemble minds in Director-card mode; minimum `1`. |
+
+### Privacy and interoperability
+
+| Setting | Default | What it does |
+|---|---:|---|
+| Spoiler-safe lens | On | Collapses beliefs and secrets in Mind Lens. |
+| Import Cortex identities | On | Imports character entity names and aliases for identity resolution. |
+| Cortex identity writeback | Off | Publishes only confirmed identity and aliases—never private mind state. |
+| Private extension interop | Off | Registers the permission-gated private scene snapshot. |
+
+---
+
+## Controller usage and cost
+
+LumiMind normally makes one quiet controller call after each newly committed turn.
+
+Additional calls can occur when:
+
+- activating a chat with existing history;
+- rebuilding a timeline;
+- replaying edits, deletions, or changed swipes;
+- changing Persona or Director policy;
+- retrying transient failures;
+- running one corrective pass after a substantive but empty result;
+- generating a Mind Seed draft.
+
+Initial history is analyzed in bounded batches. You can pause a timeline whenever you do not want background analysis costs.
+
+The prompt interceptor itself makes **no model call**. It only reads the latest valid cached checkpoint and adds one compact system message. Prompt Breakdown attributes that block as **LumiMind — Private Mind**.
+
+LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to the active connection for the chat. It uses Lumiverse connection profiles and does not read or store API credentials.
+
+---
+
+## Permissions
+
+| Permission | Used for | If unavailable |
+|---|---|---|
+| `generation` | Background analysis, connection listing, and Mind Seed drafts | Controller features become inactive. |
+| `interceptor` | Private checkpoint injection before generation | Analysis can remain stored, but no mind block is injected. |
+| `chats` | Active chat and card routing | Host enrichment is limited to context supplied elsewhere. |
+| `chat_mutation` | Read-only access to committed raw message history and private RPC gating | Automatic timeline analysis is disabled. |
+| `characters` | Stable card identity, reviewed seeds, and Mind Seed editor tab | Card enrichment and seed editing are unavailable. |
 | `personas` | Stable active-persona identity | Persona enrichment is unavailable. |
-| `memories` | Optional Cortex identity import/writeback | The independent actor registry remains fully functional. |
+| `memories` | Optional Memory Cortex identity import and writeback | The independent actor registry continues to work. |
 
-Permissions are checked live. Granting or revoking access updates Mind Lens without requiring a data reset.
+Despite the `chat_mutation` permission name, LumiMind does not edit, delete, hide, append, or swipe Lumiverse chat messages. It reads committed history and stores its own extension timeline separately.
 
-## Controller selection and cost
+Permissions are checked live. Denying an optional permission should remove only the dependent capability rather than breaking Lumiverse.
 
-LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to Lumiverse's active connection for the chat.
+---
 
-Defaults:
+## Privacy
 
-- Temperature: `0.1`
-- Maximum analysis output: approximately `1,800` tokens
-- Prompt injection budget: approximately `1,600` tokens
-- Secondary actors: up to `4`
-- Initial-history rebuilds: bounded batches
+LumiMind stores:
 
-Controller analysis normally runs once per newly committed turn. If a substantive batch returns no accepted mental-state changes, LumiMind makes at most one corrective call focused on evidence-bound bootstrap extraction. Rebuilds, edits, swipe changes, initial history, and corrective passes can therefore create additional calls. Pause a timeline when you do not want background analysis costs.
+- user-scoped global settings;
+- per-chat actor registries and timeline records;
+- inferred and manually edited mental-state entries;
+- reviewed Mind Seeds on their character cards;
+- privacy-safe diagnostics metadata.
 
-The interceptor never performs a model call. When analysis is pending, it uses the last valid folded checkpoint.
+LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to the Lumiverse data directory or exported character extension data may be able to read stored minds and seeds.
 
-## Privacy model
+### Memory Cortex
 
-LumiMind stores settings and timelines in user-scoped extension storage. Reviewed seeds live on their character cards.
+- Identity import is optional and uses character entity names and aliases for resolution.
+- Writeback is disabled by default.
+- When explicitly enabled, writeback is limited to user-confirmed actor identities and aliases.
+- Beliefs, secrets, goals, plans, emotions, relationships, evidence, and private scene state are never written to Cortex.
 
-Private state is ordinary JSON, not cryptographically encrypted. Anyone with direct access to the Lumiverse data directory or character-card extension data may be able to read it.
+### Controller data
 
-Cortex writeback is disabled by default. When enabled, LumiMind publishes only user-confirmed actor names and aliases. It never writes beliefs, secrets, goals, plans, emotions, relationships, or private scene state to Cortex.
+The selected controller receives recent transcript context, the analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
 
-Private shared RPC is also disabled by default and requires `chat_mutation` when enabled.
+Diagnostics store counts, lengths, hashes, provider metadata, and warning codes—not raw controller responses or private story content.
 
-## Prompt behavior
+---
 
-Before generation, LumiMind resolves the exact target actor captured by `GENERATION_STARTED`:
+## Extension interoperability
 
-- Solo/group character generation targets the selected character card.
-- Impersonation targets the active persona.
-- The target receives roughly 60% of the available compact-state budget.
-- Present/relevant secondary actors share the remainder.
+LumiMind publishes shared RPC snapshots so other extensions can use scene context without reading LumiMind’s storage format.
 
-The injected system message tells the model that beliefs are subjective, private state must not be quoted, and secrets should emerge only through character-motivated behavior. Prompt Breakdown attributes it as **LumiMind — Private Mind**.
+| Endpoint | Access | Contents |
+|---|---|---|
+| `lumi_mind.contract.v1` | Public | Schema version, capabilities, and endpoint metadata. |
+| `lumi_mind.scene.current` | Public | Active chat, revision, freshness, actor identities, aliases, presence, and public stance. |
+| `lumi_mind.scene.private` | Opt-in, requires `chat_mutation` | Compact private beliefs, secrets, goals, and relationships. |
 
-## Shared RPC interoperability
+Every scene snapshot includes `chatId`, `revision`, and `schemaVersion: 1`. Consumers should reject unsupported schemas, snapshots for another active chat, or revisions older than the newest one already accepted.
 
-Spindle namespaces these endpoints under the `lumi_mind` manifest identifier:
+If LumiMind is missing, permission-gated, disabled, or stale, LumiWorld, Lore Recall, and future extensions should continue without LumiMind data.
 
-- `lumi_mind.contract.v1` — schema version, capabilities, and endpoint metadata.
-- `lumi_mind.scene.current` — public actor identity, aliases, presence, confirmation, and public stance. Readable without delegated permissions.
-- `lumi_mind.scene.private` — compact private minds. Registered only when private interoperability is enabled and gated by `chat_mutation`.
+---
 
-Every scene snapshot includes `chatId`, `revision`, and `schemaVersion: 1`. Consumers such as LumiWorld, LoreRecall, and future extensions should reject snapshots with an unsupported schema, a different active chat, or an older revision than the newest value they have already accepted. If an endpoint is missing or rejected, consumers should continue without LumiMind data.
+## Tips
+
+> **Start with one short chat.** Activate LumiMind on a small transcript before rebuilding a long-running roleplay. This confirms that your controller returns usable structured state.
+
+> **Use Director mode for scenario cards.** If the card narrates several named characters, enabling Director mode prevents their motives from collapsing into the card’s identity.
+
+> **Turn persona management off if authorship matters.** Other characters can still react to the player; LumiMind simply stops assigning the player an internal state or injecting instructions for it.
+
+> **Treat beliefs as beliefs.** Correct a mind when the character would not reasonably know something. Do not “fix” a false belief merely because you know the objective truth.
+
+> **Lock deliberate corrections.** Manual edits are locked automatically. Keep them locked when the controller should not reinterpret them.
+
+> **Confirm identities before Cortex writeback.** Merge duplicates and review aliases first. Writeback is intentionally identity-only.
+
+> **Watch Changes after switching controllers.** Different providers vary in structured-output reliability. The quality banner and Diagnostics report show whether entries were dropped or a corrective pass was needed.
+
+---
 
 ## Troubleshooting
 
-**Mind Lens says access is missing**
+<details>
+<summary><b>Mind Lens says access is missing</b></summary>
 
-Open Lumiverse Settings → Extensions and grant the permissions named in the inactive state.
+Open **Lumiverse → Settings → Extensions**, select LumiMind, and grant the permissions listed in the inactive state.
 
-**A timeline is stale or in error**
+Automatic analysis needs `generation` and `chat_mutation`. Prompt injection additionally needs `interceptor`.
 
-Open Changes and choose **Retry**. Use **Rebuild** when transcript history changed substantially or a controller response was malformed. Manual locked edits remain applied.
+</details>
 
-**The timeline is current but contains no mind entries**
+<details>
+<summary><b>The timeline is current but contains no mind entries</b></summary>
 
-Mind Lens reports this separately as an analysis-quality warning. Open Diagnostics to compare raw and accepted structured-output counts, then use **Rebuild analysis** to run the current bootstrap and corrective-pass rules over committed history.
+Mind Lens treats a technically compatible but suspiciously empty result as an analysis-quality problem.
 
-**No controller connection appears**
+1. Open **Settings → Diagnostics**.
+2. Compare raw, normalized, and final accepted counts.
+3. Check whether the corrective pass ran or failed.
+4. Choose **Rebuild analysis** from the warning or Changes view.
+5. If it remains empty, try a controller with stronger structured-output support and copy the sanitized report for a bug report.
 
-Grant `generation`, configure a Lumiverse connection, then refresh Mind Lens. Leaving the selector on its default uses the chat's active connection.
+</details>
 
-**A character has the wrong identity**
+<details>
+<summary><b>The timeline is stale or in error</b></summary>
 
-Use actor tools to rename, add an alias, merge duplicates, or split an ambiguous actor. Confirm an NPC only after reviewing it.
+Open **Changes** and choose **Retry**. Use **Rebuild** when committed history changed substantially, a roleplay mode changed, or the controller repeatedly returned malformed output.
 
-**Secrets are visible in storage**
+Locked manual edits remain applied.
 
-Spoiler-safe mode is a UI disclosure control, not encryption. This is expected in v0.1.
+</details>
 
-**Prompt injection is missing**
+<details>
+<summary><b>Prompt injection is missing</b></summary>
 
-Confirm that the chat is active, not paused, `interceptor` is granted, and the target character/persona exists in the actor registry. Check Prompt Breakdown for **LumiMind — Private Mind**.
+Check that:
 
-**Support needs more detail**
+- the chat is activated and not paused;
+- `interceptor` is granted;
+- analysis has produced a valid checkpoint;
+- Actor-card mode has the correct target card in the registry;
+- Director mode has discovered at least one portrayed cast member;
+- persona management is enabled if you expect impersonation injection.
 
-Open Mind Lens → Settings → Diagnostics, choose **Refresh snapshot**, then **Copy report**. The copied JSON is sanitized and does not include private story or mind content.
+Open Prompt Breakdown and look for **LumiMind — Private Mind**.
 
-## Development layout
+</details>
 
-- `src/backend.ts` — event coordination, queueing, persistence, RPC, and interception.
-- `src/controller.ts` — prompts, provider-specific structured output, and tolerant parsing.
-- `src/engine.ts` — actor resolution, immutable records, reducer, ranking, and compaction.
-- `src/frontend.ts` — Mind Lens and Mind Seed host integration.
-- `src/ui/` — UI helpers, styling, and focused tests.
-- `src/storage.ts` — user-scoped settings and timeline storage.
-- `src/types.ts` — versioned contracts shared by both bundles.
+<details>
+<summary><b>My persona disappeared from Mind Lens</b></summary>
+
+Open **Settings → Roleplay behavior** and enable **Manage the active persona**. LumiMind will rebuild the activated timeline under the new policy.
+
+If the setting is on but no persona appears, confirm that the `personas` permission is granted and an active persona is selected in Lumiverse.
+
+</details>
+
+<details>
+<summary><b>The director card appears as a character, or the cast is blended together</b></summary>
+
+Enable **Character card acts as director**, save Settings, and let the timeline rebuild. The host card will be excluded from managed minds and named individuals in its replies will be resolved as NPC cast members.
+
+Use actor tools to merge any duplicates left from earlier analysis.
+
+</details>
+
+<details>
+<summary><b>Mind Seed is not visible in the character editor</b></summary>
+
+Confirm that the `characters` permission is granted. Open a character editor and scroll its top tab strip all the way to the right; **Mind Seed** is appended after **Advanced**.
+
+</details>
+
+<details>
+<summary><b>A character has the wrong identity</b></summary>
+
+Use the actor menu in Cast to:
+
+- rename the actor;
+- add or remove aliases;
+- merge duplicates;
+- split an incorrectly combined identity;
+- confirm a reviewed NPC;
+- remove the actor from this LumiMind timeline.
+
+Unrelated chats do not automatically share discovered NPC identities.
+
+</details>
+
+<details>
+<summary><b>No controller connection appears</b></summary>
+
+Grant `generation`, configure at least one Lumiverse connection, and refresh Mind Lens. Leaving the selector on **Use active Lumiverse connection** uses the connection associated with the chat.
+
+</details>
+
+<details>
+<summary><b>Secrets are visible in files or exported data</b></summary>
+
+This is expected. Spoiler-safe mode controls disclosure in Mind Lens; it is not encryption. See [Privacy](#privacy).
+
+</details>
+
+<details>
+<summary><b>I need to report a bug</b></summary>
+
+Open **Mind Lens → Settings → Diagnostics**, choose **Refresh snapshot**, then **Copy report**.
+
+The copied JSON omits private story text, mind entries, actor names, aliases, evidence, credentials, raw controller output, and full IDs.
+
+</details>
+
+---
+
+## Development
+
+### Source layout
+
+```text
+src/
+  backend.ts          lifecycle events, queues, persistence, RPC, interception
+  controller.ts       controller prompts, structured output, tolerant parsing
+  engine.ts           actor resolution, deltas, reducer, ranking, compaction
+  frontend.ts         Mind Lens, Diagnostics, and Mind Seed integration
+  storage.ts          user-scoped settings and timeline storage
+  types.ts            shared versioned contracts
+  ui/
+    helpers.ts        UI normalization and formatting helpers
+    styles.ts         Mind Lens and Mind Seed styling
+
+dist/
+  backend.js          bundled backend entrypoint
+  frontend.js         bundled frontend entrypoint
+
+spindle.json          LumiMind manifest
+```
+
+### Commands
+
+```bash
+bun install            # install development dependencies
+bun run typecheck      # strict TypeScript validation
+bun run test           # Vitest suite
+bun run build          # rebuild backend and frontend bundles
+bun run build:backend  # backend bundle only
+bun run build:frontend # frontend bundle only
+```
+
+Built `dist/` files are committed so Lumiverse can install and run LumiMind directly from the repository.
+
+---
 
 ## License
 
-See [`LICENSE.md`](./LICENSE.md).
+LumiMind is provided under the **Lumiverse Community License 2.0**. See [`LICENSE.md`](./LICENSE.md) for the complete terms.
