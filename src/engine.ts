@@ -875,6 +875,13 @@ export function toTimelineView(timeline: ChatTimelineV1): TimelineView {
         swipeId: record.swipeId,
         createdAt: record.createdAt,
         changeCount: record.deltas.length,
+        mentionCount: record.actorMentions.length,
+        controller: {
+          provider: record.controller.provider,
+          model: record.controller.model,
+          dedicatedConnection: !!record.controller.connectionId,
+          telemetry: record.controller.telemetry ?? null,
+        },
       })),
     lastValidMessageIndex: timeline.lastValidMessageIndex,
     lastAnalyzedAt: timeline.lastAnalyzedAt,

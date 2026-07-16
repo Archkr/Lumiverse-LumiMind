@@ -1,11 +1,14 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
-import { makeEmptySeed, normalizeSeed, uniqueStrings } from "./engine";
+import { makeEmptySeed, normalizeSeed, stableHash, uniqueStrings } from "./engine";
 import type {
   ChatMessageLike,
+  ControllerBatchTelemetry,
   ControllerActorMention,
   ControllerAnalysis,
   ControllerChange,
+  ControllerResponseTelemetry,
+  ControllerWarningCode,
   LumiMindSettings,
   MindCategory,
   MindOperation,
@@ -24,6 +27,7 @@ export interface AnalysisControllerResult {
   analysis: ControllerAnalysis;
   meta: ControllerMeta;
   raw: string;
+  telemetry: ControllerBatchTelemetry;
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -129,6 +133,40 @@ export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis 
       })
     : [];
   return { actorMentions, changes };
+}
+
+export function isNontrivialAnalysisBatch(messages: ChatMessageLike[]): boolean {
+  const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
+  const total = lengths.reduce((sum, length) => sum + length, 0);
+  return total >= 400 || lengths.some((length) => length >= 280) || (messages.length >= 2 && total >= 240);
+}
+
+export function makeControllerResponseTelemetry(
+  raw: string,
+  parsed: unknown,
+  accepted: ControllerAnalysis,
+): ControllerResponseTelemetry {
+  const object = asObject(parsed);
+  return {
+    responseChars: raw.length,
+    responseHash: stableHash(raw),
+    rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
+    rawChanges: Array.isArray(object.changes) ? object.changes.length : 0,
+    acceptedActorMentions: accepted.actorMentions.length,
+    acceptedChanges: accepted.changes.length,
+  };
+}
+
+export function mergeControllerAnalyses(first: ControllerAnalysis, corrective: ControllerAnalysis): ControllerAnalysis {
+  const mentions = new Map<string, ControllerActorMention>();
+  for (const mention of [...first.actorMentions, ...corrective.actorMentions]) {
+    const key = `${mention.messageId}|${mention.ref || mention.name}`.toLocaleLowerCase();
+    mentions.set(key, mention);
+  }
+  return {
+    actorMentions: [...mentions.values()],
+    changes: corrective.changes.length ? corrective.changes : first.changes,
+  };
 }
 
 const ANALYSIS_SCHEMA: Record<string, unknown> = {
@@ -301,8 +339,18 @@ const ANALYSIS_SYSTEM_PROMPT = [
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
   "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked entries.",
+  "Bootstrap rule: when an actor has no active subjective-state entries, treat the supplied scene as initialization and add every clearly evidence-supported starting emotion, goal, awareness, relationship stance, plan, or belief.",
+  "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
+  "A substantive scene with character choices, reactions, attention, dialogue, or strong subtext should not return an empty changes array merely because mind_state started empty.",
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt.",
+].join("\n");
+
+const CORRECTIVE_ANALYSIS_SYSTEM_PROMPT = [
+  ANALYSIS_SYSTEM_PROMPT,
+  "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
+  "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
+  "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any actor's subjective state.",
 ].join("\n");
 
 export async function analyzeMessages(input: {
@@ -332,7 +380,63 @@ export async function analyzeMessages(input: {
     input.fallbackConnectionId,
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  return { analysis: normalizeControllerAnalysis(result.parsed), meta: result.meta, raw: result.raw };
+  const firstAnalysis = normalizeControllerAnalysis(result.parsed);
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, firstAnalysis);
+  const nontrivial = isNontrivialAnalysisBatch(input.messages);
+  let finalAnalysis = firstAnalysis;
+  let retryTelemetry: ControllerResponseTelemetry | null = null;
+  let retryError: string | null = null;
+  let attempts = 1;
+
+  if (nontrivial && firstAnalysis.changes.length === 0) {
+    attempts = 2;
+    try {
+      const corrective = await quietJson(
+        `${prompt}\n\nThe first pass produced zero accepted changes. Perform the corrective bootstrap extraction now.`,
+        CORRECTIVE_ANALYSIS_SYSTEM_PROMPT,
+        "lumi_mind_analysis_v1_corrective",
+        ANALYSIS_SCHEMA,
+        input.settings,
+        input.userId,
+        input.fallbackConnectionId,
+      );
+      const correctiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, correctiveAnalysis);
+      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
+      finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
+    } catch (error) {
+      retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
+    }
+  }
+
+  const warningCodes = new Set<ControllerWarningCode>();
+  const normalizationDropped = (telemetry: ControllerResponseTelemetry | null) => !!telemetry && (
+    telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges > telemetry.acceptedChanges
+  );
+  if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
+  if (retryError) warningCodes.add("retry_failed");
+  if (nontrivial && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");
+
+  return {
+    analysis: finalAnalysis,
+    meta: result.meta,
+    raw: result.raw,
+    telemetry: {
+      schemaVersion: 1,
+      batchId: crypto.randomUUID(),
+      messageCount: input.messages.length,
+      inputChars: input.messages.reduce((sum, message) => sum + message.content.length, 0),
+      nontrivial,
+      attempts,
+      retryReason: attempts === 2 ? "empty_nontrivial_batch" : null,
+      first: firstTelemetry,
+      retry: retryTelemetry,
+      finalActorMentions: finalAnalysis.actorMentions.length,
+      finalChanges: finalAnalysis.changes.length,
+      warningCodes: [...warningCodes],
+      retryError,
+    },
+  };
 }
 
 const SEED_SYSTEM_PROMPT = [

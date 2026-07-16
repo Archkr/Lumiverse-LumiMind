@@ -36,6 +36,7 @@ import {
   relationshipLines,
   removeReviewedSeed,
   seedFromCharacterCard,
+  summarizeTimelineQuality,
   uniqueLines,
   writeReviewedSeed,
 } from "./ui/helpers";
@@ -246,6 +247,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const actors = timeline?.actors ?? [];
     const minds = timeline ? Object.values(timeline.minds) : [];
     const items = minds.flatMap((mind) => mind.items);
+    const quality = summarizeTimelineQuality(timeline);
     const countBy = <T extends string>(values: T[]): Record<string, number> => values.reduce<Record<string, number>>((counts, value) => {
       counts[value] = (counts[value] ?? 0) + 1;
       return counts;
@@ -349,10 +351,31 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         },
         analysisRecords: {
           total: timeline.records.length,
+          quality: {
+            acceptedMentions: quality.acceptedMentions,
+            acceptedChanges: quality.acceptedChanges,
+            instrumentedBatches: quality.instrumentedBatches,
+            uninstrumentedRecords: quality.uninstrumentedRecords,
+            correctiveAttempts: quality.correctiveAttempts,
+            emptyNontrivialBatches: quality.emptyNontrivialBatches,
+            normalizationDrops: quality.normalizationDrops,
+            retryFailures: quality.retryFailures,
+            warningCodes: quality.warningCodes,
+            legacyEmptyResult: quality.legacyEmptyResult,
+            needsAttention: quality.needsAttention,
+          },
+          batches: quality.batches.slice(-10).reverse(),
           recent: timeline.records.slice(-10).reverse().map((record) => ({
             messageIndex: record.messageIndex,
             swipe: record.swipeId,
+            mentions: record.mentionCount,
             changes: record.changeCount,
+            controller: {
+              provider: record.controller.provider,
+              model: record.controller.model,
+              dedicatedConnection: record.controller.dedicatedConnection,
+              batchId: record.controller.telemetry?.batchId ?? null,
+            },
             createdAt: new Date(record.createdAt).toISOString(),
           })),
         },
@@ -405,12 +428,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     diagnosticsRefresh = () => {
       const report = buildDiagnosticReport();
       const timeline = currentState?.timeline;
+      const quality = summarizeTimelineQuality(timeline ?? null);
       summary.replaceChildren();
       const stats: Array<[string, string]> = [
         ["Timeline", timeline ? healthLabel(timeline.health) : "No active timeline"],
         ["Revision", timeline ? String(timeline.revision) : "—"],
         ["Actors", timeline ? String(timeline.actors.length) : "0"],
-        ["Records", timeline ? String(timeline.records.length) : "0"],
+        ["Analysis", quality.needsAttention ? "Needs attention" : timeline?.records.length ? "Healthy" : "No records"],
       ];
       for (const [label, value] of stats) {
         const stat = element("div", "lm-diagnostic-stat");
@@ -554,6 +578,39 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
     actions.appendChild(textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"));
     panel.append(pulse, copy, actions);
+    return panel;
+  }
+
+  async function requestTimelineRebuild(chatId: string): Promise<void> {
+    const result = await ctx.ui.showConfirm({
+      title: "Rebuild LumiMind timeline?",
+      message: "Controller-derived records will be recomputed from committed history using the current analysis rules. Manual locked edits remain applied.",
+      variant: "warning",
+      confirmLabel: "Rebuild",
+    });
+    if (result.confirmed) send({ type: "rebuild", chatId });
+  }
+
+  function renderAnalysisQualityWarning(): HTMLElement | null {
+    const timeline = currentState?.timeline ?? null;
+    const quality = summarizeTimelineQuality(timeline);
+    if (!timeline || !quality.needsAttention) return null;
+    const panel = element("section", "lm-analysis-quality-warning");
+    const marker = element("span", "lm-quality-marker", "!");
+    const copy = element("div", "lm-timeline-status-copy");
+    copy.appendChild(element("strong", undefined, "Analysis completed with limited usable state"));
+    const details: string[] = [];
+    if (quality.legacyEmptyResult) details.push("Existing records contain no mental-state changes; rebuild to run bootstrap extraction.");
+    if (quality.emptyNontrivialBatches) details.push(`${quality.emptyNontrivialBatches} substantive ${quality.emptyNontrivialBatches === 1 ? "batch remained" : "batches remained"} empty after the corrective pass.`);
+    if (quality.normalizationDrops) details.push(`${quality.normalizationDrops} ${quality.normalizationDrops === 1 ? "batch had" : "batches had"} structured entries rejected during normalization.`);
+    if (quality.retryFailures) details.push(`${quality.retryFailures} corrective ${quality.retryFailures === 1 ? "request failed" : "requests failed"}; the valid first pass was retained.`);
+    copy.appendChild(element("span", undefined, details.join(" ")));
+    const actions = element("div", "lm-inline-actions");
+    actions.append(
+      textButton("Diagnostics", openDiagnostics, "quiet"),
+      textButton("Rebuild analysis", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
+    );
+    panel.append(marker, copy, actions);
     return panel;
   }
 
@@ -1001,17 +1058,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const actions = element("div", "lm-inline-actions");
     actions.append(
       textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
-      textButton("Rebuild", () => {
-        void (async () => {
-          const result = await ctx.ui.showConfirm({
-            title: "Rebuild LumiMind timeline?",
-            message: "Controller-derived records will be recomputed from committed history. Manual locked edits remain applied.",
-            variant: "warning",
-            confirmLabel: "Rebuild",
-          });
-          if (result.confirmed) send({ type: "rebuild", chatId: timeline.chatId });
-        })();
-      }, "secondary"),
+      textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
     );
     heading.append(title, actions);
     heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} · last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
@@ -1022,7 +1069,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const row = element("article", `lm-change-row${record.changeCount ? " changed" : ""}`);
       const marker = element("span", "lm-change-marker");
       const copy = element("div", "lm-change-copy");
-      copy.append(element("strong", undefined, `Message ${record.messageIndex + 1}`), element("span", undefined, `Swipe ${record.swipeId + 1} · ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}`));
+      const telemetry = record.controller.telemetry;
+      const qualityNote = telemetry?.warningCodes.length ? ` · ${telemetry.warningCodes.join(", ")}` : "";
+      copy.append(
+        element("strong", undefined, `Message ${record.messageIndex + 1}`),
+        element("span", undefined, `Swipe ${record.swipeId + 1} · ${record.mentionCount} ${record.mentionCount === 1 ? "mention" : "mentions"} · ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}${qualityNote}`),
+      );
       const time = element("time", undefined, formatRelativeTime(record.createdAt));
       row.append(marker, copy, time);
       feed.appendChild(row);
@@ -1194,6 +1246,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
     const status = renderTimelineStatus();
     if (status) root.appendChild(status);
+    const qualityWarning = renderAnalysisQualityWarning();
+    if (qualityWarning) root.appendChild(qualityWarning);
     if (activeView === "scene") root.appendChild(renderScene());
     else if (activeView === "history") root.appendChild(renderHistory());
     else root.appendChild(renderCast());

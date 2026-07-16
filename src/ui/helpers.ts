@@ -1,12 +1,15 @@
 import type {
   ActorMind,
   ActorRecord,
+  ControllerBatchTelemetry,
+  ControllerWarningCode,
   FrontendState,
   LumiMindSettings,
   MindCategory,
   MindCore,
   MindSeedV1,
   TimelineHealth,
+  TimelineView,
 } from "../types";
 
 export const MIND_CATEGORIES: MindCategory[] = [
@@ -232,4 +235,51 @@ export function formatRelativeTime(timestamp: number | null, now = Date.now()): 
 
 export function compactChatId(chatId: string): string {
   return chatId.length <= 16 ? chatId : `${chatId.slice(0, 7)}…${chatId.slice(-6)}`;
+}
+
+export interface TimelineQualitySummary {
+  recordCount: number;
+  acceptedMentions: number;
+  acceptedChanges: number;
+  instrumentedBatches: number;
+  uninstrumentedRecords: number;
+  correctiveAttempts: number;
+  emptyNontrivialBatches: number;
+  normalizationDrops: number;
+  retryFailures: number;
+  warningCodes: ControllerWarningCode[];
+  legacyEmptyResult: boolean;
+  needsAttention: boolean;
+  batches: ControllerBatchTelemetry[];
+}
+
+export function summarizeTimelineQuality(timeline: TimelineView | null): TimelineQualitySummary {
+  const records = timeline?.records ?? [];
+  const batchesById = new Map<string, ControllerBatchTelemetry>();
+  for (const record of records) {
+    const telemetry = record.controller.telemetry;
+    if (telemetry) batchesById.set(telemetry.batchId, telemetry);
+  }
+  const batches = [...batchesById.values()];
+  const warningCodes = new Set<ControllerWarningCode>();
+  for (const batch of batches) for (const code of batch.warningCodes) warningCodes.add(code);
+  const acceptedMentions = records.reduce((sum, record) => sum + record.mentionCount, 0);
+  const acceptedChanges = records.reduce((sum, record) => sum + record.changeCount, 0);
+  const entryCount = timeline ? Object.values(timeline.minds).reduce((sum, mind) => sum + mind.items.length, 0) : 0;
+  const legacyEmptyResult = records.length > 0 && batches.length === 0 && acceptedChanges === 0 && entryCount === 0;
+  return {
+    recordCount: records.length,
+    acceptedMentions,
+    acceptedChanges,
+    instrumentedBatches: batches.length,
+    uninstrumentedRecords: records.filter((record) => !record.controller.telemetry).length,
+    correctiveAttempts: batches.filter((batch) => batch.attempts > 1).length,
+    emptyNontrivialBatches: batches.filter((batch) => batch.warningCodes.includes("empty_nontrivial_batch")).length,
+    normalizationDrops: batches.filter((batch) => batch.warningCodes.includes("normalization_drop")).length,
+    retryFailures: batches.filter((batch) => batch.warningCodes.includes("retry_failed")).length,
+    warningCodes: [...warningCodes],
+    legacyEmptyResult,
+    needsAttention: warningCodes.size > 0 || legacyEmptyResult,
+    batches,
+  };
 }

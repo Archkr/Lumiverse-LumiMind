@@ -1,5 +1,19 @@
-import { describe, expect, it } from "vitest";
-import { normalizeControllerAnalysis, parseJsonValue, sanitizeControllerText } from "./controller";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  analyzeMessages,
+  isNontrivialAnalysisBatch,
+  makeControllerResponseTelemetry,
+  mergeControllerAnalyses,
+  normalizeControllerAnalysis,
+  parseJsonValue,
+  sanitizeControllerText,
+} from "./controller";
+import { DEFAULT_SETTINGS } from "./engine";
+import type { ChatMessageLike, ControllerAnalysis } from "./types";
+
+afterEach(() => {
+  delete (globalThis as Record<string, unknown>).spindle;
+});
 
 describe("controller response parsing", () => {
   it("accepts fenced JSON with provider chatter", () => {
@@ -18,5 +32,79 @@ describe("controller response parsing", () => {
     });
     expect(result.actorMentions[0]).toMatchObject({ kind: "npc", confidence: 1, present: true });
     expect(result.changes[0]).toMatchObject({ category: "emotion", confidence: 0, text: "Wary" });
+  });
+
+  it("detects substantive bootstrap batches without flagging trivial greetings", () => {
+    expect(isNontrivialAnalysisBatch([{ id: "m1", role: "user", content: "hello" }])).toBe(false);
+    expect(isNontrivialAnalysisBatch([{ id: "m1", role: "assistant", content: "A".repeat(400) }])).toBe(true);
+  });
+
+  it("reports raw entries rejected during normalization without storing raw text", () => {
+    const parsed = { actorMentions: [{ name: "Missing message id" }], changes: [{ text: "Missing subject" }] };
+    const accepted = normalizeControllerAnalysis(parsed);
+    expect(makeControllerResponseTelemetry(JSON.stringify(parsed), parsed, accepted)).toMatchObject({
+      rawActorMentions: 1,
+      rawChanges: 1,
+      acceptedActorMentions: 0,
+      acceptedChanges: 0,
+    });
+  });
+
+  it("merges corrective mentions while taking corrective state changes", () => {
+    const first: ControllerAnalysis = {
+      actorMentions: [{ ref: "aster", name: "Aster", messageId: "m1" }],
+      changes: [],
+    };
+    const corrective: ControllerAnalysis = {
+      actorMentions: [
+        { ref: "aster", name: "Aster", messageId: "m1", present: true },
+        { ref: "mira", name: "Mira", messageId: "m1" },
+      ],
+      changes: [{ subjectRef: "aster", category: "emotion", operation: "add", text: "Wary", messageId: "m1" }],
+    };
+    const merged = mergeControllerAnalyses(first, corrective);
+    expect(merged.actorMentions).toHaveLength(2);
+    expect(merged.changes).toHaveLength(1);
+  });
+
+  it("runs exactly one corrective pass for an empty substantive bootstrap", async () => {
+    const quiet = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })
+      .mockResolvedValueOnce({ content: JSON.stringify({
+        actorMentions: [],
+        changes: [{
+          subjectRef: "Aster",
+          category: "emotion",
+          operation: "add",
+          targetItemId: null,
+          text: "Wary of the unexpected visitor",
+          status: "active",
+          confidence: 0.82,
+          targetRefs: [],
+          concealedFromRefs: [],
+          intensity: 0.55,
+          dimensions: { valence: -0.3 },
+          messageId: "m1",
+          evidenceExcerpt: "Aster watched the doorway and lowered her voice.",
+        }],
+      }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "Aster watched the doorway and lowered her voice. ".repeat(10), index_in_chat: 0 }];
+    const result = await analyzeMessages({ messages, recentContext: [], compactState: [], settings: DEFAULT_SETTINGS, userId: "user" });
+    expect(quiet).toHaveBeenCalledTimes(2);
+    expect(result.analysis.changes).toHaveLength(1);
+    expect(result.telemetry).toMatchObject({ attempts: 2, finalChanges: 1, warningCodes: [] });
+  });
+
+  it("retains a valid first pass and warns when the corrective request fails", async () => {
+    const quiet = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })
+      .mockRejectedValueOnce(new Error("temporary provider failure"));
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "B".repeat(500), index_in_chat: 0 }];
+    const result = await analyzeMessages({ messages, recentContext: [], compactState: [], settings: DEFAULT_SETTINGS, userId: "user" });
+    expect(result.analysis.changes).toEqual([]);
+    expect(result.telemetry.warningCodes).toEqual(expect.arrayContaining(["retry_failed", "empty_nontrivial_batch"]));
+    expect(result.telemetry.retryError).toBe("temporary provider failure");
   });
 });

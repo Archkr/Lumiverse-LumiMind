@@ -193,6 +193,36 @@ function formatRelativeTime(timestamp, now = Date.now()) {
 function compactChatId(chatId) {
   return chatId.length <= 16 ? chatId : `${chatId.slice(0, 7)}\u2026${chatId.slice(-6)}`;
 }
+function summarizeTimelineQuality(timeline) {
+  const records = timeline?.records ?? [];
+  const batchesById = /* @__PURE__ */ new Map();
+  for (const record of records) {
+    const telemetry = record.controller.telemetry;
+    if (telemetry) batchesById.set(telemetry.batchId, telemetry);
+  }
+  const batches = [...batchesById.values()];
+  const warningCodes = /* @__PURE__ */ new Set();
+  for (const batch of batches) for (const code of batch.warningCodes) warningCodes.add(code);
+  const acceptedMentions = records.reduce((sum, record) => sum + record.mentionCount, 0);
+  const acceptedChanges = records.reduce((sum, record) => sum + record.changeCount, 0);
+  const entryCount = timeline ? Object.values(timeline.minds).reduce((sum, mind) => sum + mind.items.length, 0) : 0;
+  const legacyEmptyResult = records.length > 0 && batches.length === 0 && acceptedChanges === 0 && entryCount === 0;
+  return {
+    recordCount: records.length,
+    acceptedMentions,
+    acceptedChanges,
+    instrumentedBatches: batches.length,
+    uninstrumentedRecords: records.filter((record) => !record.controller.telemetry).length,
+    correctiveAttempts: batches.filter((batch) => batch.attempts > 1).length,
+    emptyNontrivialBatches: batches.filter((batch) => batch.warningCodes.includes("empty_nontrivial_batch")).length,
+    normalizationDrops: batches.filter((batch) => batch.warningCodes.includes("normalization_drop")).length,
+    retryFailures: batches.filter((batch) => batch.warningCodes.includes("retry_failed")).length,
+    warningCodes: [...warningCodes],
+    legacyEmptyResult,
+    needsAttention: warningCodes.size > 0 || legacyEmptyResult,
+    batches
+  };
+}
 
 // src/ui/styles.ts
 var LUMI_MIND_CSS = `
@@ -333,6 +363,8 @@ var LUMI_MIND_CSS = `
 .lm-timeline-status-copy strong { font-size:11px; }
 .lm-timeline-status-copy span { color:var(--lm-muted); font-size:10px; }
 .lm-inline-actions { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
+.lm-analysis-quality-warning { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:start; padding:10px; border:1px solid color-mix(in srgb,var(--lm-warning) 38%,var(--lm-line)); border-radius:var(--lm-radius); background:linear-gradient(110deg,color-mix(in srgb,var(--lm-warning) 10%,var(--lm-panel)),var(--lm-panel)); }
+.lm-quality-marker { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border:1px solid color-mix(in srgb,var(--lm-warning) 45%,var(--lm-line)); border-radius:50%; color:var(--lm-warning); background:color-mix(in srgb,var(--lm-warning) 10%,transparent); font-size:10px; font-weight:850; }
 
 .lm-section-heading { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
 .lm-section-title { color:var(--lm-muted); font-size:10px; font-weight:750; letter-spacing:.09em; text-transform:uppercase; }
@@ -511,6 +543,8 @@ var LUMI_MIND_CSS = `
   .lm-mind-section-name { flex-direction:column; gap:0; }
   .lm-timeline-status { grid-template-columns:auto minmax(0,1fr); }
   .lm-timeline-status > .lm-inline-actions { grid-column:2; }
+  .lm-analysis-quality-warning { grid-template-columns:auto minmax(0,1fr); }
+  .lm-analysis-quality-warning > .lm-inline-actions { grid-column:2; }
   .lm-seed-header { grid-template-columns:1fr; }
   .lm-seed-toolbar .lm-button-primary { margin-left:0; }
   .lm-diagnostics-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -695,6 +729,7 @@ function setup(ctx) {
     const actors = timeline?.actors ?? [];
     const minds = timeline ? Object.values(timeline.minds) : [];
     const items = minds.flatMap((mind) => mind.items);
+    const quality = summarizeTimelineQuality(timeline);
     const countBy = (values) => values.reduce((counts, value) => {
       counts[value] = (counts[value] ?? 0) + 1;
       return counts;
@@ -798,10 +833,31 @@ function setup(ctx) {
         },
         analysisRecords: {
           total: timeline.records.length,
+          quality: {
+            acceptedMentions: quality.acceptedMentions,
+            acceptedChanges: quality.acceptedChanges,
+            instrumentedBatches: quality.instrumentedBatches,
+            uninstrumentedRecords: quality.uninstrumentedRecords,
+            correctiveAttempts: quality.correctiveAttempts,
+            emptyNontrivialBatches: quality.emptyNontrivialBatches,
+            normalizationDrops: quality.normalizationDrops,
+            retryFailures: quality.retryFailures,
+            warningCodes: quality.warningCodes,
+            legacyEmptyResult: quality.legacyEmptyResult,
+            needsAttention: quality.needsAttention
+          },
+          batches: quality.batches.slice(-10).reverse(),
           recent: timeline.records.slice(-10).reverse().map((record) => ({
             messageIndex: record.messageIndex,
             swipe: record.swipeId,
+            mentions: record.mentionCount,
             changes: record.changeCount,
+            controller: {
+              provider: record.controller.provider,
+              model: record.controller.model,
+              dedicatedConnection: record.controller.dedicatedConnection,
+              batchId: record.controller.telemetry?.batchId ?? null
+            },
             createdAt: new Date(record.createdAt).toISOString()
           }))
         }
@@ -851,12 +907,13 @@ function setup(ctx) {
     diagnosticsRefresh = () => {
       const report = buildDiagnosticReport();
       const timeline = currentState?.timeline;
+      const quality = summarizeTimelineQuality(timeline ?? null);
       summary.replaceChildren();
       const stats = [
         ["Timeline", timeline ? healthLabel(timeline.health) : "No active timeline"],
         ["Revision", timeline ? String(timeline.revision) : "\u2014"],
         ["Actors", timeline ? String(timeline.actors.length) : "0"],
-        ["Records", timeline ? String(timeline.records.length) : "0"]
+        ["Analysis", quality.needsAttention ? "Needs attention" : timeline?.records.length ? "Healthy" : "No records"]
       ];
       for (const [label, value] of stats) {
         const stat = element("div", "lm-diagnostic-stat");
@@ -988,6 +1045,37 @@ function setup(ctx) {
     }
     actions.appendChild(textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"));
     panel.append(pulse, copy, actions);
+    return panel;
+  }
+  async function requestTimelineRebuild(chatId) {
+    const result = await ctx.ui.showConfirm({
+      title: "Rebuild LumiMind timeline?",
+      message: "Controller-derived records will be recomputed from committed history using the current analysis rules. Manual locked edits remain applied.",
+      variant: "warning",
+      confirmLabel: "Rebuild"
+    });
+    if (result.confirmed) send({ type: "rebuild", chatId });
+  }
+  function renderAnalysisQualityWarning() {
+    const timeline = currentState?.timeline ?? null;
+    const quality = summarizeTimelineQuality(timeline);
+    if (!timeline || !quality.needsAttention) return null;
+    const panel = element("section", "lm-analysis-quality-warning");
+    const marker = element("span", "lm-quality-marker", "!");
+    const copy = element("div", "lm-timeline-status-copy");
+    copy.appendChild(element("strong", void 0, "Analysis completed with limited usable state"));
+    const details = [];
+    if (quality.legacyEmptyResult) details.push("Existing records contain no mental-state changes; rebuild to run bootstrap extraction.");
+    if (quality.emptyNontrivialBatches) details.push(`${quality.emptyNontrivialBatches} substantive ${quality.emptyNontrivialBatches === 1 ? "batch remained" : "batches remained"} empty after the corrective pass.`);
+    if (quality.normalizationDrops) details.push(`${quality.normalizationDrops} ${quality.normalizationDrops === 1 ? "batch had" : "batches had"} structured entries rejected during normalization.`);
+    if (quality.retryFailures) details.push(`${quality.retryFailures} corrective ${quality.retryFailures === 1 ? "request failed" : "requests failed"}; the valid first pass was retained.`);
+    copy.appendChild(element("span", void 0, details.join(" ")));
+    const actions = element("div", "lm-inline-actions");
+    actions.append(
+      textButton("Diagnostics", openDiagnostics, "quiet"),
+      textButton("Rebuild analysis", () => void requestTimelineRebuild(timeline.chatId), "secondary")
+    );
+    panel.append(marker, copy, actions);
     return panel;
   }
   function renderActorRail(actors, minds) {
@@ -1409,17 +1497,7 @@ function setup(ctx) {
     const actions = element("div", "lm-inline-actions");
     actions.append(
       textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
-      textButton("Rebuild", () => {
-        void (async () => {
-          const result = await ctx.ui.showConfirm({
-            title: "Rebuild LumiMind timeline?",
-            message: "Controller-derived records will be recomputed from committed history. Manual locked edits remain applied.",
-            variant: "warning",
-            confirmLabel: "Rebuild"
-          });
-          if (result.confirmed) send({ type: "rebuild", chatId: timeline.chatId });
-        })();
-      }, "secondary")
+      textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary")
     );
     heading.append(title, actions);
     heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} \xB7 last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
@@ -1430,7 +1508,12 @@ function setup(ctx) {
       const row = element("article", `lm-change-row${record.changeCount ? " changed" : ""}`);
       const marker = element("span", "lm-change-marker");
       const copy = element("div", "lm-change-copy");
-      copy.append(element("strong", void 0, `Message ${record.messageIndex + 1}`), element("span", void 0, `Swipe ${record.swipeId + 1} \xB7 ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}`));
+      const telemetry = record.controller.telemetry;
+      const qualityNote = telemetry?.warningCodes.length ? ` \xB7 ${telemetry.warningCodes.join(", ")}` : "";
+      copy.append(
+        element("strong", void 0, `Message ${record.messageIndex + 1}`),
+        element("span", void 0, `Swipe ${record.swipeId + 1} \xB7 ${record.mentionCount} ${record.mentionCount === 1 ? "mention" : "mentions"} \xB7 ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}${qualityNote}`)
+      );
       const time = element("time", void 0, formatRelativeTime(record.createdAt));
       row.append(marker, copy, time);
       feed.appendChild(row);
@@ -1592,6 +1675,8 @@ function setup(ctx) {
     }
     const status = renderTimelineStatus();
     if (status) root.appendChild(status);
+    const qualityWarning = renderAnalysisQualityWarning();
+    if (qualityWarning) root.appendChild(qualityWarning);
     if (activeView === "scene") root.appendChild(renderScene());
     else if (activeView === "history") root.appendChild(renderHistory());
     else root.appendChild(renderCast());

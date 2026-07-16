@@ -724,7 +724,14 @@ function toTimelineView(timeline) {
       messageIndex: record.messageIndex,
       swipeId: record.swipeId,
       createdAt: record.createdAt,
-      changeCount: record.deltas.length
+      changeCount: record.deltas.length,
+      mentionCount: record.actorMentions.length,
+      controller: {
+        provider: record.controller.provider,
+        model: record.controller.model,
+        dedicatedConnection: !!record.controller.connectionId,
+        telemetry: record.controller.telemetry ?? null
+      }
     })),
     lastValidMessageIndex: timeline.lastValidMessageIndex,
     lastAnalyzedAt: timeline.lastAnalyzedAt,
@@ -841,6 +848,33 @@ function normalizeControllerAnalysis(value) {
     }];
   }) : [];
   return { actorMentions, changes };
+}
+function isNontrivialAnalysisBatch(messages) {
+  const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
+  const total = lengths.reduce((sum, length) => sum + length, 0);
+  return total >= 400 || lengths.some((length) => length >= 280) || messages.length >= 2 && total >= 240;
+}
+function makeControllerResponseTelemetry(raw, parsed, accepted) {
+  const object = asObject2(parsed);
+  return {
+    responseChars: raw.length,
+    responseHash: stableHash(raw),
+    rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
+    rawChanges: Array.isArray(object.changes) ? object.changes.length : 0,
+    acceptedActorMentions: accepted.actorMentions.length,
+    acceptedChanges: accepted.changes.length
+  };
+}
+function mergeControllerAnalyses(first, corrective) {
+  const mentions = /* @__PURE__ */ new Map();
+  for (const mention of [...first.actorMentions, ...corrective.actorMentions]) {
+    const key = `${mention.messageId}|${mention.ref || mention.name}`.toLocaleLowerCase();
+    mentions.set(key, mention);
+  }
+  return {
+    actorMentions: [...mentions.values()],
+    changes: corrective.changes.length ? corrective.changes : first.changes
+  };
 }
 var ANALYSIS_SCHEMA = {
   type: "object",
@@ -1006,8 +1040,17 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
   "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked entries.",
+  "Bootstrap rule: when an actor has no active subjective-state entries, treat the supplied scene as initialization and add every clearly evidence-supported starting emotion, goal, awareness, relationship stance, plan, or belief.",
+  "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
+  "A substantive scene with character choices, reactions, attention, dialogue, or strong subtext should not return an empty changes array merely because mind_state started empty.",
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
+].join("\n");
+var CORRECTIVE_ANALYSIS_SYSTEM_PROMPT = [
+  ANALYSIS_SYSTEM_PROMPT,
+  "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
+  "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
+  "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any actor's subjective state."
 ].join("\n");
 async function analyzeMessages(input) {
   const prompt = [
@@ -1035,7 +1078,60 @@ ${renderMessages(input.messages)}
     input.fallbackConnectionId
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  return { analysis: normalizeControllerAnalysis(result.parsed), meta: result.meta, raw: result.raw };
+  const firstAnalysis = normalizeControllerAnalysis(result.parsed);
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, firstAnalysis);
+  const nontrivial = isNontrivialAnalysisBatch(input.messages);
+  let finalAnalysis = firstAnalysis;
+  let retryTelemetry = null;
+  let retryError = null;
+  let attempts = 1;
+  if (nontrivial && firstAnalysis.changes.length === 0) {
+    attempts = 2;
+    try {
+      const corrective = await quietJson(
+        `${prompt}
+
+The first pass produced zero accepted changes. Perform the corrective bootstrap extraction now.`,
+        CORRECTIVE_ANALYSIS_SYSTEM_PROMPT,
+        "lumi_mind_analysis_v1_corrective",
+        ANALYSIS_SCHEMA,
+        input.settings,
+        input.userId,
+        input.fallbackConnectionId
+      );
+      const correctiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, correctiveAnalysis);
+      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
+      finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
+    } catch (error) {
+      retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
+    }
+  }
+  const warningCodes = /* @__PURE__ */ new Set();
+  const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges > telemetry.acceptedChanges);
+  if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
+  if (retryError) warningCodes.add("retry_failed");
+  if (nontrivial && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");
+  return {
+    analysis: finalAnalysis,
+    meta: result.meta,
+    raw: result.raw,
+    telemetry: {
+      schemaVersion: 1,
+      batchId: crypto.randomUUID(),
+      messageCount: input.messages.length,
+      inputChars: input.messages.reduce((sum, message) => sum + message.content.length, 0),
+      nontrivial,
+      attempts,
+      retryReason: attempts === 2 ? "empty_nontrivial_batch" : null,
+      first: firstTelemetry,
+      retry: retryTelemetry,
+      finalActorMentions: finalAnalysis.actorMentions.length,
+      finalChanges: finalAnalysis.changes.length,
+      warningCodes: [...warningCodes],
+      retryError
+    }
+  };
 }
 var SEED_SYSTEM_PROMPT = [
   "You draft reusable LumiMind character-card seeds.",
@@ -1378,8 +1474,19 @@ async function reconcileChat(userId, chatId, force = false) {
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null
       });
-      const records = materializeAnalysisRecords(timeline, batch, derivation.nextPrefix, result.analysis, result.meta);
+      const records = materializeAnalysisRecords(
+        timeline,
+        batch,
+        derivation.nextPrefix,
+        result.analysis,
+        { ...result.meta, telemetry: result.telemetry }
+      );
       timeline.records.push(...records);
+      if (result.telemetry.warningCodes.length) {
+        spindle.log.warn(
+          `LumiMind analysis quality warning for ${chatId} batch ${result.telemetry.batchId}: ${result.telemetry.warningCodes.join(", ")} (attempts=${result.telemetry.attempts}, acceptedMentions=${result.telemetry.finalActorMentions}, acceptedChanges=${result.telemetry.finalChanges}).`
+        );
+      }
       if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);

@@ -119,8 +119,36 @@ export interface AnalysisRecord {
     connectionId: string | null;
     provider: string | null;
     model: string | null;
+    telemetry?: ControllerBatchTelemetry;
   };
   createdAt: number;
+}
+
+export type ControllerWarningCode = "empty_nontrivial_batch" | "normalization_drop" | "retry_failed";
+
+export interface ControllerResponseTelemetry {
+  responseChars: number;
+  responseHash: string;
+  rawActorMentions: number;
+  rawChanges: number;
+  acceptedActorMentions: number;
+  acceptedChanges: number;
+}
+
+export interface ControllerBatchTelemetry {
+  schemaVersion: 1;
+  batchId: string;
+  messageCount: number;
+  inputChars: number;
+  nontrivial: boolean;
+  attempts: number;
+  retryReason: "empty_nontrivial_batch" | null;
+  first: ControllerResponseTelemetry;
+  retry: ControllerResponseTelemetry | null;
+  finalActorMentions: number;
+  finalChanges: number;
+  warningCodes: ControllerWarningCode[];
+  retryError: string | null;
 }
 
 export interface ManualOverride {
@@ -215,7 +243,16 @@ export interface TimelineView {
   error: string | null;
   actors: ActorRecord[];
   minds: Record<string, ActorMind>;
-  records: Array<Pick<AnalysisRecord, "id" | "messageId" | "messageIndex" | "swipeId" | "createdAt"> & { changeCount: number }>;
+  records: Array<Pick<AnalysisRecord, "id" | "messageId" | "messageIndex" | "swipeId" | "createdAt"> & {
+    changeCount: number;
+    mentionCount: number;
+    controller: {
+      provider: string | null;
+      model: string | null;
+      dedicatedConnection: boolean;
+      telemetry: ControllerBatchTelemetry | null;
+    };
+  }>;
   lastValidMessageIndex: number;
   lastAnalyzedAt: number | null;
   updatedAt: number;

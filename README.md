@@ -13,6 +13,7 @@ Chats are inactive until you explicitly enable them. Beliefs and secrets are col
 - Evidence, confidence, message index, swipe, source, lock, and pin metadata for every mind entry.
 - Deterministic timeline replay across edits, deletions, swipe navigation, and forks.
 - Background controller analysis with tolerant structured-output parsing.
+- Explicit first-scene bootstrapping plus one bounded corrective pass when a substantive batch produces no usable mental-state changes.
 - Cached, generation-free prompt interception with an approximately 1,600-token default budget.
 - Mind Lens drawer with Cast, Scene, Changes, and Settings views.
 - Spoiler-safe beliefs and secrets, editable state, actor identity tools, provenance, pause/retry/rebuild, and live capability status.
@@ -54,7 +55,9 @@ The drawer has four views:
 - **Changes** — per-message analysis records, swipe provenance, checkpoint freshness, pause/resume, retry, and rebuild controls.
 - **Settings** — controller connection, analysis and injection budgets, privacy controls, Cortex behavior, interoperability, and live permissions.
 
-Settings also includes a **Diagnostics** window. It summarizes frontend context, live permissions, controller availability, timeline health, aggregate actor/mind counts, and recent analysis metadata. **Copy report** produces formatted JSON suitable for a bug report while excluding story text, beliefs, secrets, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
+Settings also includes a **Diagnostics** window. It summarizes frontend context, live permissions, controller availability, timeline health, aggregate actor/mind counts, recent analysis metadata, accepted mention/change counts, corrective attempts, normalization drops, and privacy-safe response lengths/hashes. **Copy report** produces formatted JSON suitable for a bug report while excluding story text, beliefs, secrets, raw controller output, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
+
+When a substantive batch still produces no usable state after the corrective pass, Mind Lens shows an analysis-quality warning even though the compatible timeline checkpoint is technically current. Rebuild reruns committed history with the latest extraction rules.
 
 User edits become locked manual overrides. Controller analysis cannot overwrite a locked item until it is unlocked.
 
@@ -96,7 +99,7 @@ Defaults:
 - Secondary actors: up to `4`
 - Initial-history rebuilds: bounded batches
 
-Controller analysis normally runs once per newly committed turn. Rebuilds, edits, swipe changes, and initial history can create additional calls. Pause a timeline when you do not want background analysis costs.
+Controller analysis normally runs once per newly committed turn. If a substantive batch returns no accepted mental-state changes, LumiMind makes at most one corrective call focused on evidence-bound bootstrap extraction. Rebuilds, edits, swipe changes, initial history, and corrective passes can therefore create additional calls. Pause a timeline when you do not want background analysis costs.
 
 The interceptor never performs a model call. When analysis is pending, it uses the last valid folded checkpoint.
 
@@ -140,6 +143,10 @@ Open Lumiverse Settings → Extensions and grant the permissions named in the in
 **A timeline is stale or in error**
 
 Open Changes and choose **Retry**. Use **Rebuild** when transcript history changed substantially or a controller response was malformed. Manual locked edits remain applied.
+
+**The timeline is current but contains no mind entries**
+
+Mind Lens reports this separately as an analysis-quality warning. Open Diagnostics to compare raw and accepted structured-output counts, then use **Rebuild analysis** to run the current bootstrap and corrective-pass rules over committed history.
 
 **No controller connection appears**
 

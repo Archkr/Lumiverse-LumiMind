@@ -378,8 +378,20 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
       });
-      const records = materializeAnalysisRecords(timeline, batch, derivation.nextPrefix, result.analysis, result.meta);
+      const records = materializeAnalysisRecords(
+        timeline,
+        batch,
+        derivation.nextPrefix,
+        result.analysis,
+        { ...result.meta, telemetry: result.telemetry },
+      );
       timeline.records.push(...records);
+      if (result.telemetry.warningCodes.length) {
+        spindle.log.warn(
+          `LumiMind analysis quality warning for ${chatId} batch ${result.telemetry.batchId}: ${result.telemetry.warningCodes.join(", ")} ` +
+          `(attempts=${result.telemetry.attempts}, acceptedMentions=${result.telemetry.finalActorMentions}, acceptedChanges=${result.telemetry.finalChanges}).`,
+        );
+      }
       if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);

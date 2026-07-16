@@ -9,9 +9,11 @@ import {
   relationshipLines,
   removeReviewedSeed,
   seedFromCharacterCard,
+  summarizeTimelineQuality,
   uniqueLines,
   writeReviewedSeed,
 } from "./helpers";
+import type { TimelineView } from "../types";
 
 function seed(): MindSeedV1 {
   return {
@@ -91,5 +93,27 @@ describe("UI normalization", () => {
       },
     } as FrontendState;
     expect(missingAnalysisPermissions(state)).toEqual(["Generation", "Chat history"]);
+  });
+
+  it("flags legacy records that completed without producing any mind state", () => {
+    const timeline = {
+      records: [{
+        id: "record",
+        messageId: "m1",
+        messageIndex: 0,
+        swipeId: 0,
+        createdAt: 1,
+        changeCount: 0,
+        mentionCount: 1,
+        controller: { provider: "openrouter", model: "model", dedicatedConnection: true, telemetry: null },
+      }],
+      minds: {},
+    } as TimelineView;
+    expect(summarizeTimelineQuality(timeline)).toMatchObject({
+      acceptedMentions: 1,
+      acceptedChanges: 0,
+      legacyEmptyResult: true,
+      needsAttention: true,
+    });
   });
 });
