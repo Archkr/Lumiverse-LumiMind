@@ -1,7 +1,8 @@
 <div align="center">
 
-<img width="1448" height="1086" alt="LumiMind(1)" src="https://github.com/user-attachments/assets/617084f3-273b-40e5-9298-4f5bc816f549" />
+<img width="680" height="680" alt="LumiFox" src="https://github.com/user-attachments/assets/17fd5a88-a577-4e0e-a119-5f89bbee2126" />
 
+# LumiMind
 
 **Timeline-aware subjective minds for Lumiverse.**
 
