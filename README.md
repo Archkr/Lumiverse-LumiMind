@@ -41,11 +41,12 @@ It supports ordinary single-card roleplay, group chats, player personas, and dir
 12. [Controller usage and cost](#controller-usage-and-cost)
 13. [Permissions](#permissions)
 14. [Privacy](#privacy)
-15. [Extension interoperability](#extension-interoperability)
-16. [Tips](#tips)
-17. [Troubleshooting](#troubleshooting)
-18. [Development](#development)
-19. [License](#license)
+15. [Memory Cortex integration](#memory-cortex-integration)
+16. [Extension interoperability](#extension-interoperability)
+17. [Tips](#tips)
+18. [Troubleshooting](#troubleshooting)
+19. [Development](#development)
+20. [License](#license)
 
 ---
 
@@ -149,17 +150,6 @@ No local build is required for a normal installation because the release-ready `
 ### Update
 
 Use the update action on LumiMind’s entry in Lumiverse’s Extensions panel, then reload the extension if Lumiverse asks you to.
-
-### Local development checkout
-
-```bash
-bun install
-bun run typecheck
-bun run test
-bun run build
-```
-
-After rebuilding, reload LumiMind from Lumiverse. Development changes belong in the repository; do not edit an installed extension copy.
 
 ---
 
@@ -412,18 +402,45 @@ LumiMind stores:
 
 LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to the Lumiverse data directory or exported character extension data may be able to read stored minds and seeds.
 
-### Memory Cortex
-
-- Identity import is optional and uses character entity names and aliases for resolution.
-- Writeback is disabled by default.
-- When explicitly enabled, writeback is limited to user-confirmed actor identities and aliases.
-- Beliefs, secrets, goals, plans, emotions, relationships, evidence, and private scene state are never written to Cortex.
-
 ### Controller data
 
 The selected controller receives recent transcript context, the analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
 
 Diagnostics store counts, lengths, hashes, provider metadata, and warning codes—not raw controller responses or private story content.
+
+---
+
+## Memory Cortex integration
+
+LumiMind has its own actor registry and works normally without Memory Cortex. Cortex integration is an optional identity bridge, not a storage destination for character minds.
+
+### Identity import — on by default
+
+When **Import Cortex identities** is enabled and the `memories` permission is available, LumiMind can read Memory Cortex `character` entities for the active chat.
+
+It uses only:
+
+- entity names;
+- known aliases;
+- confirmation confidence;
+- the Cortex entity ID needed to preserve the optional link.
+
+This helps LumiMind recognize that “Captain Mira,” “Mira,” and an already-known Cortex character refer to the same actor. Imported identities join the chat-local registry, while unrelated chats still do not automatically share LumiMind’s discovered NPC IDs.
+
+### Identity writeback — off by default
+
+LumiMind never publishes an inferred identity automatically. To write an actor back to Cortex, you must:
+
+1. enable **Cortex identity writeback** in Settings;
+2. review and confirm the actor in Mind Lens;
+3. correct its canonical name and aliases if needed;
+4. deliberately use the writeback action.
+
+Writeback is limited to the confirmed actor’s name and aliases. LumiMind never writes beliefs, secrets, goals, plans, emotions, relationships, evidence, or private scene state to Memory Cortex.
+
+### Without the `memories` permission
+
+Nothing essential breaks. LumiMind continues resolving character cards, personas, and chat-local NPCs through its independent registry. Cortex import, linkage, and writeback controls simply become unavailable.
 
 ---
 
