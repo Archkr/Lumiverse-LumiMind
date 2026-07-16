@@ -176,6 +176,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   let settingsDirty = false;
   let notice: UiNotice | null = null;
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let diagnosticsModal: ReturnType<SpindleFrontendContext["ui"]["showModal"]> | null = null;
+  let diagnosticsRefresh: (() => void) | null = null;
 
   let seedTab: ReturnType<SpindleFrontendContext["ui"]["registerCharacterEditorTab"]> | null = null;
   let seedRoot: HTMLElement | null = null;
@@ -211,6 +213,218 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   function syncContext(): void {
     const active = safeActiveChat(ctx);
     send({ type: "refresh", chatId: active.chatId, characterId: active.characterId });
+  }
+
+  async function copyText(value: string): Promise<boolean> {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      // Fall through to a host-safe selection copy.
+    }
+    const fallback = element("textarea");
+    fallback.value = value;
+    fallback.setAttribute("readonly", "true");
+    fallback.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.appendChild(fallback);
+    fallback.focus();
+    fallback.select();
+    try {
+      return document.execCommand("copy");
+    } catch {
+      return false;
+    } finally {
+      fallback.remove();
+    }
+  }
+
+  function buildDiagnosticReport(): Record<string, unknown> {
+    const state = currentState;
+    const timeline = state?.timeline ?? null;
+    const actors = timeline?.actors ?? [];
+    const minds = timeline ? Object.values(timeline.minds) : [];
+    const items = minds.flatMap((mind) => mind.items);
+    const countBy = <T extends string>(values: T[]): Record<string, number> => values.reduce<Record<string, number>>((counts, value) => {
+      counts[value] = (counts[value] ?? 0) + 1;
+      return counts;
+    }, {});
+    let editorState: SpindleCharacterEditorState | null = null;
+    try {
+      if (state?.permissions.characters) editorState = ctx.ui.characterEditor.getState();
+    } catch {
+      editorState = null;
+    }
+    const active = safeActiveChat(ctx);
+    return {
+      reportFormat: "lumi_mind.diagnostics.v1",
+      generatedAt: new Date().toISOString(),
+      privacy: {
+        sanitized: true,
+        excluded: ["mind entry text", "beliefs", "secrets", "evidence excerpts", "actor names", "aliases", "API credentials", "full entity IDs"],
+      },
+      extension: {
+        identifier: ctx.manifest.identifier,
+        name: ctx.manifest.name,
+        version: ctx.manifest.version,
+        minimumLumiverseVersion: ctx.manifest.minimum_lumiverse_version ?? null,
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        online: navigator.onLine,
+        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+      },
+      frontend: {
+        activeView,
+        drawer: ctx.ui.events.getDrawerState(),
+        activeChat: {
+          available: !!active.chatId,
+          reference: active.chatId ? compactChatId(active.chatId) : null,
+          characterAvailable: !!active.characterId,
+          matchesBackendState: active.chatId === (state?.activeChatId ?? null),
+        },
+        seedEditor: {
+          available: !!seedTab,
+          open: editorState?.open ?? false,
+          characterAvailable: !!editorState?.characterId,
+          draftLoaded: !!seedDraft,
+          persisted: seedPersisted,
+          dirty: seedDirty,
+          loading: seedLoading,
+          generating: seedGenerating,
+        },
+      },
+      permissions: state?.permissions ?? null,
+      controller: state ? {
+        dedicatedConnectionSelected: !!state.settings.controllerConnectionId,
+        connectionCount: state.connections.length,
+        connections: state.connections.map((connection) => ({
+          provider: connection.provider,
+          model: connection.model,
+          default: connection.isDefault,
+          credentialConfigured: connection.hasApiKey,
+        })),
+        temperature: state.settings.controllerTemperature,
+        maxOutputTokens: state.settings.controllerMaxTokens,
+      } : null,
+      injection: state ? {
+        tokenBudget: state.settings.injectionTokenBudget,
+        secondaryActorLimit: state.settings.secondaryActorLimit,
+        interceptorAvailable: state.permissions.interceptor,
+      } : null,
+      features: state ? {
+        spoilerSafe: state.settings.spoilerSafe,
+        cortexImport: state.settings.cortexImportEnabled,
+        cortexWriteback: state.settings.cortexWritebackEnabled,
+        privateInterop: state.settings.privateInteropEnabled,
+      } : null,
+      timeline: timeline ? {
+        available: true,
+        chatReference: compactChatId(timeline.chatId),
+        active: timeline.active,
+        paused: timeline.paused,
+        revision: timeline.revision,
+        health: timeline.health,
+        error: timeline.error,
+        lastValidMessageIndex: timeline.lastValidMessageIndex,
+        lastAnalyzedAt: timeline.lastAnalyzedAt ? new Date(timeline.lastAnalyzedAt).toISOString() : null,
+        updatedAt: new Date(timeline.updatedAt).toISOString(),
+        actors: {
+          total: actors.length,
+          byKind: countBy(actors.map((actor) => actor.kind)),
+          present: actors.filter((actor) => actor.present).length,
+          confirmed: actors.filter((actor) => actor.confirmed).length,
+          cortexLinked: actors.filter((actor) => !!actor.cortexEntityId).length,
+        },
+        minds: {
+          total: minds.length,
+          entries: items.length,
+          byCategory: countBy(items.map((item) => item.category)),
+          byStatus: countBy(items.map((item) => item.status)),
+          bySource: countBy(items.map((item) => item.source)),
+          locked: items.filter((item) => item.locked).length,
+          pinned: items.filter((item) => item.pinned).length,
+        },
+        analysisRecords: {
+          total: timeline.records.length,
+          recent: timeline.records.slice(-10).reverse().map((record) => ({
+            messageIndex: record.messageIndex,
+            swipe: record.swipeId,
+            changes: record.changeCount,
+            createdAt: new Date(record.createdAt).toISOString(),
+          })),
+        },
+      } : { available: false },
+    };
+  }
+
+  function openDiagnostics(): void {
+    if (diagnosticsModal) {
+      diagnosticsRefresh?.();
+      return;
+    }
+    const modal = ctx.ui.showModal({ title: "LumiMind Diagnostics", width: 760, maxHeight: 820 });
+    diagnosticsModal = modal;
+    const shell = element("div", "lm-root lm-diagnostics");
+    const intro = element("div", "lm-diagnostics-intro");
+    const introCopy = element("div");
+    introCopy.append(element("div", "lm-kicker", "Sanitized support report"), element("p", undefined, "Copy this report into a bug report or support conversation. Private mind content and credentials are excluded."));
+    const privacy = element("span", "lm-diagnostics-privacy", "No story text");
+    intro.append(introCopy, privacy);
+
+    const summary = element("div", "lm-diagnostics-summary");
+    const output = element("pre", "lm-diagnostics-output");
+    const generated = element("span", "lm-diagnostics-generated");
+    const toolbar = element("div", "lm-diagnostics-toolbar");
+    const copy = textButton("Copy report", () => {
+      void copyText(output.textContent ?? "").then((copied) => {
+        copy.textContent = copied ? "Copied" : "Copy failed";
+        copy.classList.toggle("lm-copy-failed", !copied);
+        setTimeout(() => {
+          copy.textContent = "Copy report";
+          copy.classList.remove("lm-copy-failed");
+        }, 1800);
+      });
+    }, "primary");
+    const refresh = textButton("Refresh snapshot", () => {
+      refresh.disabled = true;
+      refresh.textContent = "Refreshing…";
+      syncContext();
+      setTimeout(() => {
+        diagnosticsRefresh?.();
+        refresh.disabled = false;
+        refresh.textContent = "Refresh snapshot";
+      }, 350);
+    });
+    toolbar.append(generated, refresh, copy);
+    shell.append(intro, summary, toolbar, output);
+    modal.root.appendChild(shell);
+
+    diagnosticsRefresh = () => {
+      const report = buildDiagnosticReport();
+      const timeline = currentState?.timeline;
+      summary.replaceChildren();
+      const stats: Array<[string, string]> = [
+        ["Timeline", timeline ? healthLabel(timeline.health) : "No active timeline"],
+        ["Revision", timeline ? String(timeline.revision) : "—"],
+        ["Actors", timeline ? String(timeline.actors.length) : "0"],
+        ["Records", timeline ? String(timeline.records.length) : "0"],
+      ];
+      for (const [label, value] of stats) {
+        const stat = element("div", "lm-diagnostic-stat");
+        stat.append(element("span", undefined, label), element("strong", undefined, value));
+        summary.appendChild(stat);
+      }
+      output.textContent = JSON.stringify(report, null, 2);
+      generated.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    };
+    diagnosticsRefresh();
+    modal.onDismiss(() => {
+      diagnosticsModal = null;
+      diagnosticsRefresh = null;
+    });
   }
 
   function ensureSelection(): void {
@@ -936,7 +1150,16 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       list.appendChild(row);
     }
     permissions.appendChild(list);
-    container.append(permissions, save);
+
+    const diagnostics = element("section", "lm-settings-card lm-diagnostics-card");
+    const diagnosticsHeading = element("div", "lm-settings-title-row");
+    const diagnosticsCopy = element("div");
+    diagnosticsCopy.append(element("h3", "lm-settings-title", "Diagnostics"), element("p", "lm-settings-description", "Inspect a sanitized snapshot of UI context, permissions, controller availability, timeline health, and aggregate state."));
+    diagnosticsHeading.append(diagnosticsCopy, textButton("Open diagnostics", openDiagnostics, "secondary"));
+    diagnostics.appendChild(diagnosticsHeading);
+    diagnostics.appendChild(element("div", "lm-diagnostics-safe-note", "Safe to share: story text, private mental state, actor names, aliases, evidence, credentials, and full IDs are omitted."));
+
+    container.append(permissions, diagnostics, save);
     return container;
   }
 
@@ -1207,6 +1430,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       ensureSeedTab();
       updateBadge();
       render();
+      diagnosticsRefresh?.();
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -1242,6 +1466,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   return () => {
     if (noticeTimer) clearTimeout(noticeTimer);
+    diagnosticsModal?.dismiss();
+    diagnosticsModal = null;
+    diagnosticsRefresh = null;
     destroySeedTab();
     while (cleanups.length) {
       try { cleanups.pop()?.(); } catch { /* Best-effort teardown. */ }

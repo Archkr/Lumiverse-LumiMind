@@ -237,6 +237,7 @@ export const LUMI_MIND_CSS = `
 .lm-settings-card { display:flex; flex-direction:column; gap:10px; padding:12px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:var(--lm-panel); }
 .lm-settings-title { font-size:13px; }
 .lm-settings-title-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.lm-settings-description { max-width:440px; margin-top:3px !important; color:var(--lm-muted); font-size:9px; }
 .lm-settings-grid, .lm-seed-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .lm-field { display:flex; flex-direction:column; gap:5px; min-width:0; }
 .lm-label { color:var(--lm-muted); font-size:10px; font-weight:650; }
@@ -264,6 +265,21 @@ export const LUMI_MIND_CSS = `
 .lm-capability strong { color:var(--lm-muted); font-size:8px; }
 .lm-capability-dot { width:6px; height:6px; border-radius:50%; background:var(--lm-danger); }
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
+.lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
+.lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
+
+.lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
+.lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }
+.lm-diagnostics-intro p { margin-top:4px !important; color:var(--lm-muted); font-size:10px; }
+.lm-diagnostics-privacy { padding:3px 7px; border:1px solid color-mix(in srgb,var(--lm-success) 28%,var(--lm-line)); border-radius:999px; color:var(--lm-success); background:color-mix(in srgb,var(--lm-success) 8%,transparent); font-size:8px; font-weight:750; white-space:nowrap; text-transform:uppercase; letter-spacing:.04em; }
+.lm-diagnostics-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; }
+.lm-diagnostic-stat { display:flex; flex-direction:column; gap:2px; min-width:0; padding:8px 9px; border:1px solid var(--lm-line); border-radius:8px; background:var(--lm-fill); }
+.lm-diagnostic-stat span { color:var(--lm-dim); font-size:8px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+.lm-diagnostic-stat strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:11px; }
+.lm-diagnostics-toolbar { display:flex; align-items:center; justify-content:flex-end; gap:7px; }
+.lm-diagnostics-generated { margin-right:auto; color:var(--lm-dim); font-family:var(--lumiverse-font-mono,ui-monospace,monospace); font-size:8px; }
+.lm-diagnostics-output { width:100%; max-height:470px; margin:0; padding:12px; overflow:auto; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-bg); color:var(--lm-muted); font:10px/1.55 var(--lumiverse-font-mono,ui-monospace,SFMono-Regular,Consolas,monospace); white-space:pre; tab-size:2; user-select:text; }
+.lm-copy-failed { color:var(--lm-accent-fg) !important; background:var(--lm-danger) !important; border-color:var(--lm-danger) !important; }
 
 .lm-modal-form { display:flex; flex-direction:column; gap:13px; padding:3px 1px 1px; color:var(--lm-text); }
 .lm-core-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -300,6 +316,10 @@ export const LUMI_MIND_CSS = `
   .lm-timeline-status > .lm-inline-actions { grid-column:2; }
   .lm-seed-header { grid-template-columns:1fr; }
   .lm-seed-toolbar .lm-button-primary { margin-left:0; }
+  .lm-diagnostics-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .lm-diagnostics-intro { grid-template-columns:1fr; }
+  .lm-diagnostics-toolbar { align-items:stretch; flex-wrap:wrap; }
+  .lm-diagnostics-generated { width:100%; margin-right:0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

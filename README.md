@@ -54,6 +54,8 @@ The drawer has four views:
 - **Changes** — per-message analysis records, swipe provenance, checkpoint freshness, pause/resume, retry, and rebuild controls.
 - **Settings** — controller connection, analysis and injection budgets, privacy controls, Cortex behavior, interoperability, and live permissions.
 
+Settings also includes a **Diagnostics** window. It summarizes frontend context, live permissions, controller availability, timeline health, aggregate actor/mind counts, and recent analysis metadata. **Copy report** produces formatted JSON suitable for a bug report while excluding story text, beliefs, secrets, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
+
 User edits become locked manual overrides. Controller analysis cannot overwrite a locked item until it is unlocked.
 
 Actor tools support rename, alias add/remove, confirm, merge, split, timeline removal, and optional identity-only Cortex publication. Removing an actor from LumiMind does not delete a character card, persona, or Cortex entity.
@@ -154,6 +156,10 @@ Spoiler-safe mode is a UI disclosure control, not encryption. This is expected i
 **Prompt injection is missing**
 
 Confirm that the chat is active, not paused, `interceptor` is granted, and the target character/persona exists in the actor registry. Check Prompt Breakdown for **LumiMind — Private Mind**.
+
+**Support needs more detail**
+
+Open Mind Lens → Settings → Diagnostics, choose **Refresh snapshot**, then **Copy report**. The copied JSON is sanitized and does not include private story or mind content.
 
 ## Development layout
 

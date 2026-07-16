@@ -190,6 +190,9 @@ function formatRelativeTime(timestamp, now = Date.now()) {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+function compactChatId(chatId) {
+  return chatId.length <= 16 ? chatId : `${chatId.slice(0, 7)}\u2026${chatId.slice(-6)}`;
+}
 
 // src/ui/styles.ts
 var LUMI_MIND_CSS = `
@@ -431,6 +434,7 @@ var LUMI_MIND_CSS = `
 .lm-settings-card { display:flex; flex-direction:column; gap:10px; padding:12px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:var(--lm-panel); }
 .lm-settings-title { font-size:13px; }
 .lm-settings-title-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.lm-settings-description { max-width:440px; margin-top:3px !important; color:var(--lm-muted); font-size:9px; }
 .lm-settings-grid, .lm-seed-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .lm-field { display:flex; flex-direction:column; gap:5px; min-width:0; }
 .lm-label { color:var(--lm-muted); font-size:10px; font-weight:650; }
@@ -458,6 +462,21 @@ var LUMI_MIND_CSS = `
 .lm-capability strong { color:var(--lm-muted); font-size:8px; }
 .lm-capability-dot { width:6px; height:6px; border-radius:50%; background:var(--lm-danger); }
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
+.lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
+.lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
+
+.lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
+.lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }
+.lm-diagnostics-intro p { margin-top:4px !important; color:var(--lm-muted); font-size:10px; }
+.lm-diagnostics-privacy { padding:3px 7px; border:1px solid color-mix(in srgb,var(--lm-success) 28%,var(--lm-line)); border-radius:999px; color:var(--lm-success); background:color-mix(in srgb,var(--lm-success) 8%,transparent); font-size:8px; font-weight:750; white-space:nowrap; text-transform:uppercase; letter-spacing:.04em; }
+.lm-diagnostics-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; }
+.lm-diagnostic-stat { display:flex; flex-direction:column; gap:2px; min-width:0; padding:8px 9px; border:1px solid var(--lm-line); border-radius:8px; background:var(--lm-fill); }
+.lm-diagnostic-stat span { color:var(--lm-dim); font-size:8px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+.lm-diagnostic-stat strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:11px; }
+.lm-diagnostics-toolbar { display:flex; align-items:center; justify-content:flex-end; gap:7px; }
+.lm-diagnostics-generated { margin-right:auto; color:var(--lm-dim); font-family:var(--lumiverse-font-mono,ui-monospace,monospace); font-size:8px; }
+.lm-diagnostics-output { width:100%; max-height:470px; margin:0; padding:12px; overflow:auto; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-bg); color:var(--lm-muted); font:10px/1.55 var(--lumiverse-font-mono,ui-monospace,SFMono-Regular,Consolas,monospace); white-space:pre; tab-size:2; user-select:text; }
+.lm-copy-failed { color:var(--lm-accent-fg) !important; background:var(--lm-danger) !important; border-color:var(--lm-danger) !important; }
 
 .lm-modal-form { display:flex; flex-direction:column; gap:13px; padding:3px 1px 1px; color:var(--lm-text); }
 .lm-core-form { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -494,6 +513,10 @@ var LUMI_MIND_CSS = `
   .lm-timeline-status > .lm-inline-actions { grid-column:2; }
   .lm-seed-header { grid-template-columns:1fr; }
   .lm-seed-toolbar .lm-button-primary { margin-left:0; }
+  .lm-diagnostics-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .lm-diagnostics-intro { grid-template-columns:1fr; }
+  .lm-diagnostics-toolbar { align-items:stretch; flex-wrap:wrap; }
+  .lm-diagnostics-generated { width:100%; margin-right:0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -609,6 +632,8 @@ function setup(ctx) {
   let settingsDirty = false;
   let notice = null;
   let noticeTimer = null;
+  let diagnosticsModal = null;
+  let diagnosticsRefresh = null;
   let seedTab = null;
   let seedRoot = null;
   let seedEditorUnsub = null;
@@ -640,6 +665,212 @@ function setup(ctx) {
   function syncContext() {
     const active2 = safeActiveChat(ctx);
     send({ type: "refresh", chatId: active2.chatId, characterId: active2.characterId });
+  }
+  async function copyText(value) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+    }
+    const fallback = element("textarea");
+    fallback.value = value;
+    fallback.setAttribute("readonly", "true");
+    fallback.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.appendChild(fallback);
+    fallback.focus();
+    fallback.select();
+    try {
+      return document.execCommand("copy");
+    } catch {
+      return false;
+    } finally {
+      fallback.remove();
+    }
+  }
+  function buildDiagnosticReport() {
+    const state = currentState;
+    const timeline = state?.timeline ?? null;
+    const actors = timeline?.actors ?? [];
+    const minds = timeline ? Object.values(timeline.minds) : [];
+    const items = minds.flatMap((mind) => mind.items);
+    const countBy = (values) => values.reduce((counts, value) => {
+      counts[value] = (counts[value] ?? 0) + 1;
+      return counts;
+    }, {});
+    let editorState = null;
+    try {
+      if (state?.permissions.characters) editorState = ctx.ui.characterEditor.getState();
+    } catch {
+      editorState = null;
+    }
+    const active2 = safeActiveChat(ctx);
+    return {
+      reportFormat: "lumi_mind.diagnostics.v1",
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      privacy: {
+        sanitized: true,
+        excluded: ["mind entry text", "beliefs", "secrets", "evidence excerpts", "actor names", "aliases", "API credentials", "full entity IDs"]
+      },
+      extension: {
+        identifier: ctx.manifest.identifier,
+        name: ctx.manifest.name,
+        version: ctx.manifest.version,
+        minimumLumiverseVersion: ctx.manifest.minimum_lumiverse_version ?? null
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        online: navigator.onLine,
+        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio }
+      },
+      frontend: {
+        activeView,
+        drawer: ctx.ui.events.getDrawerState(),
+        activeChat: {
+          available: !!active2.chatId,
+          reference: active2.chatId ? compactChatId(active2.chatId) : null,
+          characterAvailable: !!active2.characterId,
+          matchesBackendState: active2.chatId === (state?.activeChatId ?? null)
+        },
+        seedEditor: {
+          available: !!seedTab,
+          open: editorState?.open ?? false,
+          characterAvailable: !!editorState?.characterId,
+          draftLoaded: !!seedDraft,
+          persisted: seedPersisted,
+          dirty: seedDirty,
+          loading: seedLoading,
+          generating: seedGenerating
+        }
+      },
+      permissions: state?.permissions ?? null,
+      controller: state ? {
+        dedicatedConnectionSelected: !!state.settings.controllerConnectionId,
+        connectionCount: state.connections.length,
+        connections: state.connections.map((connection) => ({
+          provider: connection.provider,
+          model: connection.model,
+          default: connection.isDefault,
+          credentialConfigured: connection.hasApiKey
+        })),
+        temperature: state.settings.controllerTemperature,
+        maxOutputTokens: state.settings.controllerMaxTokens
+      } : null,
+      injection: state ? {
+        tokenBudget: state.settings.injectionTokenBudget,
+        secondaryActorLimit: state.settings.secondaryActorLimit,
+        interceptorAvailable: state.permissions.interceptor
+      } : null,
+      features: state ? {
+        spoilerSafe: state.settings.spoilerSafe,
+        cortexImport: state.settings.cortexImportEnabled,
+        cortexWriteback: state.settings.cortexWritebackEnabled,
+        privateInterop: state.settings.privateInteropEnabled
+      } : null,
+      timeline: timeline ? {
+        available: true,
+        chatReference: compactChatId(timeline.chatId),
+        active: timeline.active,
+        paused: timeline.paused,
+        revision: timeline.revision,
+        health: timeline.health,
+        error: timeline.error,
+        lastValidMessageIndex: timeline.lastValidMessageIndex,
+        lastAnalyzedAt: timeline.lastAnalyzedAt ? new Date(timeline.lastAnalyzedAt).toISOString() : null,
+        updatedAt: new Date(timeline.updatedAt).toISOString(),
+        actors: {
+          total: actors.length,
+          byKind: countBy(actors.map((actor) => actor.kind)),
+          present: actors.filter((actor) => actor.present).length,
+          confirmed: actors.filter((actor) => actor.confirmed).length,
+          cortexLinked: actors.filter((actor) => !!actor.cortexEntityId).length
+        },
+        minds: {
+          total: minds.length,
+          entries: items.length,
+          byCategory: countBy(items.map((item) => item.category)),
+          byStatus: countBy(items.map((item) => item.status)),
+          bySource: countBy(items.map((item) => item.source)),
+          locked: items.filter((item) => item.locked).length,
+          pinned: items.filter((item) => item.pinned).length
+        },
+        analysisRecords: {
+          total: timeline.records.length,
+          recent: timeline.records.slice(-10).reverse().map((record) => ({
+            messageIndex: record.messageIndex,
+            swipe: record.swipeId,
+            changes: record.changeCount,
+            createdAt: new Date(record.createdAt).toISOString()
+          }))
+        }
+      } : { available: false }
+    };
+  }
+  function openDiagnostics() {
+    if (diagnosticsModal) {
+      diagnosticsRefresh?.();
+      return;
+    }
+    const modal = ctx.ui.showModal({ title: "LumiMind Diagnostics", width: 760, maxHeight: 820 });
+    diagnosticsModal = modal;
+    const shell = element("div", "lm-root lm-diagnostics");
+    const intro = element("div", "lm-diagnostics-intro");
+    const introCopy = element("div");
+    introCopy.append(element("div", "lm-kicker", "Sanitized support report"), element("p", void 0, "Copy this report into a bug report or support conversation. Private mind content and credentials are excluded."));
+    const privacy = element("span", "lm-diagnostics-privacy", "No story text");
+    intro.append(introCopy, privacy);
+    const summary = element("div", "lm-diagnostics-summary");
+    const output = element("pre", "lm-diagnostics-output");
+    const generated = element("span", "lm-diagnostics-generated");
+    const toolbar = element("div", "lm-diagnostics-toolbar");
+    const copy = textButton("Copy report", () => {
+      void copyText(output.textContent ?? "").then((copied) => {
+        copy.textContent = copied ? "Copied" : "Copy failed";
+        copy.classList.toggle("lm-copy-failed", !copied);
+        setTimeout(() => {
+          copy.textContent = "Copy report";
+          copy.classList.remove("lm-copy-failed");
+        }, 1800);
+      });
+    }, "primary");
+    const refresh = textButton("Refresh snapshot", () => {
+      refresh.disabled = true;
+      refresh.textContent = "Refreshing\u2026";
+      syncContext();
+      setTimeout(() => {
+        diagnosticsRefresh?.();
+        refresh.disabled = false;
+        refresh.textContent = "Refresh snapshot";
+      }, 350);
+    });
+    toolbar.append(generated, refresh, copy);
+    shell.append(intro, summary, toolbar, output);
+    modal.root.appendChild(shell);
+    diagnosticsRefresh = () => {
+      const report = buildDiagnosticReport();
+      const timeline = currentState?.timeline;
+      summary.replaceChildren();
+      const stats = [
+        ["Timeline", timeline ? healthLabel(timeline.health) : "No active timeline"],
+        ["Revision", timeline ? String(timeline.revision) : "\u2014"],
+        ["Actors", timeline ? String(timeline.actors.length) : "0"],
+        ["Records", timeline ? String(timeline.records.length) : "0"]
+      ];
+      for (const [label, value] of stats) {
+        const stat = element("div", "lm-diagnostic-stat");
+        stat.append(element("span", void 0, label), element("strong", void 0, value));
+        summary.appendChild(stat);
+      }
+      output.textContent = JSON.stringify(report, null, 2);
+      generated.textContent = `Updated ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}`;
+    };
+    diagnosticsRefresh();
+    modal.onDismiss(() => {
+      diagnosticsModal = null;
+      diagnosticsRefresh = null;
+    });
   }
   function ensureSelection() {
     const actors = currentState?.timeline?.actors ?? [];
@@ -1320,7 +1551,14 @@ function setup(ctx) {
       list.appendChild(row);
     }
     permissions.appendChild(list);
-    container.append(permissions, save);
+    const diagnostics = element("section", "lm-settings-card lm-diagnostics-card");
+    const diagnosticsHeading = element("div", "lm-settings-title-row");
+    const diagnosticsCopy = element("div");
+    diagnosticsCopy.append(element("h3", "lm-settings-title", "Diagnostics"), element("p", "lm-settings-description", "Inspect a sanitized snapshot of UI context, permissions, controller availability, timeline health, and aggregate state."));
+    diagnosticsHeading.append(diagnosticsCopy, textButton("Open diagnostics", openDiagnostics, "secondary"));
+    diagnostics.appendChild(diagnosticsHeading);
+    diagnostics.appendChild(element("div", "lm-diagnostics-safe-note", "Safe to share: story text, private mental state, actor names, aliases, evidence, credentials, and full IDs are omitted."));
+    container.append(permissions, diagnostics, save);
     return container;
   }
   function render() {
@@ -1593,6 +1831,7 @@ function setup(ctx) {
       ensureSeedTab();
       updateBadge();
       render();
+      diagnosticsRefresh?.();
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -1625,6 +1864,9 @@ function setup(ctx) {
   send({ type: "ready", chatId: active.chatId, characterId: active.characterId });
   return () => {
     if (noticeTimer) clearTimeout(noticeTimer);
+    diagnosticsModal?.dismiss();
+    diagnosticsModal = null;
+    diagnosticsRefresh = null;
     destroySeedTab();
     while (cleanups.length) {
       try {
