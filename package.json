@@ -1,0 +1,21 @@
+{
+  "name": "lumiverse-lumi-mind",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:backend": "esbuild src/backend.ts --bundle --outfile=dist/backend.js --format=esm --platform=node --target=esnext",
+    "build:frontend": "esbuild src/frontend.ts --bundle --outfile=dist/frontend.js --format=esm --platform=browser --target=esnext",
+    "build": "bun run build:backend && bun run build:frontend",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "esbuild": "^0.28.1",
+    "lumiverse-spindle-types": "0.6.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

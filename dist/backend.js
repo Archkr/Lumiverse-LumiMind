@@ -1,0 +1,1714 @@
+// src/types.ts
+var MIND_SCHEMA_VERSION = 1;
+var ANALYSIS_SCHEMA_VERSION = 1;
+var EXTENSION_KEY = "lumi_mind";
+
+// src/engine.ts
+var DEFAULT_SETTINGS = {
+  controllerConnectionId: null,
+  controllerTemperature: 0.1,
+  controllerMaxTokens: 1800,
+  injectionTokenBudget: 1600,
+  secondaryActorLimit: 4,
+  cortexImportEnabled: true,
+  cortexWritebackEnabled: false,
+  privateInteropEnabled: false,
+  spoilerSafe: true
+};
+var EMPTY_CORE = {
+  selfConcept: "",
+  values: [],
+  desires: [],
+  fears: [],
+  boundaries: [],
+  notes: []
+};
+var EMPTY_EVIDENCE = { messageId: "seed", swipeId: 0, excerpt: "Mind seed", messageIndex: -1 };
+var CATEGORY_ORDER = {
+  goal: 7,
+  plan: 6,
+  secret: 5,
+  belief: 4,
+  relationship: 3,
+  emotion: 2,
+  awareness: 1
+};
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function stringValue(value, fallback = "") {
+  return typeof value === "string" ? value.trim() : fallback;
+}
+function strings(value) {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(value.filter((entry) => typeof entry === "string"));
+}
+function uniqueStrings(values) {
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const raw of values) {
+    const value = raw.trim();
+    const key = value.toLocaleLowerCase();
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+function clamp(value, min, max, fallback) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+function normalizeSettings(value) {
+  const raw = asObject(value);
+  return {
+    controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
+    controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
+    controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8e3, DEFAULT_SETTINGS.controllerMaxTokens)),
+    injectionTokenBudget: Math.round(clamp(raw.injectionTokenBudget, 400, 4e3, DEFAULT_SETTINGS.injectionTokenBudget)),
+    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    cortexImportEnabled: raw.cortexImportEnabled !== false,
+    cortexWritebackEnabled: raw.cortexWritebackEnabled === true,
+    privateInteropEnabled: raw.privateInteropEnabled === true,
+    spoilerSafe: raw.spoilerSafe !== false
+  };
+}
+function normalizeCore(value) {
+  const raw = asObject(value);
+  return {
+    selfConcept: stringValue(raw.selfConcept),
+    values: strings(raw.values),
+    desires: strings(raw.desires),
+    fears: strings(raw.fears),
+    boundaries: strings(raw.boundaries),
+    notes: strings(raw.notes)
+  };
+}
+function normalizeSeed(value) {
+  const raw = asObject(value);
+  if (!Object.keys(raw).length) return null;
+  const priors = Array.isArray(raw.relationshipPriors) ? raw.relationshipPriors.flatMap((entry) => {
+    const item = asObject(entry);
+    const target = stringValue(item.target);
+    const stance = stringValue(item.stance);
+    return target && stance ? [{ target, stance }] : [];
+  }) : [];
+  return {
+    schemaVersion: MIND_SCHEMA_VERSION,
+    core: normalizeCore(raw.core),
+    startingBeliefs: strings(raw.startingBeliefs),
+    startingSecrets: strings(raw.startingSecrets),
+    startingGoals: strings(raw.startingGoals),
+    relationshipPriors: priors,
+    updatedAt: Math.round(clamp(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, Date.now()))
+  };
+}
+function makeEmptySeed(core = {}) {
+  return {
+    schemaVersion: MIND_SCHEMA_VERSION,
+    core: normalizeCore({ ...EMPTY_CORE, ...core }),
+    startingBeliefs: [],
+    startingSecrets: [],
+    startingGoals: [],
+    relationshipPriors: [],
+    updatedAt: Date.now()
+  };
+}
+function stableHash(input) {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= BigInt(input.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * prime);
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+function messageContentHash(message) {
+  return stableHash(`${message.role}
+${message.name ?? ""}
+${message.content}`);
+}
+function nextPrefixHash(prefixHash, contentHash, swipeId) {
+  return stableHash(`${prefixHash}|${contentHash}|${swipeId}`);
+}
+function sortMessages(messages) {
+  return messages.filter((message) => message && typeof message.id === "string" && (message.role === "user" || message.role === "assistant")).map((message, index) => ({ ...message, index_in_chat: message.index_in_chat ?? index })).sort((left, right) => (left.index_in_chat ?? 0) - (right.index_in_chat ?? 0));
+}
+function createActor(input) {
+  const now = Date.now();
+  return {
+    id: input.id ?? `actor:${crypto.randomUUID()}`,
+    kind: input.kind,
+    canonicalName: input.name.trim() || "Unnamed actor",
+    aliases: uniqueStrings(input.aliases ?? []),
+    characterId: input.characterId ?? null,
+    personaId: input.personaId ?? null,
+    cortexEntityId: input.cortexEntityId ?? null,
+    confidence: clamp(input.confidence, 0, 1, 0.75),
+    confirmed: input.confirmed ?? input.kind !== "npc",
+    present: false,
+    firstSeenMessageId: null,
+    lastSeenMessageId: null,
+    updatedAt: now
+  };
+}
+function seedItem(actorId, category2, text2, index) {
+  const now = Date.now();
+  return {
+    id: `seed:${actorId}:${category2}:${stableHash(`${index}:${text2}`)}`,
+    category: category2,
+    text: text2,
+    status: "active",
+    confidence: 1,
+    targetActorIds: [],
+    concealedFromActorIds: [],
+    intensity: null,
+    dimensions: {},
+    evidence: EMPTY_EVIDENCE,
+    locked: true,
+    pinned: true,
+    source: "seed",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+function makeBaseMind(actorId, seed) {
+  const normalized = seed ?? makeEmptySeed();
+  const items = [
+    ...normalized.startingBeliefs.map((text2, index) => seedItem(actorId, "belief", text2, index)),
+    ...normalized.startingSecrets.map((text2, index) => seedItem(actorId, "secret", text2, index)),
+    ...normalized.startingGoals.map((text2, index) => seedItem(actorId, "goal", text2, index)),
+    ...normalized.relationshipPriors.map(
+      (prior, index) => seedItem(actorId, "relationship", `${prior.target}: ${prior.stance}`, index)
+    )
+  ];
+  return {
+    actorId,
+    core: normalized.core,
+    items,
+    sceneSummary: "",
+    attention: "",
+    presentActorIds: [],
+    lastUpdatedMessageId: null
+  };
+}
+function createTimeline(chatId) {
+  return {
+    schemaVersion: MIND_SCHEMA_VERSION,
+    chatId,
+    active: false,
+    paused: false,
+    revision: 0,
+    health: "inactive",
+    error: null,
+    actors: {},
+    baseMinds: {},
+    minds: {},
+    records: [],
+    manualOverrides: [],
+    lastValidMessageIndex: -1,
+    lastAnalyzedAt: null,
+    updatedAt: Date.now()
+  };
+}
+function normalizeTimeline(value, chatId) {
+  const raw = asObject(value);
+  if (raw.schemaVersion !== MIND_SCHEMA_VERSION || raw.chatId !== chatId) return createTimeline(chatId);
+  const fallback = createTimeline(chatId);
+  return {
+    ...fallback,
+    ...raw,
+    schemaVersion: MIND_SCHEMA_VERSION,
+    chatId,
+    active: raw.active === true,
+    paused: raw.paused === true,
+    revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
+    actors: asObject(raw.actors),
+    baseMinds: asObject(raw.baseMinds),
+    minds: asObject(raw.minds),
+    records: Array.isArray(raw.records) ? raw.records : [],
+    manualOverrides: Array.isArray(raw.manualOverrides) ? raw.manualOverrides : [],
+    lastValidMessageIndex: Math.round(clamp(raw.lastValidMessageIndex, -1, Number.MAX_SAFE_INTEGER, -1)),
+    updatedAt: Math.round(clamp(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, Date.now()))
+  };
+}
+function actorNames(actor) {
+  return [actor.canonicalName, ...actor.aliases].map((name) => name.trim().toLocaleLowerCase()).filter(Boolean);
+}
+function resolveActorId(actors, reference) {
+  const normalized = reference.trim().toLocaleLowerCase();
+  if (!normalized) return null;
+  if (actors[reference]) return reference;
+  const matches = Object.values(actors).filter((actor) => actorNames(actor).includes(normalized));
+  return matches.length === 1 ? matches[0].id : null;
+}
+function upsertActor(timeline, input, evidence) {
+  const stableId = input.characterId ? `character:${input.characterId}` : input.personaId ? `persona:${input.personaId}` : input.id;
+  const byStable = stableId ? timeline.actors[stableId] : null;
+  const byNameId = resolveActorId(timeline.actors, input.name);
+  const byCortex = input.cortexEntityId ? Object.values(timeline.actors).find((actor2) => actor2.cortexEntityId === input.cortexEntityId) : null;
+  const existing = byStable ?? byCortex ?? (byNameId ? timeline.actors[byNameId] : null);
+  if (existing) {
+    existing.aliases = uniqueStrings([
+      ...existing.aliases,
+      ...input.aliases ?? [],
+      ...existing.canonicalName.toLocaleLowerCase() !== input.name.trim().toLocaleLowerCase() ? [input.name] : []
+    ]);
+    existing.confidence = Math.max(existing.confidence, clamp(input.confidence, 0, 1, existing.confidence));
+    existing.confirmed = existing.confirmed || input.confirmed === true;
+    existing.characterId = existing.characterId ?? input.characterId ?? null;
+    existing.personaId = existing.personaId ?? input.personaId ?? null;
+    existing.cortexEntityId = existing.cortexEntityId ?? input.cortexEntityId ?? null;
+    existing.updatedAt = Date.now();
+    if (evidence) {
+      existing.firstSeenMessageId ??= evidence.messageId;
+      existing.lastSeenMessageId = evidence.messageId;
+    }
+    timeline.baseMinds[existing.id] ??= makeBaseMind(existing.id);
+    return existing;
+  }
+  const actor = createActor({ ...input, id: stableId });
+  if (evidence) {
+    actor.firstSeenMessageId = evidence.messageId;
+    actor.lastSeenMessageId = evidence.messageId;
+  }
+  timeline.actors[actor.id] = actor;
+  timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  return actor;
+}
+function cloneMind(mind) {
+  return {
+    ...mind,
+    core: { ...mind.core, values: [...mind.core.values], desires: [...mind.core.desires], fears: [...mind.core.fears], boundaries: [...mind.core.boundaries], notes: [...mind.core.notes] },
+    items: mind.items.map((item) => ({
+      ...item,
+      targetActorIds: [...item.targetActorIds],
+      concealedFromActorIds: [...item.concealedFromActorIds],
+      dimensions: { ...item.dimensions },
+      evidence: { ...item.evidence }
+    })),
+    presentActorIds: [...mind.presentActorIds]
+  };
+}
+function decayEmotions(minds, changedSubjects) {
+  for (const mind of Object.values(minds)) {
+    mind.items = mind.items.flatMap((item) => {
+      if (item.category !== "emotion" || item.locked || changedSubjects.has(mind.actorId) || item.intensity === null) return [item];
+      const intensity = Number((item.intensity * 0.85).toFixed(3));
+      return intensity < 0.1 ? [] : [{ ...item, intensity }];
+    });
+  }
+}
+function itemFromDelta(delta) {
+  return {
+    id: delta.targetItemId || delta.id,
+    category: delta.category,
+    text: delta.text,
+    status: delta.status,
+    confidence: delta.confidence,
+    targetActorIds: [...delta.targetActorIds],
+    concealedFromActorIds: [...delta.concealedFromActorIds],
+    intensity: delta.intensity,
+    dimensions: { ...delta.dimensions },
+    evidence: { ...delta.evidence },
+    locked: false,
+    pinned: false,
+    source: "controller",
+    createdAt: delta.createdAt,
+    updatedAt: delta.createdAt
+  };
+}
+function applyRecord(record, actors, minds) {
+  if (record.actorMentions.length > 0) {
+    for (const actor of Object.values(actors)) actor.present = false;
+    for (const mention of record.actorMentions) {
+      const actor = actors[mention.ref];
+      if (!actor) continue;
+      actor.present = mention.present;
+      actor.confidence = Math.max(actor.confidence, mention.confidence);
+      actor.aliases = uniqueStrings([...actor.aliases, ...mention.aliases]);
+      actor.firstSeenMessageId ??= mention.evidence.messageId;
+      actor.lastSeenMessageId = mention.evidence.messageId;
+    }
+  }
+  const changedSubjects = new Set(record.deltas.filter((delta) => delta.category === "emotion").map((delta) => delta.subjectActorId));
+  decayEmotions(minds, changedSubjects);
+  for (const delta of record.deltas) {
+    const mind = minds[delta.subjectActorId] ??= makeBaseMind(delta.subjectActorId);
+    const targetIndex = delta.targetItemId ? mind.items.findIndex((item) => item.id === delta.targetItemId) : -1;
+    const target = targetIndex >= 0 ? mind.items[targetIndex] : null;
+    if (target?.locked) continue;
+    if (delta.operation === "remove") {
+      if (targetIndex >= 0) mind.items.splice(targetIndex, 1);
+      continue;
+    }
+    if (delta.operation === "resolve" || delta.operation === "abandon") {
+      if (targetIndex >= 0) {
+        mind.items[targetIndex] = {
+          ...target,
+          status: delta.operation === "resolve" ? "resolved" : "abandoned",
+          evidence: { ...delta.evidence },
+          updatedAt: delta.createdAt
+        };
+      }
+      continue;
+    }
+    const next = itemFromDelta(delta);
+    if (targetIndex >= 0) {
+      mind.items[targetIndex] = {
+        ...target,
+        ...next,
+        id: target.id,
+        createdAt: target.createdAt
+      };
+    } else {
+      mind.items.push(next);
+    }
+    mind.lastUpdatedMessageId = delta.evidence.messageId;
+  }
+  const presentIds = Object.values(actors).filter((actor) => actor.present).map((actor) => actor.id);
+  for (const mind of Object.values(minds)) mind.presentActorIds = [...presentIds];
+}
+function applyManualOverrides(minds, overrides) {
+  for (const override of overrides) {
+    const mind = minds[override.actorId];
+    if (!mind) continue;
+    const targetId = override.targetItemId ?? override.item?.id;
+    const index = targetId ? mind.items.findIndex((item) => item.id === targetId) : -1;
+    if (override.operation === "remove") {
+      if (index >= 0) mind.items.splice(index, 1);
+      continue;
+    }
+    if (!override.item) continue;
+    if (index >= 0) mind.items[index] = { ...override.item, id: mind.items[index].id };
+    else mind.items.push({ ...override.item });
+  }
+}
+function rebuildTimeline(timeline, rawMessages) {
+  const messages = sortMessages(rawMessages);
+  const minds = {};
+  for (const actor of Object.values(timeline.actors)) {
+    actor.present = false;
+    minds[actor.id] = cloneMind(timeline.baseMinds[actor.id] ?? makeBaseMind(actor.id));
+  }
+  const matchedRecords = [];
+  let prefixHash = "root";
+  let firstMissingIndex = messages.length;
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const contentHash = messageContentHash(message);
+    const swipeId = message.swipe_id ?? 0;
+    const record = timeline.records.find(
+      (candidate) => candidate.messageId === message.id && candidate.swipeId === swipeId && candidate.contentHash === contentHash && candidate.prefixHash === prefixHash && candidate.analysisVersion === ANALYSIS_SCHEMA_VERSION
+    );
+    if (!record) {
+      firstMissingIndex = index;
+      break;
+    }
+    matchedRecords.push(record);
+    applyRecord(record, timeline.actors, minds);
+    prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
+  }
+  applyManualOverrides(minds, timeline.manualOverrides);
+  timeline.minds = minds;
+  timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1;
+  if (!timeline.active) timeline.health = "inactive";
+  else if (timeline.paused) timeline.health = "paused";
+  else if (firstMissingIndex < messages.length) timeline.health = "stale";
+  else timeline.health = "ready";
+  return { messages, matchedRecords, firstMissingIndex, nextPrefix: prefixHash };
+}
+function evidenceFor(message, excerpt = "") {
+  const clean = excerpt.trim() || message.content.trim().slice(0, 240);
+  return {
+    messageId: message.id,
+    swipeId: message.swipe_id ?? 0,
+    excerpt: clean,
+    messageIndex: message.index_in_chat ?? 0
+  };
+}
+function actorRefMap(timeline) {
+  const map = /* @__PURE__ */ new Map();
+  for (const actor of Object.values(timeline.actors)) {
+    map.set(actor.id.toLocaleLowerCase(), actor.id);
+    for (const name of actorNames(actor)) map.set(name, actor.id);
+    if (actor.characterId) map.set(`character:${actor.characterId}`.toLocaleLowerCase(), actor.id);
+    if (actor.personaId) map.set(`persona:${actor.personaId}`.toLocaleLowerCase(), actor.id);
+  }
+  return map;
+}
+function resolveOrCreateRef(timeline, refs, reference, evidence) {
+  const key = reference.trim().toLocaleLowerCase();
+  const existing = refs.get(key) ?? resolveActorId(timeline.actors, reference);
+  if (existing) return existing;
+  const actor = upsertActor(timeline, { kind: "npc", name: reference || "Unnamed actor", confidence: 0.55 }, evidence);
+  refs.set(key, actor.id);
+  refs.set(actor.canonicalName.toLocaleLowerCase(), actor.id);
+  return actor.id;
+}
+function normalizeStatus(value) {
+  return value === "resolved" || value === "abandoned" || value === "uncertain" ? value : "active";
+}
+function normalizeCategory(value) {
+  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : "belief";
+}
+function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, analysis, controller) {
+  const messages = sortMessages(batchMessages);
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  const refs = actorRefMap(timeline);
+  const mentionsByMessage = /* @__PURE__ */ new Map();
+  for (const raw of analysis.actorMentions ?? []) {
+    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    if (!message || !raw.name?.trim()) continue;
+    const evidence = evidenceFor(message);
+    const stableReference = raw.ref?.trim() || raw.name.trim();
+    let id = refs.get(stableReference.toLocaleLowerCase()) ?? refs.get(raw.name.trim().toLocaleLowerCase());
+    if (!id) {
+      const actor2 = upsertActor(
+        timeline,
+        {
+          kind: raw.kind === "character" || raw.kind === "persona" ? raw.kind : "npc",
+          name: raw.name,
+          aliases: raw.aliases ?? [],
+          confidence: raw.confidence
+        },
+        evidence
+      );
+      id = actor2.id;
+    }
+    const actor = timeline.actors[id];
+    actor.aliases = uniqueStrings([...actor.aliases, ...raw.aliases ?? []]);
+    refs.set(stableReference.toLocaleLowerCase(), id);
+    refs.set(raw.name.trim().toLocaleLowerCase(), id);
+    for (const alias of raw.aliases ?? []) refs.set(alias.trim().toLocaleLowerCase(), id);
+    const mention = {
+      ref: id,
+      name: actor.canonicalName,
+      aliases: actor.aliases,
+      kind: actor.kind,
+      confidence: clamp(raw.confidence, 0, 1, 0.75),
+      present: raw.present !== false,
+      evidence
+    };
+    const list = mentionsByMessage.get(message.id) ?? [];
+    list.push(mention);
+    mentionsByMessage.set(message.id, list);
+  }
+  const changesByMessage = /* @__PURE__ */ new Map();
+  for (const raw of analysis.changes ?? []) {
+    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    if (!message || !raw.subjectRef?.trim()) continue;
+    const evidence = evidenceFor(message, raw.evidenceExcerpt);
+    const subjectActorId = resolveOrCreateRef(timeline, refs, raw.subjectRef, evidence);
+    const operation2 = raw.operation === "update" || raw.operation === "resolve" || raw.operation === "abandon" || raw.operation === "remove" ? raw.operation : "add";
+    const dimensions = {};
+    for (const [key, value] of Object.entries(raw.dimensions ?? {})) {
+      dimensions[key] = clamp(value, -1, 1, 0);
+    }
+    const delta = {
+      id: `delta:${crypto.randomUUID()}`,
+      subjectActorId,
+      category: normalizeCategory(raw.category),
+      operation: operation2,
+      targetItemId: stringValue(raw.targetItemId) || null,
+      text: stringValue(raw.text),
+      status: normalizeStatus(raw.status),
+      confidence: clamp(raw.confidence, 0, 1, 0.75),
+      targetActorIds: uniqueStrings((raw.targetRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
+      concealedFromActorIds: uniqueStrings((raw.concealedFromRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
+      intensity: raw.intensity === null || raw.intensity === void 0 ? null : clamp(raw.intensity, 0, 1, 0.5),
+      dimensions,
+      evidence,
+      createdAt: Date.now()
+    };
+    const list = changesByMessage.get(message.id) ?? [];
+    list.push(delta);
+    changesByMessage.set(message.id, list);
+  }
+  const records = [];
+  let prefixHash = startingPrefix;
+  for (const message of messages) {
+    const contentHash = messageContentHash(message);
+    const swipeId = message.swipe_id ?? 0;
+    records.push({
+      id: `analysis:${crypto.randomUUID()}`,
+      analysisVersion: ANALYSIS_SCHEMA_VERSION,
+      messageId: message.id,
+      messageIndex: message.index_in_chat ?? 0,
+      swipeId,
+      contentHash,
+      prefixHash,
+      actorMentions: mentionsByMessage.get(message.id) ?? [],
+      deltas: changesByMessage.get(message.id) ?? [],
+      controller,
+      createdAt: Date.now()
+    });
+    prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
+  }
+  return records;
+}
+function addManualItem(timeline, actorId, category2, text2) {
+  const now = Date.now();
+  const item = {
+    id: `manual:${crypto.randomUUID()}`,
+    category: category2,
+    text: text2.trim(),
+    status: "active",
+    confidence: 1,
+    targetActorIds: [],
+    concealedFromActorIds: [],
+    intensity: category2 === "emotion" ? 0.7 : null,
+    dimensions: {},
+    evidence: { messageId: "manual", swipeId: 0, excerpt: "User-authored", messageIndex: -1 },
+    locked: true,
+    pinned: true,
+    source: "manual",
+    createdAt: now,
+    updatedAt: now
+  };
+  timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "upsert", item, targetItemId: null, createdAt: now });
+}
+function overrideItem(timeline, actorId, itemId, mutate) {
+  const current = timeline.minds[actorId]?.items.find((item2) => item2.id === itemId);
+  if (!current) return false;
+  const item = mutate({ ...current, targetActorIds: [...current.targetActorIds], concealedFromActorIds: [...current.concealedFromActorIds], dimensions: { ...current.dimensions }, evidence: { ...current.evidence } });
+  item.source = "manual";
+  item.updatedAt = Date.now();
+  timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "upsert", item, targetItemId: itemId, createdAt: Date.now() });
+  return true;
+}
+function removeManualItem(timeline, actorId, itemId) {
+  timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "remove", item: null, targetItemId: itemId, createdAt: Date.now() });
+}
+function mergeActors(timeline, sourceActorId, targetActorId) {
+  const source = timeline.actors[sourceActorId];
+  const target = timeline.actors[targetActorId];
+  if (!source || !target || sourceActorId === targetActorId) return false;
+  target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases]);
+  target.confidence = Math.max(target.confidence, source.confidence);
+  target.confirmed = target.confirmed || source.confirmed;
+  target.cortexEntityId ??= source.cortexEntityId;
+  const remap = (id) => id === sourceActorId ? targetActorId : id;
+  for (const record of timeline.records) {
+    for (const mention of record.actorMentions) mention.ref = remap(mention.ref);
+    for (const delta of record.deltas) {
+      delta.subjectActorId = remap(delta.subjectActorId);
+      delta.targetActorIds = uniqueStrings(delta.targetActorIds.map(remap));
+      delta.concealedFromActorIds = uniqueStrings(delta.concealedFromActorIds.map(remap));
+    }
+  }
+  for (const override of timeline.manualOverrides) override.actorId = remap(override.actorId);
+  const targetBase = timeline.baseMinds[targetActorId] ?? makeBaseMind(targetActorId);
+  const sourceBase = timeline.baseMinds[sourceActorId];
+  if (sourceBase) targetBase.items.push(...sourceBase.items.map((item) => ({ ...item, id: `${item.id}:merged` })));
+  timeline.baseMinds[targetActorId] = targetBase;
+  delete timeline.baseMinds[sourceActorId];
+  delete timeline.minds[sourceActorId];
+  delete timeline.actors[sourceActorId];
+  return true;
+}
+function removeActor(timeline, actorId) {
+  if (!timeline.actors[actorId]) return false;
+  delete timeline.actors[actorId];
+  delete timeline.baseMinds[actorId];
+  delete timeline.minds[actorId];
+  timeline.records = timeline.records.map((record) => ({
+    ...record,
+    actorMentions: record.actorMentions.filter((mention) => mention.ref !== actorId),
+    deltas: record.deltas.filter((delta) => delta.subjectActorId !== actorId).map((delta) => ({
+      ...delta,
+      targetActorIds: delta.targetActorIds.filter((id) => id !== actorId),
+      concealedFromActorIds: delta.concealedFromActorIds.filter((id) => id !== actorId)
+    }))
+  }));
+  timeline.manualOverrides = timeline.manualOverrides.filter((override) => override.actorId !== actorId);
+  return true;
+}
+function splitActor(timeline, actorId, name) {
+  const source = timeline.actors[actorId];
+  if (!source || !name.trim()) return null;
+  const actor = createActor({ kind: "npc", name, confidence: 1, confirmed: true });
+  timeline.actors[actor.id] = actor;
+  timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  return actor;
+}
+function itemScore(item, relevantActorIds) {
+  let score = CATEGORY_ORDER[item.category] * 10 + item.confidence * 10;
+  if (item.locked) score += 30;
+  if (item.pinned) score += 40;
+  if (item.status !== "active" && item.status !== "uncertain") score -= 25;
+  if (item.targetActorIds.some((id) => relevantActorIds.has(id))) score += 20;
+  score += Math.min(15, (item.updatedAt || item.createdAt) / 1e12);
+  return score;
+}
+function actorLabel(actors, id) {
+  return actors[id]?.canonicalName ?? id;
+}
+function formatMind(mind, actors, maxChars, compact) {
+  const actor = actors[mind.actorId];
+  if (!actor) return "";
+  const relevant = new Set(mind.presentActorIds);
+  const items = [...mind.items].filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
+  const lines = [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`];
+  if (!compact && mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
+  if (!compact && mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
+  for (const item of items) {
+    const targets = item.targetActorIds.length ? ` [toward ${item.targetActorIds.map((id) => actorLabel(actors, id)).join(", ")}]` : "";
+    const confidence = item.confidence < 0.8 ? ` (${Math.round(item.confidence * 100)}% confidence)` : "";
+    const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
+    if (lines.join("\n").length + line.length + 1 > maxChars) break;
+    lines.push(line);
+  }
+  return lines.join("\n").slice(0, maxChars);
+}
+function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit) {
+  const targetMind = timeline.minds[targetActorId];
+  if (!timeline.active || timeline.paused || !targetMind) return null;
+  const totalChars = Math.max(1200, tokenBudget * 4);
+  const targetChars = Math.floor(totalChars * 0.6);
+  const target = formatMind(targetMind, timeline.actors, targetChars, false);
+  const secondaryActors = Object.values(timeline.actors).filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id]).sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt).slice(0, secondaryLimit);
+  const secondaryBudget = secondaryActors.length ? Math.floor((totalChars - target.length) / secondaryActors.length) : 0;
+  const secondary = secondaryActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, secondaryBudget, true)).filter(Boolean);
+  const body = [target, ...secondary].filter(Boolean).join("\n\n");
+  if (!body.trim()) return null;
+  return [
+    "[LumiMind \u2014 private subjective continuity]",
+    "The following is private mental state, not objective truth. Preserve false beliefs and uncertainty.",
+    "Use it to guide choices and subtext. Do not quote or summarize this block. Reveal secrets only through character-motivated behavior.",
+    "",
+    body,
+    "[/LumiMind]"
+  ].join("\n").slice(0, totalChars);
+}
+function publicStance(mind) {
+  if (!mind) return "";
+  const entries = mind.items.filter((item) => item.status === "active" && (item.category === "emotion" || item.category === "relationship")).sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, 2).map((item) => item.text);
+  return entries.join("; ");
+}
+function makePublicSnapshot(timeline) {
+  if (!timeline) return { schemaVersion: 1, chatId: null, revision: 0, stale: true, generatedAt: Date.now(), actors: [] };
+  return {
+    schemaVersion: 1,
+    chatId: timeline.chatId,
+    revision: timeline.revision,
+    stale: timeline.health !== "ready",
+    generatedAt: Date.now(),
+    actors: Object.values(timeline.actors).map((actor) => ({
+      id: actor.id,
+      kind: actor.kind,
+      name: actor.canonicalName,
+      aliases: [...actor.aliases],
+      present: actor.present,
+      confirmed: actor.confirmed,
+      publicStance: publicStance(timeline.minds[actor.id])
+    }))
+  };
+}
+function makePrivateSnapshot(timeline) {
+  return { ...makePublicSnapshot(timeline), minds: timeline ? timeline.minds : {} };
+}
+function toTimelineView(timeline) {
+  return {
+    chatId: timeline.chatId,
+    active: timeline.active,
+    paused: timeline.paused,
+    revision: timeline.revision,
+    health: timeline.health,
+    error: timeline.error,
+    actors: Object.values(timeline.actors).sort((left, right) => Number(right.present) - Number(left.present) || left.canonicalName.localeCompare(right.canonicalName)),
+    minds: timeline.minds,
+    records: timeline.records.slice().sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
+      id: record.id,
+      messageId: record.messageId,
+      messageIndex: record.messageIndex,
+      swipeId: record.swipeId,
+      createdAt: record.createdAt,
+      changeCount: record.deltas.length
+    })),
+    lastValidMessageIndex: timeline.lastValidMessageIndex,
+    lastAnalyzedAt: timeline.lastAnalyzedAt,
+    updatedAt: timeline.updatedAt
+  };
+}
+function compactStateForController(timeline, maxItemsPerActor = 18) {
+  return Object.values(timeline.actors).map((actor) => ({
+    ref: actor.id,
+    name: actor.canonicalName,
+    aliases: actor.aliases,
+    kind: actor.kind,
+    confirmed: actor.confirmed,
+    present: actor.present,
+    core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
+    items: (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, maxItemsPerActor).map((item) => ({
+      id: item.id,
+      category: item.category,
+      text: item.text,
+      status: item.status,
+      confidence: item.confidence,
+      targetActorIds: item.targetActorIds,
+      concealedFromActorIds: item.concealedFromActorIds,
+      intensity: item.intensity,
+      dimensions: item.dimensions,
+      locked: item.locked
+    }))
+  }));
+}
+
+// src/controller.ts
+var THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
+function asObject2(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function text(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+function numberValue(value, fallback) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+function booleanValue(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
+function stringArray(value) {
+  return Array.isArray(value) ? uniqueStrings(value.filter((entry) => typeof entry === "string")) : [];
+}
+function sanitizeControllerText(value) {
+  return value.replace(THINK_BLOCK_RE, "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+}
+function parseJsonValue(content) {
+  const cleaned = sanitizeControllerText(content);
+  if (!cleaned) return null;
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const objectMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!objectMatch) return null;
+    try {
+      return JSON.parse(objectMatch[0]);
+    } catch {
+      return null;
+    }
+  }
+}
+function category(value) {
+  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : "belief";
+}
+function operation(value) {
+  return value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : "add";
+}
+function normalizeControllerAnalysis(value) {
+  const raw = asObject2(value);
+  const actorMentions = Array.isArray(raw.actorMentions) ? raw.actorMentions.flatMap((entry) => {
+    const item = asObject2(entry);
+    const name = text(item.name);
+    const messageId = text(item.messageId);
+    if (!name || !messageId) return [];
+    const kind = item.kind === "character" || item.kind === "persona" ? item.kind : "npc";
+    return [{
+      ref: text(item.ref) || name,
+      name,
+      aliases: stringArray(item.aliases),
+      kind,
+      confidence: Math.min(1, Math.max(0, numberValue(item.confidence, 0.75))),
+      present: booleanValue(item.present, true),
+      messageId
+    }];
+  }) : [];
+  const changes = Array.isArray(raw.changes) ? raw.changes.flatMap((entry) => {
+    const item = asObject2(entry);
+    const subjectRef = text(item.subjectRef);
+    const messageId = text(item.messageId);
+    if (!subjectRef || !messageId) return [];
+    const dimensions = {};
+    for (const [key, value2] of Object.entries(asObject2(item.dimensions))) {
+      dimensions[key] = Math.min(1, Math.max(-1, numberValue(value2, 0)));
+    }
+    return [{
+      subjectRef,
+      category: category(item.category),
+      operation: operation(item.operation),
+      targetItemId: text(item.targetItemId) || null,
+      text: text(item.text),
+      status: item.status === "resolved" || item.status === "abandoned" || item.status === "uncertain" ? item.status : "active",
+      confidence: Math.min(1, Math.max(0, numberValue(item.confidence, 0.75))),
+      targetRefs: stringArray(item.targetRefs),
+      concealedFromRefs: stringArray(item.concealedFromRefs),
+      intensity: item.intensity === null || item.intensity === void 0 ? null : Math.min(1, Math.max(0, numberValue(item.intensity, 0.5))),
+      dimensions,
+      messageId,
+      evidenceExcerpt: text(item.evidenceExcerpt)
+    }];
+  }) : [];
+  return { actorMentions, changes };
+}
+var ANALYSIS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    actorMentions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ref: { type: "string" },
+          name: { type: "string" },
+          aliases: { type: "array", items: { type: "string" } },
+          kind: { type: "string", enum: ["character", "persona", "npc"] },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          present: { type: "boolean" },
+          messageId: { type: "string" }
+        },
+        required: ["ref", "name", "aliases", "kind", "confidence", "present", "messageId"]
+      }
+    },
+    changes: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          subjectRef: { type: "string" },
+          category: { type: "string", enum: ["belief", "secret", "goal", "plan", "emotion", "relationship", "awareness"] },
+          operation: { type: "string", enum: ["add", "update", "resolve", "abandon", "remove"] },
+          targetItemId: { anyOf: [{ type: "string" }, { type: "null" }] },
+          text: { type: "string" },
+          status: { type: "string", enum: ["active", "resolved", "abandoned", "uncertain"] },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          targetRefs: { type: "array", items: { type: "string" } },
+          concealedFromRefs: { type: "array", items: { type: "string" } },
+          intensity: { anyOf: [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }] },
+          dimensions: {
+            type: "object",
+            additionalProperties: { type: "number", minimum: -1, maximum: 1 }
+          },
+          messageId: { type: "string" },
+          evidenceExcerpt: { type: "string" }
+        },
+        required: [
+          "subjectRef",
+          "category",
+          "operation",
+          "targetItemId",
+          "text",
+          "status",
+          "confidence",
+          "targetRefs",
+          "concealedFromRefs",
+          "intensity",
+          "dimensions",
+          "messageId",
+          "evidenceExcerpt"
+        ]
+      }
+    }
+  },
+  required: ["actorMentions", "changes"]
+};
+var SEED_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    schemaVersion: { type: "number", enum: [1] },
+    core: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        selfConcept: { type: "string" },
+        values: { type: "array", items: { type: "string" } },
+        desires: { type: "array", items: { type: "string" } },
+        fears: { type: "array", items: { type: "string" } },
+        boundaries: { type: "array", items: { type: "string" } },
+        notes: { type: "array", items: { type: "string" } }
+      },
+      required: ["selfConcept", "values", "desires", "fears", "boundaries", "notes"]
+    },
+    startingBeliefs: { type: "array", items: { type: "string" } },
+    startingSecrets: { type: "array", items: { type: "string" } },
+    startingGoals: { type: "array", items: { type: "string" } },
+    relationshipPriors: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: { target: { type: "string" }, stance: { type: "string" } },
+        required: ["target", "stance"]
+      }
+    },
+    updatedAt: { type: "number" }
+  },
+  required: ["schemaVersion", "core", "startingBeliefs", "startingSecrets", "startingGoals", "relationshipPriors", "updatedAt"]
+};
+function structuredParameters(provider, schemaName, schema) {
+  const normalized = provider?.trim().toLocaleLowerCase() ?? "";
+  if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
+    return { responseMimeType: "application/json", responseSchema: schema };
+  }
+  if (normalized === "openai" || normalized === "openrouter") {
+    return { response_format: { type: "json_schema", json_schema: { name: schemaName, strict: true, schema } } };
+  }
+  return {};
+}
+function noReasoningParameters(provider) {
+  const normalized = provider?.trim().toLocaleLowerCase() ?? "";
+  if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
+    return { thinkingConfig: { thinkingLevel: "minimal", includeThoughts: false } };
+  }
+  if (normalized === "nanogpt") return { reasoning_effort: "none" };
+  return { reasoning: { effort: "none" } };
+}
+async function resolveConnection(settings, userId, fallbackConnectionId) {
+  const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
+  if (!id) return { id: null, provider: null, model: null };
+  const connection = await spindle.connections.get(id, userId).catch(() => null);
+  return { id, provider: connection?.provider ?? null, model: connection?.model ?? null };
+}
+async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId) {
+  const connection = await resolveConnection(settings, userId, fallbackConnectionId);
+  const result = await spindle.generate.quiet({
+    type: "quiet",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt }
+    ],
+    parameters: {
+      temperature: settings.controllerTemperature,
+      max_tokens: settings.controllerMaxTokens,
+      ...noReasoningParameters(connection.provider),
+      ...structuredParameters(connection.provider, schemaName, schema)
+    },
+    ...connection.id ? { connection_id: connection.id } : {},
+    userId
+  });
+  const object = asObject2(result);
+  const content = sanitizeControllerText(text(object.content));
+  const reasoning = sanitizeControllerText(text(object.reasoning));
+  const raw = content || reasoning;
+  return {
+    parsed: parseJsonValue(raw),
+    raw,
+    meta: { connectionId: connection.id, provider: connection.provider, model: connection.model }
+  };
+}
+function renderMessages(messages) {
+  return messages.map((message) => {
+    const name = message.name?.trim() || message.role;
+    return `<message id="${message.id}" index="${message.index_in_chat ?? 0}" role="${message.role}" speaker="${name}">
+${message.content}
+</message>`;
+  }).join("\n");
+}
+var ANALYSIS_SYSTEM_PROMPT = [
+  "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
+  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency: cards, the user persona, and NPCs.",
+  "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
+  "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
+  "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
+  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked entries.",
+  "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
+  "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
+].join("\n");
+async function analyzeMessages(input) {
+  const prompt = [
+    "Existing actor registry and current subjective state:",
+    `<mind_state>
+${JSON.stringify(input.compactState)}
+</mind_state>`,
+    "Recent transcript context (context only; do not emit changes for these messages):",
+    `<recent_context>
+${renderMessages(input.recentContext)}
+</recent_context>`,
+    "Messages to analyze:",
+    `<analysis_batch>
+${renderMessages(input.messages)}
+</analysis_batch>`,
+    'Return {"actorMentions": [...], "changes": [...]} now.'
+  ].join("\n\n").slice(0, 12e4);
+  const result = await quietJson(
+    prompt,
+    ANALYSIS_SYSTEM_PROMPT,
+    "lumi_mind_analysis_v1",
+    ANALYSIS_SCHEMA,
+    input.settings,
+    input.userId,
+    input.fallbackConnectionId
+  );
+  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
+  return { analysis: normalizeControllerAnalysis(result.parsed), meta: result.meta, raw: result.raw };
+}
+var SEED_SYSTEM_PROMPT = [
+  "You draft reusable LumiMind character-card seeds.",
+  "Return JSON only. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
+  "The seed must be concise, portable across new chats, and written as private subjective state rather than visible roleplay prose."
+].join("\n");
+async function generateSeedDraft(input) {
+  const prompt = [
+    "Draft a reusable mind seed from this character card:",
+    `<character_card>
+${JSON.stringify(input.character)}
+</character_card>`,
+    "Use schemaVersion 1 and updatedAt equal to the current Unix time in milliseconds."
+  ].join("\n\n").slice(0, 8e4);
+  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId);
+  const normalized = normalizeSeed(result.parsed);
+  if (!normalized) throw new Error("The LumiMind controller returned an invalid mind seed.");
+  return { ...makeEmptySeed(), ...normalized, schemaVersion: 1, updatedAt: Date.now() };
+}
+
+// src/storage.ts
+var SETTINGS_PATH = "global/settings.json";
+var TIMELINE_DIR = "timelines";
+function timelinePath(chatId) {
+  return `${TIMELINE_DIR}/${encodeURIComponent(chatId)}.json`;
+}
+async function loadSettings(userId) {
+  const stored = await spindle.userStorage.getJson(SETTINGS_PATH, { fallback: DEFAULT_SETTINGS, userId });
+  return normalizeSettings(stored);
+}
+async function saveSettings(userId, patch) {
+  const current = await loadSettings(userId);
+  const next = normalizeSettings({ ...current, ...patch });
+  await spindle.userStorage.setJson(SETTINGS_PATH, next, { indent: 2, userId });
+  return next;
+}
+async function loadTimeline(chatId, userId) {
+  const stored = await spindle.userStorage.getJson(timelinePath(chatId), { fallback: null, userId });
+  return normalizeTimeline(stored, chatId);
+}
+async function saveTimeline(timeline, userId) {
+  timeline.updatedAt = Date.now();
+  await spindle.userStorage.setJson(timelinePath(timeline.chatId), timeline, { indent: 2, userId });
+}
+async function deleteTimeline(chatId, userId) {
+  await spindle.userStorage.delete(timelinePath(chatId), userId).catch(() => void 0);
+}
+
+// src/backend.ts
+var INTERCEPTOR_PRIORITY = 125;
+var ANALYSIS_BATCH_SIZE = 6;
+var RECENT_CONTEXT_SIZE = 4;
+var MAX_RECORDS = 5e3;
+var RECONCILE_DEBOUNCE_MS = 650;
+var timelines = /* @__PURE__ */ new Map();
+var settingsCache = /* @__PURE__ */ new Map();
+var activeChats = /* @__PURE__ */ new Map();
+var chatUsers = /* @__PURE__ */ new Map();
+var operations = /* @__PURE__ */ new Map();
+var reconcileTimers = /* @__PURE__ */ new Map();
+var generationContexts = /* @__PURE__ */ new Map();
+var latestGenerationByChat = /* @__PURE__ */ new Map();
+var connectionByChat = /* @__PURE__ */ new Map();
+var lastFrontendUserId = null;
+function cacheKey(userId, chatId) {
+  return `${userId}:${chatId}`;
+}
+function asObject3(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function readString(value, keys) {
+  const raw = asObject3(value);
+  for (const key of keys) {
+    const candidate = raw[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+function extractChatId(value) {
+  return readString(value, ["chatId", "chat_id"]);
+}
+function extractCharacterId(value) {
+  return readString(value, ["characterId", "character_id", "targetCharacterId", "target_character_id"]);
+}
+function extractPersonaId(value) {
+  return readString(value, ["personaId", "persona_id"]);
+}
+function extractGenerationType(value) {
+  return readString(value, ["generationType", "generation_type"]) ?? "normal";
+}
+function rememberChatUser(chatId, userId) {
+  if (chatId && userId) chatUsers.set(chatId, userId);
+}
+function resolveUserId(chatId, eventUserId) {
+  return eventUserId || (chatId ? chatUsers.get(chatId) : null) || lastFrontendUserId;
+}
+function storageTimelineKey(userId, chatId) {
+  return cacheKey(userId, chatId);
+}
+async function getSettings(userId) {
+  const cached = settingsCache.get(userId);
+  if (cached) return cached;
+  const loaded = await loadSettings(userId);
+  settingsCache.set(userId, loaded);
+  return loaded;
+}
+async function getTimeline(chatId, userId) {
+  const key = storageTimelineKey(userId, chatId);
+  const cached = timelines.get(key);
+  if (cached) return cached;
+  const loaded = await loadTimeline(chatId, userId);
+  timelines.set(key, loaded);
+  return loaded;
+}
+function send(message, userId) {
+  spindle.sendToFrontend(message, userId);
+}
+function notice(userId, tone, message) {
+  send({ type: "notice", tone, message }, userId);
+}
+function hasPermission(id) {
+  try {
+    return spindle.permissions.has(id);
+  } catch {
+    return false;
+  }
+}
+function currentPermissions() {
+  return {
+    generation: hasPermission("generation"),
+    interceptor: hasPermission("interceptor"),
+    chats: hasPermission("chats"),
+    chatMutation: hasPermission("chat_mutation"),
+    characters: hasPermission("characters"),
+    personas: hasPermission("personas"),
+    memories: hasPermission("memories")
+  };
+}
+async function listConnections(userId) {
+  if (!hasPermission("generation")) return [];
+  const connections = await spindle.connections.list(userId).catch(() => []);
+  return connections.map((connection) => ({
+    id: connection.id,
+    name: connection.name,
+    provider: connection.provider,
+    model: connection.model,
+    isDefault: connection.is_default,
+    hasApiKey: connection.has_api_key
+  }));
+}
+async function buildFrontendState(userId, requestedChatId, characterId) {
+  const active = activeChats.get(userId) ?? { chatId: null, characterId: null };
+  const chatId = requestedChatId === void 0 ? active.chatId : requestedChatId;
+  if (requestedChatId !== void 0 || characterId !== void 0) {
+    activeChats.set(userId, { chatId: chatId ?? null, characterId: characterId ?? active.characterId });
+  }
+  const [settings, connections, timeline] = await Promise.all([
+    getSettings(userId),
+    listConnections(userId),
+    chatId ? getTimeline(chatId, userId) : Promise.resolve(null)
+  ]);
+  return {
+    settings,
+    permissions: currentPermissions(),
+    connections,
+    activeChatId: chatId ?? null,
+    activeCharacterId: characterId ?? active.characterId,
+    timeline: timeline ? toTimelineView(timeline) : null
+  };
+}
+async function sendState(userId, chatId, characterId) {
+  send({ type: "state", state: await buildFrontendState(userId, chatId, characterId) }, userId);
+}
+function normalizeChatMessages(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry, index) => {
+    const raw = asObject3(entry);
+    const id = readString(raw, ["id"]);
+    const content = typeof raw.content === "string" ? raw.content : "";
+    if (!id) return [];
+    const role = raw.role === "user" || raw.role === "assistant" || raw.role === "system" ? raw.role : raw.is_user === true ? "user" : "assistant";
+    return [{
+      id,
+      role,
+      content,
+      name: typeof raw.name === "string" ? raw.name : void 0,
+      extra: asObject3(raw.extra),
+      metadata: asObject3(raw.metadata),
+      swipe_id: typeof raw.swipe_id === "number" ? raw.swipe_id : 0,
+      swipes: Array.isArray(raw.swipes) ? raw.swipes.filter((item) => typeof item === "string") : [content],
+      index_in_chat: typeof raw.index_in_chat === "number" ? raw.index_in_chat : index,
+      created_at: typeof raw.created_at === "number" ? raw.created_at : void 0
+    }];
+  });
+}
+async function getChatMessages(chatId, userId) {
+  const api = spindle.chat;
+  return sortMessages(normalizeChatMessages(await api.getMessages(chatId, userId)));
+}
+function seedFromCharacter(character) {
+  const extension = asObject3(character.extensions?.[EXTENSION_KEY]);
+  const seedContainer = asObject3(extension.seed);
+  const stored = normalizeSeed(seedContainer.v1 ?? extension.seed);
+  if (stored) return stored;
+  const seed = makeEmptySeed({
+    selfConcept: character.description.trim(),
+    notes: uniqueStrings([character.personality, character.creator_notes].filter(Boolean))
+  });
+  seed.startingBeliefs = [];
+  seed.startingGoals = [];
+  return seed;
+}
+function seedFromPersona(persona) {
+  return makeEmptySeed({
+    selfConcept: persona.description.trim(),
+    notes: uniqueStrings([persona.title].filter(Boolean))
+  });
+}
+async function initializeHostActors(timeline, userId) {
+  const permissions = currentPermissions();
+  const chat = permissions.chats ? await spindle.chats.get(timeline.chatId, userId).catch(() => null) : null;
+  if (chat && permissions.characters) {
+    const metadata = asObject3(chat.metadata);
+    const groupIds = Array.isArray(metadata.character_ids) ? metadata.character_ids.filter((id) => typeof id === "string") : [];
+    const characterIds = uniqueStrings(groupIds.length ? groupIds : [chat.character_id].filter(Boolean));
+    for (const characterId of characterIds) {
+      const character = await spindle.characters.get(characterId, userId).catch(() => null);
+      if (!character) continue;
+      const actor = upsertActor(timeline, {
+        id: `character:${character.id}`,
+        kind: "character",
+        name: character.name,
+        characterId: character.id,
+        confidence: 1,
+        confirmed: true
+      });
+      timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seedFromCharacter(character));
+    }
+  }
+  if (permissions.personas) {
+    const persona = await spindle.personas.getActive(userId).catch(() => null);
+    if (persona) {
+      const actor = upsertActor(timeline, {
+        id: `persona:${persona.id}`,
+        kind: "persona",
+        name: persona.name,
+        personaId: persona.id,
+        confidence: 1,
+        confirmed: true
+      });
+      timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seedFromPersona(persona));
+    }
+  }
+  const settings = await getSettings(userId);
+  if (settings.cortexImportEnabled && permissions.memories) {
+    const entities = await spindle.memories.entities.list(timeline.chatId, { activeOnly: false, limit: 250, userId }).catch(() => []);
+    for (const entity of entities) {
+      if (entity.entityType !== "character") continue;
+      upsertActor(timeline, {
+        kind: "npc",
+        name: entity.name,
+        aliases: entity.aliases,
+        cortexEntityId: entity.id,
+        confidence: entity.confidence === "confirmed" ? 1 : 0.65,
+        confirmed: entity.confidence === "confirmed"
+      });
+    }
+  }
+  rebuildTimeline(timeline, []);
+}
+async function ensurePersonaActor(timeline, personaId, userId) {
+  const existing = timeline.actors[`persona:${personaId}`];
+  if (existing) return existing;
+  const persona = hasPermission("personas") ? await spindle.personas.get(personaId, userId).catch(() => null) : null;
+  const actor = upsertActor(timeline, {
+    id: `persona:${personaId}`,
+    kind: "persona",
+    name: persona?.name ?? "User persona",
+    personaId,
+    confidence: 1,
+    confirmed: true
+  });
+  timeline.baseMinds[actor.id] = makeBaseMind(actor.id, persona ? seedFromPersona(persona) : null);
+  return actor;
+}
+function enqueue(userId, chatId, task) {
+  const key = cacheKey(userId, chatId);
+  const previous = operations.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => void 0).then(task);
+  operations.set(key, next);
+  void next.finally(() => {
+    if (operations.get(key) === next) operations.delete(key);
+  });
+  return next;
+}
+async function persistAndPublish(timeline, userId, announce = true) {
+  timeline.revision += 1;
+  timeline.updatedAt = Date.now();
+  await saveTimeline(timeline, userId);
+  await publishScene(userId, timeline);
+  if (announce && activeChats.get(userId)?.chatId === timeline.chatId) await sendState(userId, timeline.chatId);
+}
+async function reconcileChat(userId, chatId, force = false) {
+  const timeline = await getTimeline(chatId, userId);
+  if (!timeline.active || timeline.paused) {
+    const messages2 = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
+    rebuildTimeline(timeline, messages2);
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+  if (!hasPermission("generation") || !hasPermission("chat_mutation")) {
+    timeline.health = "error";
+    timeline.error = "LumiMind requires generation and chat history permissions to analyze this chat.";
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+  if (force) timeline.records = [];
+  const messages = await getChatMessages(chatId, userId);
+  let derivation = rebuildTimeline(timeline, messages);
+  if (derivation.firstMissingIndex >= derivation.messages.length) {
+    timeline.health = "ready";
+    timeline.error = null;
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+  timeline.health = timeline.records.length ? "pending" : "initializing";
+  timeline.error = null;
+  await persistAndPublish(timeline, userId);
+  try {
+    const settings = await getSettings(userId);
+    while (derivation.firstMissingIndex < derivation.messages.length) {
+      const start = derivation.firstMissingIndex;
+      const batch = derivation.messages.slice(start, start + ANALYSIS_BATCH_SIZE);
+      const recentContext = derivation.messages.slice(Math.max(0, start - RECENT_CONTEXT_SIZE), start);
+      const result = await analyzeMessages({
+        messages: batch,
+        recentContext,
+        compactState: compactStateForController(timeline),
+        settings,
+        userId,
+        fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null
+      });
+      const records = materializeAnalysisRecords(timeline, batch, derivation.nextPrefix, result.analysis, result.meta);
+      timeline.records.push(...records);
+      if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
+      timeline.lastAnalyzedAt = Date.now();
+      derivation = rebuildTimeline(timeline, messages);
+      timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
+      timeline.error = null;
+      await persistAndPublish(timeline, userId);
+    }
+  } catch (error) {
+    timeline.health = "error";
+    timeline.error = error instanceof Error ? error.message : String(error);
+    await persistAndPublish(timeline, userId);
+    spindle.log.warn(`LumiMind analysis failed for ${chatId}: ${timeline.error}`);
+  }
+}
+function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS) {
+  const key = cacheKey(userId, chatId);
+  const existing = reconcileTimers.get(key);
+  if (existing) clearTimeout(existing);
+  reconcileTimers.set(key, setTimeout(() => {
+    reconcileTimers.delete(key);
+    void enqueue(userId, chatId, () => reconcileChat(userId, chatId));
+  }, delay));
+}
+async function activateChat(userId, chatId) {
+  const timeline = await getTimeline(chatId, userId);
+  timeline.active = true;
+  timeline.paused = false;
+  timeline.health = "initializing";
+  timeline.error = null;
+  await initializeHostActors(timeline, userId);
+  await persistAndPublish(timeline, userId);
+  notice(userId, "info", "LumiMind is building this timeline in the background.");
+  await reconcileChat(userId, chatId);
+}
+async function writeActorToCortex(userId, timeline, actor) {
+  const settings = await getSettings(userId);
+  if (!settings.cortexWritebackEnabled) throw new Error("Enable Cortex writeback in LumiMind settings first.");
+  if (!hasPermission("memories")) throw new Error("Memory Cortex permission is not granted.");
+  if (!actor.confirmed) throw new Error("Confirm this actor before writing it to Memory Cortex.");
+  const entity = await spindle.memories.entities.upsert(
+    timeline.chatId,
+    { name: actor.canonicalName, type: "character", aliases: actor.aliases, confidence: 1, provisional: false },
+    { userId }
+  );
+  actor.cortexEntityId = entity.id;
+  actor.updatedAt = Date.now();
+}
+async function publishScene(userId, timeline) {
+  const activeChatId = activeChats.get(userId)?.chatId ?? null;
+  const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
+  spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved), { requires: [] });
+  const settings = await getSettings(userId);
+  if (settings.privateInteropEnabled) {
+    spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved), { requires: ["chat_mutation"] });
+  } else {
+    try {
+      spindle.rpcPool.unregister("scene.private");
+    } catch {
+    }
+  }
+}
+function bumpAndRebuild(timeline) {
+  timeline.error = null;
+  const messages = [];
+  if (!timeline.records.length) rebuildTimeline(timeline, messages);
+}
+async function mutateTimeline(userId, chatId, mutate) {
+  await enqueue(userId, chatId, async () => {
+    const timeline = await getTimeline(chatId, userId);
+    await mutate(timeline);
+    const messages = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
+    rebuildTimeline(timeline, messages);
+    await persistAndPublish(timeline, userId);
+  });
+}
+async function cloneFork(payload, eventUserId) {
+  const sourceChatId = readString(payload, ["sourceChatId"]);
+  const forkedChatId = readString(payload, ["forkedChatId"]);
+  const userId = resolveUserId(sourceChatId, eventUserId);
+  if (!sourceChatId || !forkedChatId || !userId) return;
+  rememberChatUser(forkedChatId, userId);
+  await enqueue(userId, forkedChatId, async () => {
+    const source = await getTimeline(sourceChatId, userId);
+    if (!source.active) return;
+    const [sourceMessages, forkMessages] = await Promise.all([
+      getChatMessages(sourceChatId, userId),
+      getChatMessages(forkedChatId, userId)
+    ]);
+    const sourceIndexById = new Map(sourceMessages.map((message) => [message.id, message.index_in_chat ?? 0]));
+    const forkByIndex = new Map(forkMessages.map((message) => [message.index_in_chat ?? 0, message]));
+    const serialized = JSON.parse(JSON.stringify(source));
+    serialized.chatId = forkedChatId;
+    serialized.records = serialized.records.flatMap((record) => {
+      const index = sourceIndexById.get(record.messageId) ?? record.messageIndex;
+      const target = forkByIndex.get(index);
+      if (!target) return [];
+      const next = JSON.parse(JSON.stringify(record));
+      next.id = `analysis:${crypto.randomUUID()}`;
+      next.messageId = target.id;
+      next.messageIndex = target.index_in_chat ?? index;
+      next.actorMentions = next.actorMentions.map((mention) => ({ ...mention, evidence: { ...mention.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? index } }));
+      next.deltas = next.deltas.map((delta) => ({ ...delta, evidence: { ...delta.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? index } }));
+      return [next];
+    });
+    serialized.revision = 0;
+    serialized.updatedAt = Date.now();
+    serialized.health = serialized.paused ? "paused" : "ready";
+    serialized.error = null;
+    rebuildTimeline(serialized, forkMessages);
+    timelines.set(storageTimelineKey(userId, forkedChatId), serialized);
+    await persistAndPublish(serialized, userId, false);
+    spindle.log.info(`LumiMind inherited ${serialized.records.length} analysis records into fork ${forkedChatId}.`);
+  });
+}
+spindle.rpcPool.sync("contract.v1", {
+  schemaVersion: 1,
+  extension: "lumi_mind",
+  capabilities: ["subjective_minds", "timeline_swipes", "chat_forks", "scene_presence", "spoiler_safe"],
+  endpoints: { public: "lumi_mind.scene.current", private: "lumi_mind.scene.private" }
+}, { requires: [] });
+spindle.registerInterceptor(async (messages, context) => {
+  try {
+    const chatId = extractChatId(context);
+    const userId = resolveUserId(chatId);
+    if (!chatId || !userId) return messages;
+    rememberChatUser(chatId, userId);
+    const connectionId = readString(context, ["connectionId", "connection_id"]);
+    if (connectionId) connectionByChat.set(cacheKey(userId, chatId), connectionId);
+    const timeline = await getTimeline(chatId, userId);
+    if (!timeline.active || timeline.paused) return messages;
+    const settings = await getSettings(userId);
+    let targetActorId = null;
+    const generationType = extractGenerationType(context);
+    if (generationType === "impersonate") {
+      const personaId = extractPersonaId(context);
+      if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
+    } else {
+      const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
+      const characterId = latest?.characterId ?? extractCharacterId(context);
+      if (characterId) targetActorId = `character:${characterId}`;
+      if (!targetActorId || !timeline.actors[targetActorId]) {
+        const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
+        if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
+      }
+    }
+    if (!targetActorId || !timeline.actors[targetActorId]) return messages;
+    const injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit);
+    if (!injection) return messages;
+    const injected = { role: "system", content: injection };
+    return {
+      messages: [injected, ...messages],
+      breakdown: [{ messageIndex: 0, name: "LumiMind \u2014 Private Mind" }]
+    };
+  } catch (error) {
+    spindle.log.warn(`LumiMind interceptor degraded safely: ${error instanceof Error ? error.message : String(error)}`);
+    return messages;
+  }
+}, INTERCEPTOR_PRIORITY);
+var onEvent = spindle.on;
+onEvent("GENERATION_STARTED", (payload, eventUserId) => {
+  const chatId = extractChatId(payload);
+  const userId = resolveUserId(chatId, eventUserId);
+  const generationId = readString(payload, ["generationId", "generation_id"]);
+  if (!chatId || !userId || !generationId) return;
+  rememberChatUser(chatId, userId);
+  const context = {
+    generationId,
+    chatId,
+    characterId: extractCharacterId(payload),
+    characterName: readString(payload, ["characterName", "character_name"]),
+    generationType: extractGenerationType(payload),
+    userId
+  };
+  generationContexts.set(generationId, context);
+  latestGenerationByChat.set(cacheKey(userId, chatId), context);
+});
+onEvent("GENERATION_ENDED", (payload, eventUserId) => {
+  const generationId = readString(payload, ["generationId", "generation_id"]);
+  const remembered = generationId ? generationContexts.get(generationId) : null;
+  const chatId = extractChatId(payload) ?? remembered?.chatId ?? null;
+  const userId = resolveUserId(chatId, eventUserId ?? remembered?.userId);
+  if (generationId) generationContexts.delete(generationId);
+  if (!chatId || !userId) return;
+  if (latestGenerationByChat.get(cacheKey(userId, chatId))?.generationId === generationId) {
+    latestGenerationByChat.delete(cacheKey(userId, chatId));
+  }
+  const error = readString(payload, ["error"]);
+  const messageId = readString(payload, ["messageId", "message_id"]);
+  if (!error && messageId) scheduleReconcile(userId, chatId, 100);
+});
+for (const event of ["MESSAGE_SENT", "MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"]) {
+  onEvent(event, (payload, eventUserId) => {
+    const chatId = extractChatId(payload) ?? extractChatId(asObject3(payload).message);
+    const userId = resolveUserId(chatId, eventUserId);
+    if (!chatId || !userId) return;
+    rememberChatUser(chatId, userId);
+    scheduleReconcile(userId, chatId);
+  });
+}
+onEvent("CHAT_FORKED", (payload, eventUserId) => {
+  void cloneFork(payload, eventUserId);
+});
+onEvent("CHAT_DELETED", (payload, eventUserId) => {
+  const chatId = extractChatId(payload) ?? readString(payload, ["id"]);
+  const userId = resolveUserId(chatId, eventUserId);
+  if (!chatId || !userId) return;
+  timelines.delete(storageTimelineKey(userId, chatId));
+  void deleteTimeline(chatId, userId);
+});
+spindle.permissions.onChanged(() => {
+  if (!lastFrontendUserId) return;
+  void sendState(lastFrontendUserId);
+});
+spindle.onFrontendMessage(async (payload, userId) => {
+  lastFrontendUserId = userId;
+  const message = payload;
+  const chatId = "chatId" in message ? message.chatId ?? null : null;
+  const characterId = "characterId" in message ? message.characterId ?? null : null;
+  if (chatId) rememberChatUser(chatId, userId);
+  if (message.type === "ready" || message.type === "refresh") {
+    activeChats.set(userId, { chatId, characterId });
+    await publishScene(userId, chatId ? await getTimeline(chatId, userId) : null);
+    await sendState(userId, chatId, characterId);
+    return;
+  }
+  try {
+    if (message.type === "activate") {
+      await enqueue(userId, message.chatId, () => activateChat(userId, message.chatId));
+      return;
+    }
+    if (message.type === "pause") {
+      await mutateTimeline(userId, message.chatId, (timeline) => {
+        timeline.paused = message.paused;
+        timeline.health = message.paused ? "paused" : "pending";
+      });
+      if (!message.paused) scheduleReconcile(userId, message.chatId, 0);
+      return;
+    }
+    if (message.type === "rebuild") {
+      await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId, true));
+      return;
+    }
+    if (message.type === "retry") {
+      await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId));
+      return;
+    }
+    if (message.type === "save_settings") {
+      const next = await saveSettings(userId, message.patch);
+      settingsCache.set(userId, next);
+      await publishScene(userId);
+      await sendState(userId, message.chatId);
+      notice(userId, "success", "LumiMind settings saved.");
+      return;
+    }
+    if (message.type === "generate_seed") {
+      if (!hasPermission("characters") || !hasPermission("generation")) throw new Error("Character and generation permissions are required to draft a seed.");
+      const character = await spindle.characters.get(message.characterId, userId);
+      if (!character) throw new Error("Character card not found.");
+      const seed = await generateSeedDraft({ character, settings: await getSettings(userId), userId });
+      send({ type: "seed_draft", characterId: message.characterId, seed }, userId);
+      return;
+    }
+    if (!chatId) throw new Error("This LumiMind action requires an active chat.");
+    await mutateTimeline(userId, chatId, async (timeline) => {
+      if (message.type === "rename_actor") {
+        const actor = timeline.actors[message.actorId];
+        if (!actor || !message.name.trim()) throw new Error("Actor not found or name is empty.");
+        actor.aliases = uniqueStrings([...actor.aliases, actor.canonicalName]);
+        actor.canonicalName = message.name.trim();
+        actor.updatedAt = Date.now();
+      } else if (message.type === "add_alias") {
+        const actor = timeline.actors[message.actorId];
+        if (!actor || !message.alias.trim()) throw new Error("Actor not found or alias is empty.");
+        actor.aliases = uniqueStrings([...actor.aliases, message.alias]);
+        actor.updatedAt = Date.now();
+      } else if (message.type === "remove_alias") {
+        const actor = timeline.actors[message.actorId];
+        if (!actor) throw new Error("Actor not found.");
+        actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== message.alias.trim().toLocaleLowerCase());
+        actor.updatedAt = Date.now();
+      } else if (message.type === "confirm_actor") {
+        const actor = timeline.actors[message.actorId];
+        if (!actor) throw new Error("Actor not found.");
+        actor.confirmed = true;
+        actor.confidence = 1;
+        if ((await getSettings(userId)).cortexWritebackEnabled) await writeActorToCortex(userId, timeline, actor);
+      } else if (message.type === "writeback_actor") {
+        const actor = timeline.actors[message.actorId];
+        if (!actor) throw new Error("Actor not found.");
+        await writeActorToCortex(userId, timeline, actor);
+      } else if (message.type === "remove_actor") {
+        if (!removeActor(timeline, message.actorId)) throw new Error("Actor not found.");
+      } else if (message.type === "merge_actor") {
+        if (!mergeActors(timeline, message.sourceActorId, message.targetActorId)) throw new Error("Could not merge those actors.");
+      } else if (message.type === "split_actor") {
+        if (!splitActor(timeline, message.actorId, message.name)) throw new Error("Could not split this actor.");
+      } else if (message.type === "add_item") {
+        if (!timeline.actors[message.actorId] || !message.text.trim()) throw new Error("Actor not found or item is empty.");
+        addManualItem(timeline, message.actorId, message.category, message.text);
+      } else if (message.type === "edit_core") {
+        const baseMind = timeline.baseMinds[message.actorId];
+        if (!timeline.actors[message.actorId] || !baseMind) throw new Error("Actor mind not found.");
+        baseMind.core = {
+          selfConcept: message.core.selfConcept.trim(),
+          values: uniqueStrings(message.core.values),
+          desires: uniqueStrings(message.core.desires),
+          fears: uniqueStrings(message.core.fears),
+          boundaries: uniqueStrings(message.core.boundaries),
+          notes: uniqueStrings(message.core.notes)
+        };
+      } else if (message.type === "edit_item") {
+        if (!message.text.trim()) throw new Error("Mind item text cannot be empty.");
+        if (!overrideItem(timeline, message.actorId, message.itemId, (item) => ({
+          ...item,
+          text: message.text.trim(),
+          status: message.status ?? item.status,
+          locked: true
+        }))) throw new Error("Mind item not found.");
+      } else if (message.type === "remove_item") {
+        removeManualItem(timeline, message.actorId, message.itemId);
+      } else if (message.type === "toggle_item") {
+        if (!overrideItem(timeline, message.actorId, message.itemId, (item) => ({ ...item, [message.field]: !item[message.field] }))) throw new Error("Mind item not found.");
+      }
+      bumpAndRebuild(timeline);
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    send({ type: "error", message: detail }, userId);
+    spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
+  }
+});
+spindle.log.info("LumiMind v0.1.0 loaded \u2014 subjective timeline engine ready.");

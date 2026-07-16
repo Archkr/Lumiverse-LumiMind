@@ -1,0 +1,22 @@
+{
+  "identifier": "lumi_mind",
+  "version": "0.1.0",
+  "name": "LumiMind",
+  "author": "Archkr",
+  "github": "https://github.com/Archkr/Lumiverse-LumiMind",
+  "homepage": "https://github.com/Archkr/Lumiverse-LumiMind",
+  "description": "Timeline-aware subjective minds for character cards, personas, and named NPCs.",
+  "permissions": [
+    "generation",
+    "interceptor",
+    "chats",
+    "chat_mutation",
+    "characters",
+    "personas",
+    "memories"
+  ],
+  "interceptorTimeoutMs": 10000,
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.0.6"
+}
