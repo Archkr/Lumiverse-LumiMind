@@ -9,6 +9,8 @@ Chats are inactive until you explicitly enable them. Beliefs and secrets are col
 ## What v0.1 includes
 
 - Per-chat actor registry with stable character/persona IDs and timeline-local NPC UUIDs.
+- Optional persona minds for players who want LumiMind to model the active persona; disable them when the persona is exclusively player-controlled.
+- Actor-card and director-card roleplay modes. Director mode manages the named cast portrayed by the card without assigning a mind to the host card itself.
 - Subjective beliefs, secrets, goals, plans, emotions, relationships, awareness, and enduring core traits.
 - Evidence, confidence, message index, swipe, source, lock, and pin metadata for every mind entry.
 - Deterministic timeline replay across edits, deletions, swipe navigation, and forks.
@@ -60,6 +62,13 @@ Settings also includes a **Diagnostics** window. It summarizes frontend context,
 When a substantive batch still produces no usable state after the corrective pass, Mind Lens shows an analysis-quality warning even though the compatible timeline checkpoint is technically current. Rebuild reruns committed history with the latest extraction rules.
 
 User edits become locked manual overrides. Controller analysis cannot overwrite a locked item until it is unlocked.
+
+### Roleplay behavior
+
+- **Manage the active persona** — when enabled, LumiMind may track the persona's subjective state and inject it during impersonation. When disabled, the persona remains context for other characters but receives no managed mind or prompt injection.
+- **Character card acts as director** — when disabled, the host card is treated as the primary in-world actor. When enabled, the card is treated as a narrator/director and LumiMind instead tracks the individual named characters it portrays.
+
+Changing either option invalidates the affected analysis policy. Activated timelines rebuild under the new mode when opened. Reviewed seeds and locked manual work remain stored; controller-inferred state is recomputed from committed history under the new policy.
 
 Actor tools support rename, alias add/remove, confirm, merge, split, timeline removal, and optional identity-only Cortex publication. Removing an actor from LumiMind does not delete a character card, persona, or Cortex entity.
 

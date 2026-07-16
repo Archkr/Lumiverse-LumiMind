@@ -135,6 +135,46 @@ export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis 
   return { actorMentions, changes };
 }
 
+function policyReference(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+}
+
+export function applyControllerMindPolicy(
+  analysis: ControllerAnalysis,
+  compactState: unknown,
+  settings: LumiMindSettings,
+): ControllerAnalysis {
+  const excluded = new Set<string>();
+  for (const entry of Array.isArray(compactState) ? compactState : []) {
+    const actor = asObject(entry);
+    if (actor.managed !== false) continue;
+    for (const value of [actor.ref, actor.name, ...(Array.isArray(actor.aliases) ? actor.aliases : [])]) {
+      const key = policyReference(value);
+      if (key) excluded.add(key);
+    }
+  }
+  if (!settings.personaMindEnabled) {
+    excluded.add("user");
+    excluded.add("user persona");
+    excluded.add("persona");
+  }
+  if (settings.characterCardDirectorMode) excluded.add("assistant");
+
+  const actorMentions = analysis.actorMentions.flatMap((mention) => {
+    const keys = [mention.ref, mention.name, ...(mention.aliases ?? [])].map(policyReference).filter(Boolean);
+    if (keys.some((key) => excluded.has(key)) || (!settings.personaMindEnabled && mention.kind === "persona")) {
+      for (const key of keys) excluded.add(key);
+      return [];
+    }
+    if (settings.characterCardDirectorMode && mention.kind === "character") {
+      return [{ ...mention, kind: "npc" as const }];
+    }
+    return [mention];
+  });
+  const changes = analysis.changes.filter((change) => !excluded.has(policyReference(change.subjectRef)));
+  return { actorMentions, changes };
+}
+
 export function isNontrivialAnalysisBatch(messages: ChatMessageLike[]): boolean {
   const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
   const total = lengths.reduce((sum, length) => sum + length, 0);
@@ -334,7 +374,7 @@ function renderMessages(messages: ChatMessageLike[]): string {
 
 const ANALYSIS_SYSTEM_PROMPT = [
   "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
-  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency: cards, the user persona, and NPCs.",
+  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
@@ -346,12 +386,22 @@ const ANALYSIS_SYSTEM_PROMPT = [
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt.",
 ].join("\n");
 
-const CORRECTIVE_ANALYSIS_SYSTEM_PROMPT = [
-  ANALYSIS_SYSTEM_PROMPT,
-  "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
-  "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
-  "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any actor's subjective state.",
-].join("\n");
+function analysisSystemPrompt(settings: LumiMindSettings, corrective = false): string {
+  const mode = settings.characterCardDirectorMode
+    ? "Director-card mode: host character-card entries marked managed=false are narrators/directors, not in-world actors. Never emit a mind or presence mention for those cards. Treat each named individual the card portrays as an independent NPC, even when several speak inside one assistant message."
+    : "Actor-card mode: host character cards are in-world actors and may receive their own subjective minds.";
+  const persona = settings.personaMindEnabled
+    ? "Persona minds are enabled: the active user persona may receive evidence-supported subjective state and may be targeted during impersonation."
+    : "Persona minds are disabled: the user persona is context only. Never emit actorMentions or changes with the user/persona as subject, and never infer actions, goals, emotions, or beliefs for them. Other managed actors may still hold beliefs or relationships about the user.";
+  const correction = corrective
+    ? [
+      "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
+      "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
+      "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any managed actor's subjective state.",
+    ].join("\n")
+    : "";
+  return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
+}
 
 export async function analyzeMessages(input: {
   messages: ChatMessageLike[];
@@ -372,7 +422,7 @@ export async function analyzeMessages(input: {
   ].join("\n\n").slice(0, 120_000);
   const result = await quietJson(
     prompt,
-    ANALYSIS_SYSTEM_PROMPT,
+    analysisSystemPrompt(input.settings),
     "lumi_mind_analysis_v1",
     ANALYSIS_SCHEMA,
     input.settings,
@@ -380,8 +430,9 @@ export async function analyzeMessages(input: {
     input.fallbackConnectionId,
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  const firstAnalysis = normalizeControllerAnalysis(result.parsed);
-  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, firstAnalysis);
+  const normalizedFirstAnalysis = normalizeControllerAnalysis(result.parsed);
+  const firstAnalysis = applyControllerMindPolicy(normalizedFirstAnalysis, input.compactState, input.settings);
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirstAnalysis);
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry: ControllerResponseTelemetry | null = null;
@@ -393,15 +444,16 @@ export async function analyzeMessages(input: {
     try {
       const corrective = await quietJson(
         `${prompt}\n\nThe first pass produced zero accepted changes. Perform the corrective bootstrap extraction now.`,
-        CORRECTIVE_ANALYSIS_SYSTEM_PROMPT,
+        analysisSystemPrompt(input.settings, true),
         "lumi_mind_analysis_v1_corrective",
         ANALYSIS_SCHEMA,
         input.settings,
         input.userId,
         input.fallbackConnectionId,
       );
-      const correctiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
-      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, correctiveAnalysis);
+      const normalizedCorrectiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
+      const correctiveAnalysis = applyControllerMindPolicy(normalizedCorrectiveAnalysis, input.compactState, input.settings);
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrectiveAnalysis);
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {

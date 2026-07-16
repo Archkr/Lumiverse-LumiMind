@@ -165,6 +165,7 @@ export type TimelineHealth = "inactive" | "initializing" | "ready" | "pending" |
 export interface ChatTimelineV1 {
   schemaVersion: 1;
   chatId: string;
+  analysisPolicyHash: string;
   active: boolean;
   paused: boolean;
   revision: number;
@@ -186,6 +187,8 @@ export interface LumiMindSettings {
   controllerMaxTokens: number;
   injectionTokenBudget: number;
   secondaryActorLimit: number;
+  personaMindEnabled: boolean;
+  characterCardDirectorMode: boolean;
   cortexImportEnabled: boolean;
   cortexWritebackEnabled: boolean;
   privateInteropEnabled: boolean;

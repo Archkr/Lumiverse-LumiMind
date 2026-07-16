@@ -318,6 +318,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       } : null,
       features: state ? {
         spoilerSafe: state.settings.spoilerSafe,
+        personaMind: state.settings.personaMindEnabled,
+        characterCardMode: state.settings.characterCardDirectorMode ? "director" : "actor",
         cortexImport: state.settings.cortexImportEnabled,
         cortexWriteback: state.settings.cortexWritebackEnabled,
         privateInterop: state.settings.privateInteropEnabled,
@@ -1107,8 +1109,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const container = element("div", "lm-view lm-settings-view");
     if (!currentState || !settingsDraft) return container;
     const heading = element("section", "lm-settings-heading");
-    heading.append(element("div", "lm-kicker", "Controller & privacy"), element("h2", "lm-view-title", "Mind Lens settings"));
-    heading.appendChild(element("p", "lm-view-copy", "Settings are user-scoped. Changes affect newly scheduled analysis and future prompt injections."));
+    heading.append(element("div", "lm-kicker", "Roleplay, controller & privacy"), element("h2", "lm-view-title", "Mind Lens settings"));
+    heading.appendChild(element("p", "lm-view-copy", "Settings are user-scoped. Roleplay-mode changes rebuild activated timelines when they are opened."));
     container.appendChild(heading);
 
     const save = textButton(settingsDirty ? "Save settings" : "Saved", () => {
@@ -1119,6 +1121,31 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       save.textContent = "Saved";
     }, "primary");
     save.disabled = !settingsDirty;
+
+    const behavior = element("section", "lm-settings-card");
+    behavior.appendChild(element("h3", "lm-settings-title", "Roleplay behavior"));
+    behavior.appendChild(element("p", "lm-settings-description", "Choose who LumiMind is allowed to manage. Reviewed seeds and locked manual edits remain stored while disabled actors are excluded from analysis, display, and injection."));
+    behavior.appendChild(renderToggle(
+      "Manage the active persona",
+      "Track and inject a mind for your persona, including during impersonation. Turn this off when you alone control the persona.",
+      settingsDraft.personaMindEnabled,
+      (checked) => {
+        if (!settingsDraft) return;
+        settingsDraft.personaMindEnabled = checked;
+        markSettingsDirty(save);
+      },
+    ));
+    behavior.appendChild(renderToggle(
+      "Character card acts as director",
+      "Treat the host card as a narrator rather than an in-scene mind, then track the named characters it portrays as the cast.",
+      settingsDraft.characterCardDirectorMode,
+      (checked) => {
+        if (!settingsDraft) return;
+        settingsDraft.characterCardDirectorMode = checked;
+        markSettingsDirty(save);
+      },
+    ));
+    container.appendChild(behavior);
 
     const controller = element("section", "lm-settings-card");
     controller.appendChild(element("h3", "lm-settings-title", "Analysis controller"));
@@ -1160,7 +1187,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
       numberSetting("Analysis output tokens", "controllerMaxTokens", 300, 8000, 100),
       numberSetting("Injection token budget", "injectionTokenBudget", 400, 4000, 100),
-      numberSetting("Secondary actors", "secondaryActorLimit", 0, 8, 1),
+      numberSetting(settingsDraft.characterCardDirectorMode ? "Director cast actors" : "Secondary actors", "secondaryActorLimit", settingsDraft.characterCardDirectorMode ? 1 : 0, 8, 1),
     );
     controller.appendChild(numberGrid);
     container.appendChild(controller);

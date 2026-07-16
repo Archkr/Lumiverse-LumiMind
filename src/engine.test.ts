@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_SETTINGS,
   addManualItem,
+  analysisPolicyHash,
+  buildDirectorMindInjection,
   buildMindInjection,
+  compactStateForController,
   createTimeline,
   makeBaseMind,
   makeEmptySeed,
@@ -12,6 +16,7 @@ import {
   rebuildTimeline,
   resolveActorId,
   stableHash,
+  toTimelineView,
   upsertActor,
 } from "./engine";
 import type { AnalysisRecord, ChatMessageLike, MindDelta } from "./types";
@@ -121,7 +126,20 @@ describe("hashing, settings, and compaction", () => {
 
   it("clamps persisted controller and budget settings", () => {
     const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, injectionTokenBudget: 99, secondaryActorLimit: 50 });
-    expect(settings).toMatchObject({ controllerTemperature: 2, controllerMaxTokens: 300, injectionTokenBudget: 400, secondaryActorLimit: 8 });
+    expect(settings).toMatchObject({
+      controllerTemperature: 2,
+      controllerMaxTokens: 300,
+      injectionTokenBudget: 400,
+      secondaryActorLimit: 8,
+      personaMindEnabled: true,
+      characterCardDirectorMode: false,
+    });
+    expect(normalizeSettings({ personaMindEnabled: false, characterCardDirectorMode: true })).toMatchObject({
+      personaMindEnabled: false,
+      characterCardDirectorMode: true,
+    });
+    expect(normalizeSettings({ characterCardDirectorMode: true, secondaryActorLimit: 0 }).secondaryActorLimit).toBe(1);
+    expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
   });
 
   it("keeps the injection within its approximate character budget", () => {
@@ -135,5 +153,36 @@ describe("hashing, settings, and compaction", () => {
     const injection = buildMindInjection(timeline, actor.id, 400, 4);
     expect(injection).toContain("private subjective continuity");
     expect(injection?.length).toBeLessThanOrEqual(1600);
+  });
+
+  it("keeps disabled host minds dormant and builds a director ensemble from portrayed actors", () => {
+    const timeline = createTimeline("chat");
+    timeline.active = true;
+    const card = upsertActor(timeline, { kind: "character", name: "The Director", characterId: "card" });
+    const persona = upsertActor(timeline, { kind: "persona", name: "Player", personaId: "persona" });
+    const npc = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const seed = makeEmptySeed({ selfConcept: "A wary scout who watches every doorway." });
+    seed.startingGoals = ["Protect the caravan"];
+    timeline.baseMinds[npc.id] = makeBaseMind(npc.id, seed);
+    rebuildTimeline(timeline, []);
+    timeline.actors[npc.id].present = true;
+    const settings = { ...DEFAULT_SETTINGS, personaMindEnabled: false, characterCardDirectorMode: true };
+
+    const view = toTimelineView(timeline, settings);
+    expect(view.actors.map((actor) => actor.id)).toEqual([npc.id]);
+    expect(view.minds[card.id]).toBeUndefined();
+    expect(view.minds[persona.id]).toBeUndefined();
+
+    const compact = compactStateForController(timeline, settings) as Array<Record<string, unknown>>;
+    expect(compact.find((actor) => actor.ref === card.id)).toMatchObject({ managed: false, contextRole: "director_card" });
+    expect(compact.find((actor) => actor.ref === persona.id)).toMatchObject({ managed: false, contextRole: "context_only_persona" });
+    expect(compact.find((actor) => actor.ref === npc.id)).toMatchObject({ managed: true, contextRole: "mind" });
+
+    expect(buildMindInjection(timeline, card.id, 400, 4, { ...DEFAULT_SETTINGS, personaMindEnabled: false })).toContain("user persona is unmanaged");
+    expect(buildMindInjection(timeline, card.id, 400, 4, settings)).toBeNull();
+    const injection = buildDirectorMindInjection(timeline, 400, 4, settings);
+    expect(injection).toContain("private ensemble continuity");
+    expect(injection).toContain("Mira");
+    expect(injection).not.toContain("The Director (character");
   });
 });

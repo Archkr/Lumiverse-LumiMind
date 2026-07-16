@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeMessages,
+  applyControllerMindPolicy,
   isNontrivialAnalysisBatch,
   makeControllerResponseTelemetry,
   mergeControllerAnalyses,
@@ -65,6 +66,36 @@ describe("controller response parsing", () => {
     const merged = mergeControllerAnalyses(first, corrective);
     expect(merged.actorMentions).toHaveLength(2);
     expect(merged.changes).toHaveLength(1);
+  });
+
+  it("blocks disabled persona and director-card minds while treating portrayed characters as NPCs", () => {
+    const analysis: ControllerAnalysis = {
+      actorMentions: [
+        { ref: "character:card", name: "The Director", kind: "character", messageId: "m1" },
+        { ref: "persona:player", name: "Player", kind: "persona", messageId: "m1" },
+        { ref: "mira", name: "Mira", kind: "character", messageId: "m1" },
+      ],
+      changes: [
+        { subjectRef: "The Director", category: "goal", operation: "add", text: "Advance the plot", messageId: "m1" },
+        { subjectRef: "Player", category: "emotion", operation: "add", text: "Afraid", messageId: "m1" },
+        { subjectRef: "Mira", category: "emotion", operation: "add", text: "Wary", messageId: "m1" },
+      ],
+    };
+    const state = [
+      { ref: "character:card", name: "The Director", aliases: [], kind: "character", managed: false },
+      { ref: "persona:player", name: "Player", aliases: [], kind: "persona", managed: false },
+    ];
+    const result = applyControllerMindPolicy(analysis, state, {
+      ...DEFAULT_SETTINGS,
+      personaMindEnabled: false,
+      characterCardDirectorMode: true,
+    });
+    expect(result.actorMentions).toEqual([
+      expect.objectContaining({ name: "Mira", kind: "npc" }),
+    ]);
+    expect(result.changes).toEqual([
+      expect.objectContaining({ subjectRef: "Mira", text: "Wary" }),
+    ]);
   });
 
   it("runs exactly one corrective pass for an empty substantive bootstrap", async () => {

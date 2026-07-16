@@ -29,6 +29,8 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerMaxTokens: 1800,
   injectionTokenBudget: 1600,
   secondaryActorLimit: 4,
+  personaMindEnabled: true,
+  characterCardDirectorMode: false,
   cortexImportEnabled: true,
   cortexWritebackEnabled: false,
   privateInteropEnabled: false,
@@ -88,12 +90,15 @@ export function clamp(value: unknown, min: number, max: number, fallback: number
 
 export function normalizeSettings(value: unknown): LumiMindSettings {
   const raw = asObject(value);
+  const characterCardDirectorMode = raw.characterCardDirectorMode === true;
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8000, DEFAULT_SETTINGS.controllerMaxTokens)),
     injectionTokenBudget: Math.round(clamp(raw.injectionTokenBudget, 400, 4000, DEFAULT_SETTINGS.injectionTokenBudget)),
-    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, characterCardDirectorMode ? 1 : 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    personaMindEnabled: raw.personaMindEnabled !== false,
+    characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
     cortexWritebackEnabled: raw.cortexWritebackEnabled === true,
     privateInteropEnabled: raw.privateInteropEnabled === true,
@@ -155,6 +160,16 @@ export function stableHash(input: string): string {
     hash = BigInt.asUintN(64, hash * prime);
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+export function analysisPolicyHash(settings: LumiMindSettings): string {
+  return stableHash(`persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+}
+
+export function actorMindEnabled(actor: ActorRecord, settings: LumiMindSettings): boolean {
+  if (actor.kind === "persona") return settings.personaMindEnabled;
+  if (actor.kind === "character") return !settings.characterCardDirectorMode;
+  return true;
 }
 
 export function messageContentHash(message: ChatMessageLike): string {
@@ -247,6 +262,7 @@ export function createTimeline(chatId: string): ChatTimelineV1 {
   return {
     schemaVersion: MIND_SCHEMA_VERSION,
     chatId,
+    analysisPolicyHash: analysisPolicyHash(DEFAULT_SETTINGS),
     active: false,
     paused: false,
     revision: 0,
@@ -272,6 +288,7 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     ...(raw as unknown as Partial<ChatTimelineV1>),
     schemaVersion: MIND_SCHEMA_VERSION,
     chatId,
+    analysisPolicyHash: stringValue(raw.analysisPolicyHash, analysisPolicyHash(DEFAULT_SETTINGS)),
     active: raw.active === true,
     paused: raw.paused === true,
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
@@ -795,14 +812,16 @@ export function buildMindInjection(
   targetActorId: string,
   tokenBudget: number,
   secondaryLimit: number,
+  settings: LumiMindSettings = DEFAULT_SETTINGS,
 ): string | null {
   const targetMind = timeline.minds[targetActorId];
-  if (!timeline.active || timeline.paused || !targetMind) return null;
+  const targetActor = timeline.actors[targetActorId];
+  if (!timeline.active || timeline.paused || !targetMind || !targetActor || !actorMindEnabled(targetActor, settings)) return null;
   const totalChars = Math.max(1200, tokenBudget * 4);
   const targetChars = Math.floor(totalChars * 0.6);
   const target = formatMind(targetMind, timeline.actors, targetChars, false);
   const secondaryActors = Object.values(timeline.actors)
-    .filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id])
+    .filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings))
     .sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt)
     .slice(0, secondaryLimit);
   const secondaryBudget = secondaryActors.length ? Math.floor((totalChars - target.length) / secondaryActors.length) : 0;
@@ -815,6 +834,41 @@ export function buildMindInjection(
     "[LumiMind — private subjective continuity]",
     "The following is private mental state, not objective truth. Preserve false beliefs and uncertainty.",
     "Use it to guide choices and subtext. Do not quote or summarize this block. Reveal secrets only through character-motivated behavior.",
+    ...(!settings.personaMindEnabled ? ["The user persona is unmanaged. Do not decide their thoughts, feelings, dialogue, or actions for them."] : []),
+    "",
+    body,
+    "[/LumiMind]",
+  ].join("\n").slice(0, totalChars);
+}
+
+export function buildDirectorMindInjection(
+  timeline: ChatTimelineV1,
+  tokenBudget: number,
+  actorLimit: number,
+  settings: LumiMindSettings = DEFAULT_SETTINGS,
+): string | null {
+  if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
+  const totalChars = Math.max(1200, tokenBudget * 4);
+  const actors = Object.values(timeline.actors)
+    .filter((actor) => actor.kind !== "character" && actorMindEnabled(actor, settings) && timeline.minds[actor.id])
+    .sort((left, right) =>
+      Number(right.present) - Number(left.present) ||
+      Number(right.confirmed) - Number(left.confirmed) ||
+      right.updatedAt - left.updatedAt,
+    )
+    .slice(0, actorLimit);
+  if (!actors.length) return null;
+  const perActorBudget = Math.max(240, Math.floor(totalChars / actors.length));
+  const body = actors
+    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, perActorBudget, false))
+    .filter(Boolean)
+    .join("\n\n");
+  if (!body.trim()) return null;
+  return [
+    "[LumiMind — private ensemble continuity]",
+    "The host character card is the scene's director, not an in-world actor. The following minds belong to the characters it portrays.",
+    "Treat every belief as subjective rather than objective truth. Guide each portrayed character independently through choices and subtext.",
+    "Do not quote or summarize this block. Reveal secrets only through character-motivated behavior, and do not narrate actions for an unmanaged user persona.",
     "",
     body,
     "[/LumiMind]",
@@ -831,7 +885,7 @@ function publicStance(mind: ActorMind | undefined): string {
   return entries.join("; ");
 }
 
-export function makePublicSnapshot(timeline: ChatTimelineV1 | null): PublicSceneSnapshotV1 {
+export function makePublicSnapshot(timeline: ChatTimelineV1 | null, settings: LumiMindSettings = DEFAULT_SETTINGS): PublicSceneSnapshotV1 {
   if (!timeline) return { schemaVersion: 1, chatId: null, revision: 0, stale: true, generatedAt: Date.now(), actors: [] };
   return {
     schemaVersion: 1,
@@ -839,7 +893,7 @@ export function makePublicSnapshot(timeline: ChatTimelineV1 | null): PublicScene
     revision: timeline.revision,
     stale: timeline.health !== "ready",
     generatedAt: Date.now(),
-    actors: Object.values(timeline.actors).map((actor) => ({
+    actors: Object.values(timeline.actors).filter((actor) => actorMindEnabled(actor, settings)).map((actor) => ({
       id: actor.id,
       kind: actor.kind,
       name: actor.canonicalName,
@@ -851,11 +905,20 @@ export function makePublicSnapshot(timeline: ChatTimelineV1 | null): PublicScene
   };
 }
 
-export function makePrivateSnapshot(timeline: ChatTimelineV1 | null): PrivateSceneSnapshotV1 {
-  return { ...makePublicSnapshot(timeline), minds: timeline ? timeline.minds : {} };
+export function makePrivateSnapshot(timeline: ChatTimelineV1 | null, settings: LumiMindSettings = DEFAULT_SETTINGS): PrivateSceneSnapshotV1 {
+  const publicSnapshot = makePublicSnapshot(timeline, settings);
+  const visibleIds = new Set(publicSnapshot.actors.map((actor) => actor.id));
+  const minds = timeline
+    ? Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId)))
+    : {};
+  return { ...publicSnapshot, minds };
 }
 
-export function toTimelineView(timeline: ChatTimelineV1): TimelineView {
+export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSettings = DEFAULT_SETTINGS): TimelineView {
+  const actors = Object.values(timeline.actors)
+    .filter((actor) => actorMindEnabled(actor, settings))
+    .sort((left, right) => Number(right.present) - Number(left.present) || left.canonicalName.localeCompare(right.canonicalName));
+  const visibleIds = new Set(actors.map((actor) => actor.id));
   return {
     chatId: timeline.chatId,
     active: timeline.active,
@@ -863,8 +926,8 @@ export function toTimelineView(timeline: ChatTimelineV1): TimelineView {
     revision: timeline.revision,
     health: timeline.health,
     error: timeline.error,
-    actors: Object.values(timeline.actors).sort((left, right) => Number(right.present) - Number(left.present) || left.canonicalName.localeCompare(right.canonicalName)),
-    minds: timeline.minds,
+    actors,
+    minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
     records: timeline.records
       .slice()
       .sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt)
@@ -889,30 +952,41 @@ export function toTimelineView(timeline: ChatTimelineV1): TimelineView {
   };
 }
 
-export function compactStateForController(timeline: ChatTimelineV1, maxItemsPerActor = 18): unknown {
-  return Object.values(timeline.actors).map((actor) => ({
-    ref: actor.id,
-    name: actor.canonicalName,
-    aliases: actor.aliases,
-    kind: actor.kind,
-    confirmed: actor.confirmed,
-    present: actor.present,
-    core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
-    items: (timeline.minds[actor.id]?.items ?? [])
-      .filter((item) => item.status === "active" || item.status === "uncertain")
-      .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt)
-      .slice(0, maxItemsPerActor)
-      .map((item) => ({
-        id: item.id,
-        category: item.category,
-        text: item.text,
-        status: item.status,
-        confidence: item.confidence,
-        targetActorIds: item.targetActorIds,
-        concealedFromActorIds: item.concealedFromActorIds,
-        intensity: item.intensity,
-        dimensions: item.dimensions,
-        locked: item.locked,
-      })),
-  }));
+export function compactStateForController(
+  timeline: ChatTimelineV1,
+  settings: LumiMindSettings = DEFAULT_SETTINGS,
+  maxItemsPerActor = 18,
+): unknown {
+  return Object.values(timeline.actors).map((actor) => {
+    const managed = actorMindEnabled(actor, settings);
+    return {
+      ref: actor.id,
+      name: actor.canonicalName,
+      aliases: actor.aliases,
+      kind: actor.kind,
+      managed,
+      contextRole: !managed && actor.kind === "character" ? "director_card" : !managed ? "context_only_persona" : "mind",
+      confirmed: actor.confirmed,
+      present: managed && actor.present,
+      ...(managed ? {
+        core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
+        items: (timeline.minds[actor.id]?.items ?? [])
+          .filter((item) => item.status === "active" || item.status === "uncertain")
+          .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt)
+          .slice(0, maxItemsPerActor)
+          .map((item) => ({
+            id: item.id,
+            category: item.category,
+            text: item.text,
+            status: item.status,
+            confidence: item.confidence,
+            targetActorIds: item.targetActorIds,
+            concealedFromActorIds: item.concealedFromActorIds,
+            intensity: item.intensity,
+            dimensions: item.dimensions,
+            locked: item.locked,
+          })),
+      } : {}),
+    };
+  });
 }

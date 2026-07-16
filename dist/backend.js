@@ -10,6 +10,8 @@ var DEFAULT_SETTINGS = {
   controllerMaxTokens: 1800,
   injectionTokenBudget: 1600,
   secondaryActorLimit: 4,
+  personaMindEnabled: true,
+  characterCardDirectorMode: false,
   cortexImportEnabled: true,
   cortexWritebackEnabled: false,
   privateInteropEnabled: false,
@@ -61,12 +63,15 @@ function clamp(value, min, max, fallback) {
 }
 function normalizeSettings(value) {
   const raw = asObject(value);
+  const characterCardDirectorMode = raw.characterCardDirectorMode === true;
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8e3, DEFAULT_SETTINGS.controllerMaxTokens)),
     injectionTokenBudget: Math.round(clamp(raw.injectionTokenBudget, 400, 4e3, DEFAULT_SETTINGS.injectionTokenBudget)),
-    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, characterCardDirectorMode ? 1 : 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    personaMindEnabled: raw.personaMindEnabled !== false,
+    characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
     cortexWritebackEnabled: raw.cortexWritebackEnabled === true,
     privateInteropEnabled: raw.privateInteropEnabled === true,
@@ -122,6 +127,14 @@ function stableHash(input) {
     hash = BigInt.asUintN(64, hash * prime);
   }
   return hash.toString(16).padStart(16, "0");
+}
+function analysisPolicyHash(settings) {
+  return stableHash(`persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+}
+function actorMindEnabled(actor, settings) {
+  if (actor.kind === "persona") return settings.personaMindEnabled;
+  if (actor.kind === "character") return !settings.characterCardDirectorMode;
+  return true;
 }
 function messageContentHash(message) {
   return stableHash(`${message.role}
@@ -196,6 +209,7 @@ function createTimeline(chatId) {
   return {
     schemaVersion: MIND_SCHEMA_VERSION,
     chatId,
+    analysisPolicyHash: analysisPolicyHash(DEFAULT_SETTINGS),
     active: false,
     paused: false,
     revision: 0,
@@ -220,6 +234,7 @@ function normalizeTimeline(value, chatId) {
     ...raw,
     schemaVersion: MIND_SCHEMA_VERSION,
     chatId,
+    analysisPolicyHash: stringValue(raw.analysisPolicyHash, analysisPolicyHash(DEFAULT_SETTINGS)),
     active: raw.active === true,
     paused: raw.paused === true,
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
@@ -661,13 +676,14 @@ function formatMind(mind, actors, maxChars, compact) {
   }
   return lines.join("\n").slice(0, maxChars);
 }
-function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit) {
+function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit, settings = DEFAULT_SETTINGS) {
   const targetMind = timeline.minds[targetActorId];
-  if (!timeline.active || timeline.paused || !targetMind) return null;
+  const targetActor = timeline.actors[targetActorId];
+  if (!timeline.active || timeline.paused || !targetMind || !targetActor || !actorMindEnabled(targetActor, settings)) return null;
   const totalChars = Math.max(1200, tokenBudget * 4);
   const targetChars = Math.floor(totalChars * 0.6);
   const target = formatMind(targetMind, timeline.actors, targetChars, false);
-  const secondaryActors = Object.values(timeline.actors).filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id]).sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt).slice(0, secondaryLimit);
+  const secondaryActors = Object.values(timeline.actors).filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings)).sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt).slice(0, secondaryLimit);
   const secondaryBudget = secondaryActors.length ? Math.floor((totalChars - target.length) / secondaryActors.length) : 0;
   const secondary = secondaryActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, secondaryBudget, true)).filter(Boolean);
   const body = [target, ...secondary].filter(Boolean).join("\n\n");
@@ -676,6 +692,27 @@ function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit
     "[LumiMind \u2014 private subjective continuity]",
     "The following is private mental state, not objective truth. Preserve false beliefs and uncertainty.",
     "Use it to guide choices and subtext. Do not quote or summarize this block. Reveal secrets only through character-motivated behavior.",
+    ...!settings.personaMindEnabled ? ["The user persona is unmanaged. Do not decide their thoughts, feelings, dialogue, or actions for them."] : [],
+    "",
+    body,
+    "[/LumiMind]"
+  ].join("\n").slice(0, totalChars);
+}
+function buildDirectorMindInjection(timeline, tokenBudget, actorLimit, settings = DEFAULT_SETTINGS) {
+  if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
+  const totalChars = Math.max(1200, tokenBudget * 4);
+  const actors = Object.values(timeline.actors).filter((actor) => actor.kind !== "character" && actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
+    (left, right) => Number(right.present) - Number(left.present) || Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
+  ).slice(0, actorLimit);
+  if (!actors.length) return null;
+  const perActorBudget = Math.max(240, Math.floor(totalChars / actors.length));
+  const body = actors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, perActorBudget, false)).filter(Boolean).join("\n\n");
+  if (!body.trim()) return null;
+  return [
+    "[LumiMind \u2014 private ensemble continuity]",
+    "The host character card is the scene's director, not an in-world actor. The following minds belong to the characters it portrays.",
+    "Treat every belief as subjective rather than objective truth. Guide each portrayed character independently through choices and subtext.",
+    "Do not quote or summarize this block. Reveal secrets only through character-motivated behavior, and do not narrate actions for an unmanaged user persona.",
     "",
     body,
     "[/LumiMind]"
@@ -686,7 +723,7 @@ function publicStance(mind) {
   const entries = mind.items.filter((item) => item.status === "active" && (item.category === "emotion" || item.category === "relationship")).sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, 2).map((item) => item.text);
   return entries.join("; ");
 }
-function makePublicSnapshot(timeline) {
+function makePublicSnapshot(timeline, settings = DEFAULT_SETTINGS) {
   if (!timeline) return { schemaVersion: 1, chatId: null, revision: 0, stale: true, generatedAt: Date.now(), actors: [] };
   return {
     schemaVersion: 1,
@@ -694,7 +731,7 @@ function makePublicSnapshot(timeline) {
     revision: timeline.revision,
     stale: timeline.health !== "ready",
     generatedAt: Date.now(),
-    actors: Object.values(timeline.actors).map((actor) => ({
+    actors: Object.values(timeline.actors).filter((actor) => actorMindEnabled(actor, settings)).map((actor) => ({
       id: actor.id,
       kind: actor.kind,
       name: actor.canonicalName,
@@ -705,10 +742,15 @@ function makePublicSnapshot(timeline) {
     }))
   };
 }
-function makePrivateSnapshot(timeline) {
-  return { ...makePublicSnapshot(timeline), minds: timeline ? timeline.minds : {} };
+function makePrivateSnapshot(timeline, settings = DEFAULT_SETTINGS) {
+  const publicSnapshot = makePublicSnapshot(timeline, settings);
+  const visibleIds = new Set(publicSnapshot.actors.map((actor) => actor.id));
+  const minds = timeline ? Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))) : {};
+  return { ...publicSnapshot, minds };
 }
-function toTimelineView(timeline) {
+function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
+  const actors = Object.values(timeline.actors).filter((actor) => actorMindEnabled(actor, settings)).sort((left, right) => Number(right.present) - Number(left.present) || left.canonicalName.localeCompare(right.canonicalName));
+  const visibleIds = new Set(actors.map((actor) => actor.id));
   return {
     chatId: timeline.chatId,
     active: timeline.active,
@@ -716,8 +758,8 @@ function toTimelineView(timeline) {
     revision: timeline.revision,
     health: timeline.health,
     error: timeline.error,
-    actors: Object.values(timeline.actors).sort((left, right) => Number(right.present) - Number(left.present) || left.canonicalName.localeCompare(right.canonicalName)),
-    minds: timeline.minds,
+    actors,
+    minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
     records: timeline.records.slice().sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
       id: record.id,
       messageId: record.messageId,
@@ -738,28 +780,35 @@ function toTimelineView(timeline) {
     updatedAt: timeline.updatedAt
   };
 }
-function compactStateForController(timeline, maxItemsPerActor = 18) {
-  return Object.values(timeline.actors).map((actor) => ({
-    ref: actor.id,
-    name: actor.canonicalName,
-    aliases: actor.aliases,
-    kind: actor.kind,
-    confirmed: actor.confirmed,
-    present: actor.present,
-    core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
-    items: (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, maxItemsPerActor).map((item) => ({
-      id: item.id,
-      category: item.category,
-      text: item.text,
-      status: item.status,
-      confidence: item.confidence,
-      targetActorIds: item.targetActorIds,
-      concealedFromActorIds: item.concealedFromActorIds,
-      intensity: item.intensity,
-      dimensions: item.dimensions,
-      locked: item.locked
-    }))
-  }));
+function compactStateForController(timeline, settings = DEFAULT_SETTINGS, maxItemsPerActor = 18) {
+  return Object.values(timeline.actors).map((actor) => {
+    const managed = actorMindEnabled(actor, settings);
+    return {
+      ref: actor.id,
+      name: actor.canonicalName,
+      aliases: actor.aliases,
+      kind: actor.kind,
+      managed,
+      contextRole: !managed && actor.kind === "character" ? "director_card" : !managed ? "context_only_persona" : "mind",
+      confirmed: actor.confirmed,
+      present: managed && actor.present,
+      ...managed ? {
+        core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
+        items: (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, maxItemsPerActor).map((item) => ({
+          id: item.id,
+          category: item.category,
+          text: item.text,
+          status: item.status,
+          confidence: item.confidence,
+          targetActorIds: item.targetActorIds,
+          concealedFromActorIds: item.concealedFromActorIds,
+          intensity: item.intensity,
+          dimensions: item.dimensions,
+          locked: item.locked
+        }))
+      } : {}
+    };
+  });
 }
 
 // src/controller.ts
@@ -847,6 +896,39 @@ function normalizeControllerAnalysis(value) {
       evidenceExcerpt: text(item.evidenceExcerpt)
     }];
   }) : [];
+  return { actorMentions, changes };
+}
+function policyReference(value) {
+  return typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+}
+function applyControllerMindPolicy(analysis, compactState, settings) {
+  const excluded = /* @__PURE__ */ new Set();
+  for (const entry of Array.isArray(compactState) ? compactState : []) {
+    const actor = asObject2(entry);
+    if (actor.managed !== false) continue;
+    for (const value of [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []]) {
+      const key = policyReference(value);
+      if (key) excluded.add(key);
+    }
+  }
+  if (!settings.personaMindEnabled) {
+    excluded.add("user");
+    excluded.add("user persona");
+    excluded.add("persona");
+  }
+  if (settings.characterCardDirectorMode) excluded.add("assistant");
+  const actorMentions = analysis.actorMentions.flatMap((mention) => {
+    const keys = [mention.ref, mention.name, ...mention.aliases ?? []].map(policyReference).filter(Boolean);
+    if (keys.some((key) => excluded.has(key)) || !settings.personaMindEnabled && mention.kind === "persona") {
+      for (const key of keys) excluded.add(key);
+      return [];
+    }
+    if (settings.characterCardDirectorMode && mention.kind === "character") {
+      return [{ ...mention, kind: "npc" }];
+    }
+    return [mention];
+  });
+  const changes = analysis.changes.filter((change) => !excluded.has(policyReference(change.subjectRef)));
   return { actorMentions, changes };
 }
 function isNontrivialAnalysisBatch(messages) {
@@ -1035,7 +1117,7 @@ ${message.content}
 }
 var ANALYSIS_SYSTEM_PROMPT = [
   "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
-  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency: cards, the user persona, and NPCs.",
+  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
@@ -1046,12 +1128,16 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
 ].join("\n");
-var CORRECTIVE_ANALYSIS_SYSTEM_PROMPT = [
-  ANALYSIS_SYSTEM_PROMPT,
-  "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
-  "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
-  "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any actor's subjective state."
-].join("\n");
+function analysisSystemPrompt(settings, corrective = false) {
+  const mode = settings.characterCardDirectorMode ? "Director-card mode: host character-card entries marked managed=false are narrators/directors, not in-world actors. Never emit a mind or presence mention for those cards. Treat each named individual the card portrays as an independent NPC, even when several speak inside one assistant message." : "Actor-card mode: host character cards are in-world actors and may receive their own subjective minds.";
+  const persona = settings.personaMindEnabled ? "Persona minds are enabled: the active user persona may receive evidence-supported subjective state and may be targeted during impersonation." : "Persona minds are disabled: the user persona is context only. Never emit actorMentions or changes with the user/persona as subject, and never infer actions, goals, emotions, or beliefs for them. Other managed actors may still hold beliefs or relationships about the user.";
+  const correction = corrective ? [
+    "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
+    "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
+    "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any managed actor's subjective state."
+  ].join("\n") : "";
+  return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
+}
 async function analyzeMessages(input) {
   const prompt = [
     "Existing actor registry and current subjective state:",
@@ -1070,7 +1156,7 @@ ${renderMessages(input.messages)}
   ].join("\n\n").slice(0, 12e4);
   const result = await quietJson(
     prompt,
-    ANALYSIS_SYSTEM_PROMPT,
+    analysisSystemPrompt(input.settings),
     "lumi_mind_analysis_v1",
     ANALYSIS_SCHEMA,
     input.settings,
@@ -1078,8 +1164,9 @@ ${renderMessages(input.messages)}
     input.fallbackConnectionId
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  const firstAnalysis = normalizeControllerAnalysis(result.parsed);
-  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, firstAnalysis);
+  const normalizedFirstAnalysis = normalizeControllerAnalysis(result.parsed);
+  const firstAnalysis = applyControllerMindPolicy(normalizedFirstAnalysis, input.compactState, input.settings);
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirstAnalysis);
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry = null;
@@ -1092,15 +1179,16 @@ ${renderMessages(input.messages)}
         `${prompt}
 
 The first pass produced zero accepted changes. Perform the corrective bootstrap extraction now.`,
-        CORRECTIVE_ANALYSIS_SYSTEM_PROMPT,
+        analysisSystemPrompt(input.settings, true),
         "lumi_mind_analysis_v1_corrective",
         ANALYSIS_SCHEMA,
         input.settings,
         input.userId,
         input.fallbackConnectionId
       );
-      const correctiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
-      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, correctiveAnalysis);
+      const normalizedCorrectiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
+      const correctiveAnalysis = applyControllerMindPolicy(normalizedCorrectiveAnalysis, input.compactState, input.settings);
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrectiveAnalysis);
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
@@ -1299,7 +1387,7 @@ async function buildFrontendState(userId, requestedChatId, characterId) {
     connections,
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
-    timeline: timeline ? toTimelineView(timeline) : null
+    timeline: timeline ? toTimelineView(timeline, settings) : null
   };
 }
 async function sendState(userId, chatId, characterId) {
@@ -1436,6 +1524,9 @@ async function persistAndPublish(timeline, userId, announce = true) {
 }
 async function reconcileChat(userId, chatId, force = false) {
   const timeline = await getTimeline(chatId, userId);
+  const settings = await getSettings(userId);
+  const policyHash = analysisPolicyHash(settings);
+  const policyChanged = timeline.analysisPolicyHash !== policyHash;
   if (!timeline.active || timeline.paused) {
     const messages2 = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
     rebuildTimeline(timeline, messages2);
@@ -1447,6 +1538,12 @@ async function reconcileChat(userId, chatId, force = false) {
     timeline.error = "LumiMind requires generation and chat history permissions to analyze this chat.";
     await persistAndPublish(timeline, userId);
     return;
+  }
+  if (policyChanged) {
+    timeline.records = [];
+    timeline.analysisPolicyHash = policyHash;
+    timeline.lastAnalyzedAt = null;
+    timeline.error = null;
   }
   if (force) timeline.records = [];
   const messages = await getChatMessages(chatId, userId);
@@ -1461,7 +1558,6 @@ async function reconcileChat(userId, chatId, force = false) {
   timeline.error = null;
   await persistAndPublish(timeline, userId);
   try {
-    const settings = await getSettings(userId);
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
       const batch = derivation.messages.slice(start, start + ANALYSIS_BATCH_SIZE);
@@ -1469,7 +1565,7 @@ async function reconcileChat(userId, chatId, force = false) {
       const result = await analyzeMessages({
         messages: batch,
         recentContext,
-        compactState: compactStateForController(timeline),
+        compactState: compactStateForController(timeline, settings),
         settings,
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null
@@ -1537,10 +1633,10 @@ async function writeActorToCortex(userId, timeline, actor) {
 async function publishScene(userId, timeline) {
   const activeChatId = activeChats.get(userId)?.chatId ?? null;
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
-  spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved), { requires: [] });
   const settings = await getSettings(userId);
+  spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved, settings), { requires: [] });
   if (settings.privateInteropEnabled) {
-    spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved), { requires: ["chat_mutation"] });
+    spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved, settings), { requires: ["chat_mutation"] });
   } else {
     try {
       spindle.rpcPool.unregister("scene.private");
@@ -1619,10 +1715,17 @@ spindle.registerInterceptor(async (messages, context) => {
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
     let targetActorId = null;
+    let injection = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
+      if (!settings.personaMindEnabled) return messages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
+      if (targetActorId && timeline.actors[targetActorId]) {
+        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      }
+    } else if (settings.characterCardDirectorMode) {
+      injection = buildDirectorMindInjection(timeline, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -1631,9 +1734,10 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
+      if (targetActorId && timeline.actors[targetActorId]) {
+        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      }
     }
-    if (!targetActorId || !timeline.actors[targetActorId]) return messages;
-    const injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit);
     if (!injection) return messages;
     const injected = { role: "system", content: injection };
     return {
@@ -1708,8 +1812,12 @@ spindle.onFrontendMessage(async (payload, userId) => {
   if (chatId) rememberChatUser(chatId, userId);
   if (message.type === "ready" || message.type === "refresh") {
     activeChats.set(userId, { chatId, characterId });
-    await publishScene(userId, chatId ? await getTimeline(chatId, userId) : null);
+    const timeline = chatId ? await getTimeline(chatId, userId) : null;
+    await publishScene(userId, timeline);
     await sendState(userId, chatId, characterId);
+    if (timeline?.active && timeline.analysisPolicyHash !== analysisPolicyHash(await getSettings(userId))) {
+      scheduleReconcile(userId, timeline.chatId, 0);
+    }
     return;
   }
   try {
@@ -1734,11 +1842,17 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "save_settings") {
+      const previous = await getSettings(userId);
       const next = await saveSettings(userId, message.patch);
       settingsCache.set(userId, next);
+      const roleplayModeChanged = previous.personaMindEnabled !== next.personaMindEnabled || previous.characterCardDirectorMode !== next.characterCardDirectorMode;
       await publishScene(userId);
       await sendState(userId, message.chatId);
-      notice(userId, "success", "LumiMind settings saved.");
+      if (roleplayModeChanged && message.chatId) {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (timeline.active) scheduleReconcile(userId, message.chatId, 0);
+      }
+      notice(userId, "success", roleplayModeChanged ? "LumiMind settings saved. Activated timelines will rebuild for the new roleplay mode when opened." : "LumiMind settings saved.");
       return;
     }
     if (message.type === "generate_seed") {

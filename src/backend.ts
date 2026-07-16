@@ -5,6 +5,8 @@ import { analyzeMessages, generateSeedDraft } from "./controller";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
+  analysisPolicyHash,
+  buildDirectorMindInjection,
   buildMindInjection,
   compactStateForController,
   createTimeline,
@@ -187,7 +189,7 @@ async function buildFrontendState(userId: string, requestedChatId?: string | nul
     connections,
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
-    timeline: timeline ? toTimelineView(timeline) : null,
+    timeline: timeline ? toTimelineView(timeline, settings) : null,
   };
 }
 
@@ -340,6 +342,9 @@ async function persistAndPublish(timeline: ChatTimelineV1, userId: string, annou
 
 async function reconcileChat(userId: string, chatId: string, force = false): Promise<void> {
   const timeline = await getTimeline(chatId, userId);
+  const settings = await getSettings(userId);
+  const policyHash = analysisPolicyHash(settings);
+  const policyChanged = timeline.analysisPolicyHash !== policyHash;
   if (!timeline.active || timeline.paused) {
     const messages = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
     rebuildTimeline(timeline, messages);
@@ -351,6 +356,12 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
     timeline.error = "LumiMind requires generation and chat history permissions to analyze this chat.";
     await persistAndPublish(timeline, userId);
     return;
+  }
+  if (policyChanged) {
+    timeline.records = [];
+    timeline.analysisPolicyHash = policyHash;
+    timeline.lastAnalyzedAt = null;
+    timeline.error = null;
   }
   if (force) timeline.records = [];
   const messages = await getChatMessages(chatId, userId);
@@ -365,7 +376,6 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   timeline.error = null;
   await persistAndPublish(timeline, userId);
   try {
-    const settings = await getSettings(userId);
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
       const batch = derivation.messages.slice(start, start + ANALYSIS_BATCH_SIZE);
@@ -373,7 +383,7 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
       const result = await analyzeMessages({
         messages: batch,
         recentContext,
-        compactState: compactStateForController(timeline),
+        compactState: compactStateForController(timeline, settings),
         settings,
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
@@ -446,10 +456,10 @@ async function writeActorToCortex(userId: string, timeline: ChatTimelineV1, acto
 async function publishScene(userId: string, timeline?: ChatTimelineV1 | null): Promise<void> {
   const activeChatId = activeChats.get(userId)?.chatId ?? null;
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
-  spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved), { requires: [] });
   const settings = await getSettings(userId);
+  spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved, settings), { requires: [] });
   if (settings.privateInteropEnabled) {
-    spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved), { requires: ["chat_mutation"] });
+    spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved, settings), { requires: ["chat_mutation"] });
   } else {
     try { spindle.rpcPool.unregister("scene.private"); } catch { /* It may not be registered yet. */ }
   }
@@ -536,10 +546,17 @@ spindle.registerInterceptor(async (messages, context) => {
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
     let targetActorId: string | null = null;
+    let injection: string | null = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
+      if (!settings.personaMindEnabled) return messages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
+      if (targetActorId && timeline.actors[targetActorId]) {
+        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      }
+    } else if (settings.characterCardDirectorMode) {
+      injection = buildDirectorMindInjection(timeline, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -548,9 +565,10 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
+      if (targetActorId && timeline.actors[targetActorId]) {
+        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      }
     }
-    if (!targetActorId || !timeline.actors[targetActorId]) return messages;
-    const injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit);
     if (!injection) return messages;
     const injected = { role: "system" as const, content: injection };
     return {
@@ -631,8 +649,12 @@ spindle.onFrontendMessage(async (payload, userId) => {
   if (chatId) rememberChatUser(chatId, userId);
   if (message.type === "ready" || message.type === "refresh") {
     activeChats.set(userId, { chatId, characterId });
-    await publishScene(userId, chatId ? await getTimeline(chatId, userId) : null);
+    const timeline = chatId ? await getTimeline(chatId, userId) : null;
+    await publishScene(userId, timeline);
     await sendState(userId, chatId, characterId);
+    if (timeline?.active && timeline.analysisPolicyHash !== analysisPolicyHash(await getSettings(userId))) {
+      scheduleReconcile(userId, timeline.chatId, 0);
+    }
     return;
   }
   try {
@@ -657,11 +679,20 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "save_settings") {
+      const previous = await getSettings(userId);
       const next = await saveSettings(userId, message.patch);
       settingsCache.set(userId, next);
+      const roleplayModeChanged = previous.personaMindEnabled !== next.personaMindEnabled
+        || previous.characterCardDirectorMode !== next.characterCardDirectorMode;
       await publishScene(userId);
       await sendState(userId, message.chatId);
-      notice(userId, "success", "LumiMind settings saved.");
+      if (roleplayModeChanged && message.chatId) {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (timeline.active) scheduleReconcile(userId, message.chatId, 0);
+      }
+      notice(userId, "success", roleplayModeChanged
+        ? "LumiMind settings saved. Activated timelines will rebuild for the new roleplay mode when opened."
+        : "LumiMind settings saved.");
       return;
     }
     if (message.type === "generate_seed") {
