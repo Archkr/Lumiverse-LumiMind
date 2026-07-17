@@ -675,7 +675,9 @@ onEvent("GENERATION_ENDED", (payload, eventUserId) => {
   if (!error && messageId) scheduleReconcile(userId, chatId, 100);
 });
 
-for (const event of ["MESSAGE_SENT", "MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"] as const) {
+// New messages are reconciled only after GENERATION_ENDED so the controller never
+// analyzes a user turn while its assistant response is still being generated.
+for (const event of ["MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"] as const) {
   onEvent(event, (payload, eventUserId) => {
     const chatId = extractChatId(payload) ?? extractChatId(asObject(payload).message);
     const userId = resolveUserId(chatId, eventUserId);

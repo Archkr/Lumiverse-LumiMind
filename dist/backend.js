@@ -2154,7 +2154,7 @@ onEvent("GENERATION_ENDED", (payload, eventUserId) => {
   const messageId = readString(payload, ["messageId", "message_id"]);
   if (!error && messageId) scheduleReconcile(userId, chatId, 100);
 });
-for (const event of ["MESSAGE_SENT", "MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"]) {
+for (const event of ["MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"]) {
   onEvent(event, (payload, eventUserId) => {
     const chatId = extractChatId(payload) ?? extractChatId(asObject3(payload).message);
     const userId = resolveUserId(chatId, eventUserId);
