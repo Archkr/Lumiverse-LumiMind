@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.1.0-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.1.1-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-beta-e6a45a)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-> **Beta note:** LumiMind `0.1.0` is an early release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
+> **Beta note:** LumiMind `0.1.1` is an early release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -124,7 +124,7 @@ If a substantive batch produces no usable mental state, LumiMind performs at mos
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.1.0` beta |
+| Extension version | `0.1.1` beta |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
