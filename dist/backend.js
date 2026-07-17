@@ -819,20 +819,20 @@ function formatMind(mind, actors) {
   if (!actor) return "";
   const relevant = new Set(mind.presentActorIds);
   const items = [...mind.items].filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
-  const lines = [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`];
-  if (mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
-  if (mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
-  if (mind.core.desires.length) lines.push(`Desires: ${mind.core.desires.join("; ")}`);
-  if (mind.core.fears.length) lines.push(`Fears: ${mind.core.fears.join("; ")}`);
-  if (mind.core.boundaries.length) lines.push(`Boundaries: ${mind.core.boundaries.join("; ")}`);
-  if (mind.core.notes.length) lines.push(`Notes: ${mind.core.notes.join("; ")}`);
+  const details = [];
+  if (mind.core.values.length) details.push(`Values: ${mind.core.values.join("; ")}`);
+  if (mind.core.desires.length) details.push(`Desires: ${mind.core.desires.join("; ")}`);
+  if (mind.core.fears.length) details.push(`Fears: ${mind.core.fears.join("; ")}`);
+  if (mind.core.boundaries.length) details.push(`Boundaries: ${mind.core.boundaries.join("; ")}`);
+  if (mind.core.notes.length) details.push(`Notes: ${mind.core.notes.join("; ")}`);
   for (const item of items) {
     const targets = item.targetActorIds.length ? ` [toward ${item.targetActorIds.map((id) => actorLabel(actors, id)).join(", ")}]` : "";
     const confidence = item.confidence < 0.8 ? ` (${Math.round(item.confidence * 100)}% confidence)` : "";
     const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
-    lines.push(line);
+    details.push(line);
   }
-  return lines.join("\n");
+  if (!details.length) return "";
+  return [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`, ...details].join("\n");
 }
 function buildMindInjection(timeline, targetActorId, settings = DEFAULT_SETTINGS) {
   if (!timeline.active || timeline.paused) return null;
@@ -841,14 +841,15 @@ function buildMindInjection(timeline, targetActorId, settings = DEFAULT_SETTINGS
   );
   const minds = presentActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors)).filter(Boolean);
   const body = minds.join("\n\n");
-  if (!body.trim()) return null;
+  const unmanagedPersonaGuidance = !settings.personaMindEnabled ? "The user persona is unmanaged. Do not decide their thoughts, feelings, dialogue, or actions for them." : "";
+  if (!body.trim() && !unmanagedPersonaGuidance) return null;
   return [
     "[LumiMind \u2014 private subjective continuity]",
     "The following is private mental state, not objective truth. Preserve false beliefs and uncertainty.",
     "Use it to guide choices and subtext. Do not quote or summarize this block. Reveal secrets only through character-motivated behavior.",
-    ...!settings.personaMindEnabled ? ["The user persona is unmanaged. Do not decide their thoughts, feelings, dialogue, or actions for them."] : [],
+    ...unmanagedPersonaGuidance ? [unmanagedPersonaGuidance] : [],
     "",
-    body,
+    ...body ? [body] : [],
     "[/LumiMind]"
   ].join("\n");
 }

@@ -184,6 +184,7 @@ Use this when the active character card represents one in-world character.
 - Solo and group generations target the exact selected character.
 - Every present managed actor is included in the private injection.
 - Active and uncertain state is included without an extension-level injection cap.
+- Self-concept remains available to analysis and Mind Lens but is omitted from generation injection because the host already supplies the character card.
 
 ### Director card
 
@@ -370,7 +371,7 @@ Additional calls can occur when:
 
 Initial history is analyzed in bounded batches. You can pause a timeline whenever you do not want background analysis costs.
 
-The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint and injects every present managed actor's active or uncertain state in one system message. Prompt Breakdown attributes that block as **LumiMind — Private Mind**.
+The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint and injects every present managed actor's active or uncertain state in one system message. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
 LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to the active connection for the chat. It uses Lumiverse connection profiles and does not read or store API credentials.
 

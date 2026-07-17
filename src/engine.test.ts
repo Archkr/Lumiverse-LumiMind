@@ -407,6 +407,8 @@ describe("hashing, settings, and compaction", () => {
     expect(injection).toContain("Detailed private belief 29 with supporting nuance");
     expect(injection).toContain("Mira (npc, present)");
     expect(injection).toContain("Protect the caravan");
+    expect(injection).not.toContain("A scholar who measures every word");
+    expect(injection).not.toContain("A vigilant scout");
     expect(injection).not.toContain("Rowan");
     expect(injection).not.toContain("Deliver the sealed letter");
     expect(injection).not.toContain("This resolved state must not be injected");
@@ -426,6 +428,21 @@ describe("hashing, settings, and compaction", () => {
     expect(compactItems).toHaveLength(31);
     expect(compactItems.find((item) => item.id === "controller-item")?.controllerWritable).toBe(true);
     expect(compactItems.filter((item) => item.id !== "controller-item").every((item) => item.controllerWritable === false)).toBe(true);
+  });
+
+  it("does not inject self-concept-only minds into main generation", () => {
+    const timeline = createTimeline("chat");
+    timeline.active = true;
+    const actor = upsertActor(timeline, { kind: "character", name: "Aster", characterId: "card" });
+    timeline.baseMinds[actor.id] = makeBaseMind(actor.id, makeEmptySeed({ selfConcept: "A concise version of the character card." }));
+    rebuildTimeline(timeline, []);
+    timeline.actors[actor.id].present = true;
+
+    expect(buildMindInjection(timeline, actor.id)).toBeNull();
+    const guardedInjection = buildMindInjection(timeline, actor.id, { ...DEFAULT_SETTINGS, personaMindEnabled: false });
+    expect(guardedInjection).toContain("The user persona is unmanaged");
+    expect(guardedInjection).not.toContain("A concise version of the character card");
+    expect(guardedInjection).not.toContain("Aster (character");
   });
 
   it("keeps disabled host minds dormant and builds a director ensemble from portrayed actors", () => {
@@ -456,6 +473,7 @@ describe("hashing, settings, and compaction", () => {
     const injection = buildDirectorMindInjection(timeline, settings);
     expect(injection).toContain("private ensemble continuity");
     expect(injection).toContain("Mira");
+    expect(injection).not.toContain("A wary scout who watches every doorway");
     expect(injection).not.toContain("The Director (character");
   });
 });
