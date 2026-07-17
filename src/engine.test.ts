@@ -98,6 +98,23 @@ describe("actor registry", () => {
     }, { connectionId: null, provider: "test", model: "test" });
     expect(Object.values(fresh.actors)[0]).toMatchObject({ kind: "npc", characterId: null });
   });
+
+  it("does not create actors from unverified change subjects or targets", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const first = message("m1", 0, "Mira remembers a stranger.");
+    const records = materializeAnalysisRecords(timeline, [first], "root", {
+      actorMentions: [],
+      changes: [
+        { subjectRef: "Invented Actor", category: "goal", operation: "add", text: "Appear", messageId: first.id },
+        { subjectRef: actor.id, category: "relationship", operation: "add", text: "Distrusts a stranger", targetRefs: ["Invented Target"], messageId: first.id },
+      ],
+    }, { connectionId: null, provider: "test", model: "test" });
+
+    expect(Object.values(timeline.actors)).toHaveLength(1);
+    expect(records[0].deltas).toHaveLength(1);
+    expect(records[0].deltas[0].targetActorIds).toEqual([]);
+  });
 });
 
 describe("timeline reducer", () => {
@@ -135,6 +152,119 @@ describe("timeline reducer", () => {
     addManualItem(timeline, actor.id, "goal", "Find the missing key");
     rebuildTimeline(timeline, []);
     expect(timeline.minds[actor.id].items[0]).toMatchObject({ category: "goal", locked: true, pinned: true, source: "manual" });
+  });
+
+  it("rewrites exact and near-duplicate additions instead of appending them", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const first = message("m1", 0, "Mira wants to escape the tower.");
+    const second = message("m2", 1, "She studies the tower exit.");
+    const firstRecord = record(first, "root", [delta(actor.id, first.id, 0, {
+      category: "goal",
+      text: "Wants to escape the tower",
+    })]);
+    const secondRecord = record(second, nextPrefixHash("root", firstRecord.contentHash, 0), [delta(actor.id, second.id, 1, {
+      category: "goal",
+      text: "Escape the tower",
+    })]);
+    timeline.records = [firstRecord, secondRecord];
+
+    rebuildTimeline(timeline, [first, second]);
+
+    expect(timeline.minds[actor.id].items).toHaveLength(1);
+    expect(timeline.minds[actor.id].items[0]).toMatchObject({ id: `delta:${first.id}`, text: "Escape the tower" });
+    expect(secondRecord.reduction).toMatchObject({ entriesUpdated: 1 });
+  });
+
+  it("keeps genuinely distinct state in the same category", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const first = message("m1", 0, "Mira studies the tower.");
+    const second = message("m2", 1, "Mira searches for a key.");
+    const firstRecord = record(first, "root", [delta(actor.id, first.id, 0, { category: "goal", text: "Escape the tower" })]);
+    timeline.records = [
+      firstRecord,
+      record(second, nextPrefixHash("root", firstRecord.contentHash, 0), [
+        delta(actor.id, second.id, 1, { category: "goal", text: "Find the missing key" }),
+      ]),
+    ];
+
+    rebuildTimeline(timeline, [first, second]);
+
+    expect(timeline.minds[actor.id].items.map((item) => item.text)).toEqual(["Escape the tower", "Find the missing key"]);
+  });
+
+  it("maintains one current relationship entry per target", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const target = upsertActor(timeline, { kind: "npc", name: "Aster" });
+    const first = message("m1", 0, "Mira trusts Aster.");
+    const second = message("m2", 1, "Mira realizes Aster lied.");
+    const firstRecord = record(first, "root", [delta(actor.id, first.id, 0, {
+      category: "relationship",
+      text: "Trusts Aster",
+      targetActorIds: [target.id],
+    })]);
+    const secondRecord = record(second, nextPrefixHash("root", firstRecord.contentHash, 0), [delta(actor.id, second.id, 1, {
+      category: "relationship",
+      text: "No longer trusts Aster",
+      targetActorIds: [target.id],
+    })]);
+    timeline.records = [firstRecord, secondRecord];
+
+    rebuildTimeline(timeline, [first, second]);
+
+    expect(timeline.minds[actor.id].items).toHaveLength(1);
+    expect(timeline.minds[actor.id].items[0].text).toBe("No longer trusts Aster");
+    expect(secondRecord.reduction).toMatchObject({ entriesSuperseded: 1 });
+  });
+
+  it("rejects targetless updates rather than turning them into additions", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const first = message("m1", 0, "Mira changes her mind.");
+    const invalidRecord = record(first, "root", [delta(actor.id, first.id, 0, {
+      operation: "update",
+      targetItemId: null,
+      text: "The door is open",
+    })]);
+    timeline.records = [invalidRecord];
+
+    rebuildTimeline(timeline, [first]);
+
+    expect(timeline.minds[actor.id].items).toEqual([]);
+    expect(invalidRecord.reduction).toMatchObject({ invalidChangesRejected: 1 });
+  });
+
+  it("keeps protected seed and manual entries authoritative while compacting controller duplicates", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const seed = makeEmptySeed();
+    seed.startingGoals = ["Escape the tower"];
+    timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seed);
+    const first = message("m1", 0, "Mira seeks an escape.");
+    const seedDuplicate = record(first, "root", [delta(actor.id, first.id, 0, {
+      category: "goal",
+      text: "Wants to escape the tower",
+    })]);
+    timeline.records = [seedDuplicate];
+    rebuildTimeline(timeline, [first]);
+    expect(timeline.minds[actor.id].items).toHaveLength(1);
+    expect(timeline.minds[actor.id].items[0]).toMatchObject({ source: "seed", locked: true, text: "Escape the tower" });
+    expect(seedDuplicate.reduction).toMatchObject({ duplicatesSuppressed: 1 });
+
+    const manualTimeline = createTimeline("manual-chat");
+    const manualActor = upsertActor(manualTimeline, { kind: "npc", name: "Mira" });
+    const controllerMessage = message("m1", 0, "Mira searches for a key.");
+    manualTimeline.records = [record(controllerMessage, "root", [delta(manualActor.id, controllerMessage.id, 0, {
+      category: "goal",
+      text: "Find the missing key",
+    })])];
+    rebuildTimeline(manualTimeline, [controllerMessage]);
+    addManualItem(manualTimeline, manualActor.id, "goal", "Wants to find the missing key");
+    rebuildTimeline(manualTimeline, [controllerMessage]);
+    expect(manualTimeline.minds[manualActor.id].items).toHaveLength(1);
+    expect(manualTimeline.minds[manualActor.id].items[0]).toMatchObject({ source: "manual", locked: true, pinned: true });
   });
 
   it("checkpoints unmanaged user messages without exposing controller records", () => {
@@ -245,6 +375,8 @@ describe("hashing, settings, and compaction", () => {
     expect(injection).not.toContain("Rowan");
     expect(injection).not.toContain("Deliver the sealed letter");
     expect(injection).not.toContain("This resolved state must not be injected");
+    const compact = compactStateForController(timeline) as Array<{ ref: string; items?: unknown[] }>;
+    expect(compact.find((entry) => entry.ref === actor.id)?.items).toHaveLength(30);
   });
 
   it("keeps disabled host minds dormant and builds a director ensemble from portrayed actors", () => {

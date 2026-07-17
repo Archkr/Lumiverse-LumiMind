@@ -17,6 +17,7 @@ import {
   type MindDelta,
   type MindItem,
   type MindItemStatus,
+  type MindReductionTelemetry,
   type MindSeedV1,
   type PrivateSceneSnapshotV1,
   type PublicSceneSnapshotV1,
@@ -158,6 +159,73 @@ export function stableHash(input: string): string {
     hash = BigInt.asUintN(64, hash * prime);
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+const MIND_TEXT_STOP_WORDS = new Set([
+  "a", "an", "and", "as", "at", "be", "because", "been", "being", "by", "for", "from", "has", "have", "he", "her", "hers",
+  "him", "his", "i", "in", "is", "it", "its", "of", "on", "or", "she", "that", "the", "their", "them", "they", "this", "to",
+  "was", "were", "will", "with", "would",
+]);
+
+const MIND_TOKEN_ALIASES: Record<string, string> = {
+  afraid: "fear",
+  fearful: "fear",
+  frightened: "fear",
+  scared: "fear",
+  angry: "anger",
+  annoyed: "anger",
+  furious: "anger",
+  irritated: "anger",
+  desires: "want",
+  wants: "want",
+  wished: "want",
+  wishes: "want",
+};
+
+function normalizedMindToken(value: string): string {
+  const aliased = MIND_TOKEN_ALIASES[value] ?? value;
+  if (aliased.length > 5 && aliased.endsWith("ing")) return aliased.slice(0, -3);
+  if (aliased.length > 4 && aliased.endsWith("ied")) return `${aliased.slice(0, -3)}y`;
+  if (aliased.length > 4 && aliased.endsWith("ed")) return aliased.slice(0, -2);
+  if (aliased.length > 4 && aliased.endsWith("es")) return aliased.slice(0, -2);
+  if (aliased.length > 3 && aliased.endsWith("s")) return aliased.slice(0, -1);
+  return aliased;
+}
+
+function mindTextTokens(value: string): string[] {
+  const words = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .replace(/[’']/g, "")
+    .match(/[a-z0-9]+/g) ?? [];
+  return uniqueStrings(words.filter((word) => !MIND_TEXT_STOP_WORDS.has(word)).map(normalizedMindToken));
+}
+
+function mindTextHasNegation(value: string): boolean {
+  return /\b(?:no|not|never|neither|without|cannot|cant|wont|wouldnt|dont|doesnt|didnt|isnt|wasnt|shouldnt)\b/i.test(
+    value.replace(/[’']/g, ""),
+  );
+}
+
+export function canonicalMindText(value: string): string {
+  return mindTextTokens(value).join(" ");
+}
+
+export function mindTextsNearDuplicate(left: string, right: string): boolean {
+  const leftCanonical = canonicalMindText(left);
+  const rightCanonical = canonicalMindText(right);
+  if (!leftCanonical || !rightCanonical) return false;
+  if (leftCanonical === rightCanonical) return true;
+  if (mindTextHasNegation(left) !== mindTextHasNegation(right)) return false;
+  const leftTokens = new Set(leftCanonical.split(" "));
+  const rightTokens = new Set(rightCanonical.split(" "));
+  if (Math.min(leftTokens.size, rightTokens.size) < 2) return false;
+  let shared = 0;
+  for (const token of leftTokens) if (rightTokens.has(token)) shared += 1;
+  const containment = shared / Math.min(leftTokens.size, rightTokens.size);
+  const coverage = shared / Math.max(leftTokens.size, rightTokens.size);
+  return shared >= 2 && containment >= 0.8 && coverage >= 0.6;
 }
 
 export function analysisPolicyHash(settings: LumiMindSettings): string {
@@ -413,14 +481,59 @@ function cloneMind(mind: ActorMind): ActorMind {
   };
 }
 
-function decayEmotions(minds: Record<string, ActorMind>, changedSubjects: Set<string>): void {
+function decayEmotions(minds: Record<string, ActorMind>): void {
   for (const mind of Object.values(minds)) {
     mind.items = mind.items.flatMap((item) => {
-      if (item.category !== "emotion" || item.locked || changedSubjects.has(mind.actorId) || item.intensity === null) return [item];
+      if (item.category !== "emotion" || item.locked || item.intensity === null) return [item];
       const intensity = Number((item.intensity * 0.85).toFixed(3));
       return intensity < 0.1 ? [] : [{ ...item, intensity }];
     });
   }
+}
+
+function sameActorIds(left: string[], right: string[]): boolean {
+  const normalizedLeft = uniqueStrings(left).sort();
+  const normalizedRight = uniqueStrings(right).sort();
+  return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function protectedMindItem(item: MindItem): boolean {
+  return item.locked || item.pinned || item.source !== "controller";
+}
+
+type MindMatchKind = "target" | "exact" | "near" | "relationship";
+
+function matchingMindItem(
+  mind: ActorMind,
+  delta: MindDelta,
+): { index: number; kind: MindMatchKind } | null {
+  if (delta.targetItemId) {
+    const index = mind.items.findIndex((item) => item.id === delta.targetItemId);
+    if (index >= 0) return { index, kind: "target" };
+  }
+  if (delta.operation !== "add") return null;
+  const candidates = mind.items
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) =>
+      (item.status === "active" || item.status === "uncertain") &&
+      item.category === delta.category &&
+      sameActorIds(item.targetActorIds, delta.targetActorIds) &&
+      sameActorIds(item.concealedFromActorIds, delta.concealedFromActorIds),
+    );
+  const deltaCanonical = canonicalMindText(delta.text);
+  const exact = deltaCanonical ? candidates.find(({ item }) => canonicalMindText(item.text) === deltaCanonical) : undefined;
+  if (exact) return { index: exact.index, kind: "exact" };
+  const near = candidates.find(({ item }) => mindTextsNearDuplicate(item.text, delta.text));
+  if (near) return { index: near.index, kind: "near" };
+  if (delta.category === "relationship" && delta.targetActorIds.length > 0) {
+    const relationship = candidates[0];
+    if (relationship) return { index: relationship.index, kind: "relationship" };
+  }
+  return null;
+}
+
+function emptyReductionTelemetry(): MindReductionTelemetry {
+  return { duplicatesSuppressed: 0, entriesUpdated: 0, entriesSuperseded: 0, invalidChangesRejected: 0 };
 }
 
 function itemFromDelta(delta: MindDelta): MindItem {
@@ -447,7 +560,8 @@ export function applyRecord(
   record: AnalysisRecord,
   actors: Record<string, ActorRecord>,
   minds: Record<string, ActorMind>,
-): void {
+): MindReductionTelemetry {
+  const reduction = emptyReductionTelemetry();
   if (record.actorMentions.length > 0) {
     for (const actor of Object.values(actors)) actor.present = false;
     for (const mention of record.actorMentions) {
@@ -460,15 +574,24 @@ export function applyRecord(
       actor.lastSeenMessageId = mention.evidence.messageId;
     }
   }
-  const changedSubjects = new Set(record.deltas.filter((delta) => delta.category === "emotion").map((delta) => delta.subjectActorId));
-  decayEmotions(minds, changedSubjects);
+  decayEmotions(minds);
   for (const delta of record.deltas) {
     const mind = (minds[delta.subjectActorId] ??= makeBaseMind(delta.subjectActorId));
-    const targetIndex = delta.targetItemId ? mind.items.findIndex((item) => item.id === delta.targetItemId) : -1;
+    const match = matchingMindItem(mind, delta);
+    const targetIndex = match?.index ?? -1;
     const target = targetIndex >= 0 ? mind.items[targetIndex] : null;
-    if (target?.locked) continue;
+    if (target && protectedMindItem(target)) {
+      if (delta.operation === "add") reduction.duplicatesSuppressed += 1;
+      else reduction.invalidChangesRejected += 1;
+      continue;
+    }
     if (delta.operation === "remove") {
-      if (targetIndex >= 0) mind.items.splice(targetIndex, 1);
+      if (targetIndex >= 0) {
+        mind.items.splice(targetIndex, 1);
+        mind.lastUpdatedMessageId = delta.evidence.messageId;
+      } else {
+        reduction.invalidChangesRejected += 1;
+      }
       continue;
     }
     if (delta.operation === "resolve" || delta.operation === "abandon") {
@@ -479,7 +602,15 @@ export function applyRecord(
           evidence: { ...delta.evidence },
           updatedAt: delta.createdAt,
         };
+        mind.lastUpdatedMessageId = delta.evidence.messageId;
+        reduction.entriesSuperseded += 1;
+      } else {
+        reduction.invalidChangesRejected += 1;
       }
+      continue;
+    }
+    if (!delta.text.trim() || (delta.operation === "update" && targetIndex < 0)) {
+      reduction.invalidChangesRejected += 1;
       continue;
     }
     const next = itemFromDelta(delta);
@@ -489,7 +620,12 @@ export function applyRecord(
         ...next,
         id: target!.id,
         createdAt: target!.createdAt,
+        locked: target!.locked,
+        pinned: target!.pinned,
+        source: target!.source,
       };
+      if (match?.kind === "relationship" && !mindTextsNearDuplicate(target!.text, delta.text)) reduction.entriesSuperseded += 1;
+      else reduction.entriesUpdated += 1;
     } else {
       mind.items.push(next);
     }
@@ -497,6 +633,7 @@ export function applyRecord(
   }
   const presentIds = Object.values(actors).filter((actor) => actor.present).map((actor) => actor.id);
   for (const mind of Object.values(minds)) mind.presentActorIds = [...presentIds];
+  return reduction;
 }
 
 function applyManualOverrides(minds: Record<string, ActorMind>, overrides: ManualOverride[]): void {
@@ -511,7 +648,26 @@ function applyManualOverrides(minds: Record<string, ActorMind>, overrides: Manua
     }
     if (!override.item) continue;
     if (index >= 0) mind.items[index] = { ...override.item, id: mind.items[index].id };
-    else mind.items.push({ ...override.item });
+    else {
+      const duplicateIndexes = mind.items.flatMap((item, itemIndex) => {
+        const sameContext = item.source === "controller" &&
+          item.category === override.item!.category &&
+          sameActorIds(item.targetActorIds, override.item!.targetActorIds) &&
+          sameActorIds(item.concealedFromActorIds, override.item!.concealedFromActorIds);
+        const sameMeaning = sameContext && (
+          mindTextsNearDuplicate(item.text, override.item!.text) ||
+          (item.category === "relationship" && item.targetActorIds.length > 0)
+        );
+        return sameMeaning ? [itemIndex] : [];
+      });
+      if (duplicateIndexes.length === 0) {
+        mind.items.push({ ...override.item });
+      } else {
+        const [replacementIndex, ...extraIndexes] = duplicateIndexes;
+        mind.items[replacementIndex] = { ...override.item };
+        for (const extraIndex of extraIndexes.sort((left, right) => right - left)) mind.items.splice(extraIndex, 1);
+      }
+    }
   }
 }
 
@@ -549,7 +705,7 @@ export function rebuildTimeline(timeline: ChatTimelineV1, rawMessages: ChatMessa
       break;
     }
     matchedRecords.push(record);
-    applyRecord(record, timeline.actors, minds);
+    record.reduction = applyRecord(record, timeline.actors, minds);
     prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
   }
   applyManualOverrides(minds, timeline.manualOverrides);
@@ -583,24 +739,19 @@ function actorRefMap(timeline: ChatTimelineV1): Map<string, string> {
   return map;
 }
 
-function resolveOrCreateRef(timeline: ChatTimelineV1, refs: Map<string, string>, reference: string, evidence: EvidenceRef): string {
+function resolveKnownRef(timeline: ChatTimelineV1, refs: Map<string, string>, reference: string): string | null {
   const key = reference.trim().toLocaleLowerCase();
-  const existing = refs.get(key) ?? resolveActorId(timeline.actors, reference);
-  if (existing) return existing;
-  const actor = upsertActor(timeline, { kind: "npc", name: reference || "Unnamed actor", confidence: 0.55 }, evidence);
-  refs.set(key, actor.id);
-  refs.set(actor.canonicalName.toLocaleLowerCase(), actor.id);
-  return actor.id;
+  return refs.get(key) ?? resolveActorId(timeline.actors, reference);
 }
 
 function normalizeStatus(value: unknown): MindItemStatus {
   return value === "resolved" || value === "abandoned" || value === "uncertain" ? value : "active";
 }
 
-function normalizeCategory(value: unknown): MindCategory {
-  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness"
+function normalizeCategory(value: unknown): MindCategory | null {
+  return value === "belief" || value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness"
     ? value
-    : "belief";
+    : null;
 }
 
 export function materializeAnalysisRecords(
@@ -615,7 +766,7 @@ export function materializeAnalysisRecords(
   const refs = actorRefMap(timeline);
   const mentionsByMessage = new Map<string, ActorMentionDelta[]>();
   for (const raw of analysis.actorMentions ?? []) {
-    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    const message = byId.get(raw.messageId);
     if (!message || !raw.name?.trim()) continue;
     const evidence = evidenceFor(message);
     const stableReference = raw.ref?.trim() || raw.name.trim();
@@ -654,13 +805,20 @@ export function materializeAnalysisRecords(
 
   const changesByMessage = new Map<string, MindDelta[]>();
   for (const raw of analysis.changes ?? []) {
-    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    const message = byId.get(raw.messageId);
     if (!message || !raw.subjectRef?.trim()) continue;
     const evidence = evidenceFor(message, raw.evidenceExcerpt);
-    const subjectActorId = resolveOrCreateRef(timeline, refs, raw.subjectRef, evidence);
+    const subjectActorId = resolveKnownRef(timeline, refs, raw.subjectRef);
+    if (!subjectActorId) continue;
     const operation = raw.operation === "update" || raw.operation === "resolve" || raw.operation === "abandon" || raw.operation === "remove"
       ? raw.operation
-      : "add";
+      : raw.operation === "add" ? "add" : null;
+    const normalizedCategory = normalizeCategory(raw.category);
+    const targetItemId = stringValue(raw.targetItemId) || null;
+    const normalizedText = stringValue(raw.text);
+    if (!operation || !normalizedCategory) continue;
+    if ((operation === "add" || operation === "update") && !normalizedText) continue;
+    if (operation !== "add" && !targetItemId) continue;
     const dimensions: Record<string, number> = {};
     for (const [key, value] of Object.entries(raw.dimensions ?? {})) {
       dimensions[key] = clamp(value, -1, 1, 0);
@@ -668,14 +826,14 @@ export function materializeAnalysisRecords(
     const delta: MindDelta = {
       id: `delta:${crypto.randomUUID()}`,
       subjectActorId,
-      category: normalizeCategory(raw.category),
+      category: normalizedCategory,
       operation,
-      targetItemId: stringValue(raw.targetItemId) || null,
-      text: stringValue(raw.text),
+      targetItemId,
+      text: normalizedText,
       status: normalizeStatus(raw.status),
       confidence: clamp(raw.confidence, 0, 1, 0.75),
-      targetActorIds: uniqueStrings((raw.targetRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
-      concealedFromActorIds: uniqueStrings((raw.concealedFromRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
+      targetActorIds: uniqueStrings((raw.targetRefs ?? []).map((ref) => resolveKnownRef(timeline, refs, ref)).filter((id): id is string => !!id)),
+      concealedFromActorIds: uniqueStrings((raw.concealedFromRefs ?? []).map((ref) => resolveKnownRef(timeline, refs, ref)).filter((id): id is string => !!id)),
       intensity: raw.intensity === null || raw.intensity === undefined ? null : clamp(raw.intensity, 0, 1, 0.5),
       dimensions,
       evidence,
@@ -984,6 +1142,7 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
         createdAt: record.createdAt,
         changeCount: record.deltas.length,
         mentionCount: record.actorMentions.length,
+        reduction: record.reduction ?? emptyReductionTelemetry(),
         controller: {
           provider: record.controller.provider,
           model: record.controller.model,
@@ -1000,7 +1159,7 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
 export function compactStateForController(
   timeline: ChatTimelineV1,
   settings: LumiMindSettings = DEFAULT_SETTINGS,
-  maxItemsPerActor = 18,
+  _maxItemsPerActor?: number,
 ): unknown {
   return Object.values(timeline.actors).map((actor) => {
     const managed = actorMindEnabled(actor, settings);
@@ -1018,7 +1177,6 @@ export function compactStateForController(
         items: (timeline.minds[actor.id]?.items ?? [])
           .filter((item) => item.status === "active" || item.status === "uncertain")
           .sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt)
-          .slice(0, maxItemsPerActor)
           .map((item) => ({
             id: item.id,
             category: item.category,
@@ -1030,6 +1188,8 @@ export function compactStateForController(
             intensity: item.intensity,
             dimensions: item.dimensions,
             locked: item.locked,
+            pinned: item.pinned,
+            source: item.source,
           })),
       } : {}),
     };

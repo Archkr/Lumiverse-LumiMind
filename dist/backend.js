@@ -126,6 +126,98 @@ function stableHash(input) {
   }
   return hash.toString(16).padStart(16, "0");
 }
+var MIND_TEXT_STOP_WORDS = /* @__PURE__ */ new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "be",
+  "because",
+  "been",
+  "being",
+  "by",
+  "for",
+  "from",
+  "has",
+  "have",
+  "he",
+  "her",
+  "hers",
+  "him",
+  "his",
+  "i",
+  "in",
+  "is",
+  "it",
+  "its",
+  "of",
+  "on",
+  "or",
+  "she",
+  "that",
+  "the",
+  "their",
+  "them",
+  "they",
+  "this",
+  "to",
+  "was",
+  "were",
+  "will",
+  "with",
+  "would"
+]);
+var MIND_TOKEN_ALIASES = {
+  afraid: "fear",
+  fearful: "fear",
+  frightened: "fear",
+  scared: "fear",
+  angry: "anger",
+  annoyed: "anger",
+  furious: "anger",
+  irritated: "anger",
+  desires: "want",
+  wants: "want",
+  wished: "want",
+  wishes: "want"
+};
+function normalizedMindToken(value) {
+  const aliased = MIND_TOKEN_ALIASES[value] ?? value;
+  if (aliased.length > 5 && aliased.endsWith("ing")) return aliased.slice(0, -3);
+  if (aliased.length > 4 && aliased.endsWith("ied")) return `${aliased.slice(0, -3)}y`;
+  if (aliased.length > 4 && aliased.endsWith("ed")) return aliased.slice(0, -2);
+  if (aliased.length > 4 && aliased.endsWith("es")) return aliased.slice(0, -2);
+  if (aliased.length > 3 && aliased.endsWith("s")) return aliased.slice(0, -1);
+  return aliased;
+}
+function mindTextTokens(value) {
+  const words = value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase().replace(/[’']/g, "").match(/[a-z0-9]+/g) ?? [];
+  return uniqueStrings(words.filter((word) => !MIND_TEXT_STOP_WORDS.has(word)).map(normalizedMindToken));
+}
+function mindTextHasNegation(value) {
+  return /\b(?:no|not|never|neither|without|cannot|cant|wont|wouldnt|dont|doesnt|didnt|isnt|wasnt|shouldnt)\b/i.test(
+    value.replace(/[’']/g, "")
+  );
+}
+function canonicalMindText(value) {
+  return mindTextTokens(value).join(" ");
+}
+function mindTextsNearDuplicate(left, right) {
+  const leftCanonical = canonicalMindText(left);
+  const rightCanonical = canonicalMindText(right);
+  if (!leftCanonical || !rightCanonical) return false;
+  if (leftCanonical === rightCanonical) return true;
+  if (mindTextHasNegation(left) !== mindTextHasNegation(right)) return false;
+  const leftTokens = new Set(leftCanonical.split(" "));
+  const rightTokens = new Set(rightCanonical.split(" "));
+  if (Math.min(leftTokens.size, rightTokens.size) < 2) return false;
+  let shared = 0;
+  for (const token of leftTokens) if (rightTokens.has(token)) shared += 1;
+  const containment = shared / Math.min(leftTokens.size, rightTokens.size);
+  const coverage = shared / Math.max(leftTokens.size, rightTokens.size);
+  return shared >= 2 && containment >= 0.8 && coverage >= 0.6;
+}
 function analysisPolicyHash(settings) {
   const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
   const personaPolicy = settings.personaMindEnabled ? "" : "persona-policy:2|";
@@ -333,14 +425,45 @@ function cloneMind(mind) {
     presentActorIds: [...mind.presentActorIds]
   };
 }
-function decayEmotions(minds, changedSubjects) {
+function decayEmotions(minds) {
   for (const mind of Object.values(minds)) {
     mind.items = mind.items.flatMap((item) => {
-      if (item.category !== "emotion" || item.locked || changedSubjects.has(mind.actorId) || item.intensity === null) return [item];
+      if (item.category !== "emotion" || item.locked || item.intensity === null) return [item];
       const intensity = Number((item.intensity * 0.85).toFixed(3));
       return intensity < 0.1 ? [] : [{ ...item, intensity }];
     });
   }
+}
+function sameActorIds(left, right) {
+  const normalizedLeft = uniqueStrings(left).sort();
+  const normalizedRight = uniqueStrings(right).sort();
+  return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+function protectedMindItem(item) {
+  return item.locked || item.pinned || item.source !== "controller";
+}
+function matchingMindItem(mind, delta) {
+  if (delta.targetItemId) {
+    const index = mind.items.findIndex((item) => item.id === delta.targetItemId);
+    if (index >= 0) return { index, kind: "target" };
+  }
+  if (delta.operation !== "add") return null;
+  const candidates = mind.items.map((item, index) => ({ item, index })).filter(
+    ({ item }) => (item.status === "active" || item.status === "uncertain") && item.category === delta.category && sameActorIds(item.targetActorIds, delta.targetActorIds) && sameActorIds(item.concealedFromActorIds, delta.concealedFromActorIds)
+  );
+  const deltaCanonical = canonicalMindText(delta.text);
+  const exact = deltaCanonical ? candidates.find(({ item }) => canonicalMindText(item.text) === deltaCanonical) : void 0;
+  if (exact) return { index: exact.index, kind: "exact" };
+  const near = candidates.find(({ item }) => mindTextsNearDuplicate(item.text, delta.text));
+  if (near) return { index: near.index, kind: "near" };
+  if (delta.category === "relationship" && delta.targetActorIds.length > 0) {
+    const relationship = candidates[0];
+    if (relationship) return { index: relationship.index, kind: "relationship" };
+  }
+  return null;
+}
+function emptyReductionTelemetry() {
+  return { duplicatesSuppressed: 0, entriesUpdated: 0, entriesSuperseded: 0, invalidChangesRejected: 0 };
 }
 function itemFromDelta(delta) {
   return {
@@ -362,6 +485,7 @@ function itemFromDelta(delta) {
   };
 }
 function applyRecord(record, actors, minds) {
+  const reduction = emptyReductionTelemetry();
   if (record.actorMentions.length > 0) {
     for (const actor of Object.values(actors)) actor.present = false;
     for (const mention of record.actorMentions) {
@@ -374,15 +498,24 @@ function applyRecord(record, actors, minds) {
       actor.lastSeenMessageId = mention.evidence.messageId;
     }
   }
-  const changedSubjects = new Set(record.deltas.filter((delta) => delta.category === "emotion").map((delta) => delta.subjectActorId));
-  decayEmotions(minds, changedSubjects);
+  decayEmotions(minds);
   for (const delta of record.deltas) {
     const mind = minds[delta.subjectActorId] ??= makeBaseMind(delta.subjectActorId);
-    const targetIndex = delta.targetItemId ? mind.items.findIndex((item) => item.id === delta.targetItemId) : -1;
+    const match = matchingMindItem(mind, delta);
+    const targetIndex = match?.index ?? -1;
     const target = targetIndex >= 0 ? mind.items[targetIndex] : null;
-    if (target?.locked) continue;
+    if (target && protectedMindItem(target)) {
+      if (delta.operation === "add") reduction.duplicatesSuppressed += 1;
+      else reduction.invalidChangesRejected += 1;
+      continue;
+    }
     if (delta.operation === "remove") {
-      if (targetIndex >= 0) mind.items.splice(targetIndex, 1);
+      if (targetIndex >= 0) {
+        mind.items.splice(targetIndex, 1);
+        mind.lastUpdatedMessageId = delta.evidence.messageId;
+      } else {
+        reduction.invalidChangesRejected += 1;
+      }
       continue;
     }
     if (delta.operation === "resolve" || delta.operation === "abandon") {
@@ -393,7 +526,15 @@ function applyRecord(record, actors, minds) {
           evidence: { ...delta.evidence },
           updatedAt: delta.createdAt
         };
+        mind.lastUpdatedMessageId = delta.evidence.messageId;
+        reduction.entriesSuperseded += 1;
+      } else {
+        reduction.invalidChangesRejected += 1;
       }
+      continue;
+    }
+    if (!delta.text.trim() || delta.operation === "update" && targetIndex < 0) {
+      reduction.invalidChangesRejected += 1;
       continue;
     }
     const next = itemFromDelta(delta);
@@ -402,8 +543,13 @@ function applyRecord(record, actors, minds) {
         ...target,
         ...next,
         id: target.id,
-        createdAt: target.createdAt
+        createdAt: target.createdAt,
+        locked: target.locked,
+        pinned: target.pinned,
+        source: target.source
       };
+      if (match?.kind === "relationship" && !mindTextsNearDuplicate(target.text, delta.text)) reduction.entriesSuperseded += 1;
+      else reduction.entriesUpdated += 1;
     } else {
       mind.items.push(next);
     }
@@ -411,6 +557,7 @@ function applyRecord(record, actors, minds) {
   }
   const presentIds = Object.values(actors).filter((actor) => actor.present).map((actor) => actor.id);
   for (const mind of Object.values(minds)) mind.presentActorIds = [...presentIds];
+  return reduction;
 }
 function applyManualOverrides(minds, overrides) {
   for (const override of overrides) {
@@ -424,7 +571,20 @@ function applyManualOverrides(minds, overrides) {
     }
     if (!override.item) continue;
     if (index >= 0) mind.items[index] = { ...override.item, id: mind.items[index].id };
-    else mind.items.push({ ...override.item });
+    else {
+      const duplicateIndexes = mind.items.flatMap((item, itemIndex) => {
+        const sameContext = item.source === "controller" && item.category === override.item.category && sameActorIds(item.targetActorIds, override.item.targetActorIds) && sameActorIds(item.concealedFromActorIds, override.item.concealedFromActorIds);
+        const sameMeaning = sameContext && (mindTextsNearDuplicate(item.text, override.item.text) || item.category === "relationship" && item.targetActorIds.length > 0);
+        return sameMeaning ? [itemIndex] : [];
+      });
+      if (duplicateIndexes.length === 0) {
+        mind.items.push({ ...override.item });
+      } else {
+        const [replacementIndex, ...extraIndexes] = duplicateIndexes;
+        mind.items[replacementIndex] = { ...override.item };
+        for (const extraIndex of extraIndexes.sort((left, right) => right - left)) mind.items.splice(extraIndex, 1);
+      }
+    }
   }
 }
 function rebuildTimeline(timeline, rawMessages) {
@@ -449,7 +609,7 @@ function rebuildTimeline(timeline, rawMessages) {
       break;
     }
     matchedRecords.push(record);
-    applyRecord(record, timeline.actors, minds);
+    record.reduction = applyRecord(record, timeline.actors, minds);
     prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
   }
   applyManualOverrides(minds, timeline.manualOverrides);
@@ -480,20 +640,15 @@ function actorRefMap(timeline) {
   }
   return map;
 }
-function resolveOrCreateRef(timeline, refs, reference, evidence) {
+function resolveKnownRef(timeline, refs, reference) {
   const key = reference.trim().toLocaleLowerCase();
-  const existing = refs.get(key) ?? resolveActorId(timeline.actors, reference);
-  if (existing) return existing;
-  const actor = upsertActor(timeline, { kind: "npc", name: reference || "Unnamed actor", confidence: 0.55 }, evidence);
-  refs.set(key, actor.id);
-  refs.set(actor.canonicalName.toLocaleLowerCase(), actor.id);
-  return actor.id;
+  return refs.get(key) ?? resolveActorId(timeline.actors, reference);
 }
 function normalizeStatus(value) {
   return value === "resolved" || value === "abandoned" || value === "uncertain" ? value : "active";
 }
 function normalizeCategory(value) {
-  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : "belief";
+  return value === "belief" || value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : null;
 }
 function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, analysis, controller) {
   const messages = sortMessages(batchMessages);
@@ -501,7 +656,7 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
   const refs = actorRefMap(timeline);
   const mentionsByMessage = /* @__PURE__ */ new Map();
   for (const raw of analysis.actorMentions ?? []) {
-    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    const message = byId.get(raw.messageId);
     if (!message || !raw.name?.trim()) continue;
     const evidence = evidenceFor(message);
     const stableReference = raw.ref?.trim() || raw.name.trim();
@@ -539,11 +694,18 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
   }
   const changesByMessage = /* @__PURE__ */ new Map();
   for (const raw of analysis.changes ?? []) {
-    const message = byId.get(raw.messageId) ?? messages[messages.length - 1];
+    const message = byId.get(raw.messageId);
     if (!message || !raw.subjectRef?.trim()) continue;
     const evidence = evidenceFor(message, raw.evidenceExcerpt);
-    const subjectActorId = resolveOrCreateRef(timeline, refs, raw.subjectRef, evidence);
-    const operation2 = raw.operation === "update" || raw.operation === "resolve" || raw.operation === "abandon" || raw.operation === "remove" ? raw.operation : "add";
+    const subjectActorId = resolveKnownRef(timeline, refs, raw.subjectRef);
+    if (!subjectActorId) continue;
+    const operation2 = raw.operation === "update" || raw.operation === "resolve" || raw.operation === "abandon" || raw.operation === "remove" ? raw.operation : raw.operation === "add" ? "add" : null;
+    const normalizedCategory = normalizeCategory(raw.category);
+    const targetItemId = stringValue(raw.targetItemId) || null;
+    const normalizedText = stringValue(raw.text);
+    if (!operation2 || !normalizedCategory) continue;
+    if ((operation2 === "add" || operation2 === "update") && !normalizedText) continue;
+    if (operation2 !== "add" && !targetItemId) continue;
     const dimensions = {};
     for (const [key, value] of Object.entries(raw.dimensions ?? {})) {
       dimensions[key] = clamp(value, -1, 1, 0);
@@ -551,14 +713,14 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
     const delta = {
       id: `delta:${crypto.randomUUID()}`,
       subjectActorId,
-      category: normalizeCategory(raw.category),
+      category: normalizedCategory,
       operation: operation2,
-      targetItemId: stringValue(raw.targetItemId) || null,
-      text: stringValue(raw.text),
+      targetItemId,
+      text: normalizedText,
       status: normalizeStatus(raw.status),
       confidence: clamp(raw.confidence, 0, 1, 0.75),
-      targetActorIds: uniqueStrings((raw.targetRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
-      concealedFromActorIds: uniqueStrings((raw.concealedFromRefs ?? []).map((ref) => resolveOrCreateRef(timeline, refs, ref, evidence))),
+      targetActorIds: uniqueStrings((raw.targetRefs ?? []).map((ref) => resolveKnownRef(timeline, refs, ref)).filter((id) => !!id)),
+      concealedFromActorIds: uniqueStrings((raw.concealedFromRefs ?? []).map((ref) => resolveKnownRef(timeline, refs, ref)).filter((id) => !!id)),
       intensity: raw.intensity === null || raw.intensity === void 0 ? null : clamp(raw.intensity, 0, 1, 0.5),
       dimensions,
       evidence,
@@ -802,6 +964,7 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
       createdAt: record.createdAt,
       changeCount: record.deltas.length,
       mentionCount: record.actorMentions.length,
+      reduction: record.reduction ?? emptyReductionTelemetry(),
       controller: {
         provider: record.controller.provider,
         model: record.controller.model,
@@ -814,7 +977,7 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
     updatedAt: timeline.updatedAt
   };
 }
-function compactStateForController(timeline, settings = DEFAULT_SETTINGS, maxItemsPerActor = 18) {
+function compactStateForController(timeline, settings = DEFAULT_SETTINGS, _maxItemsPerActor) {
   return Object.values(timeline.actors).map((actor) => {
     const managed = actorMindEnabled(actor, settings);
     return {
@@ -828,7 +991,7 @@ function compactStateForController(timeline, settings = DEFAULT_SETTINGS, maxIte
       present: managed && actor.present,
       ...managed ? {
         core: timeline.minds[actor.id]?.core ?? timeline.baseMinds[actor.id]?.core ?? EMPTY_CORE,
-        items: (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).slice(0, maxItemsPerActor).map((item) => ({
+        items: (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.updatedAt - left.updatedAt).map((item) => ({
           id: item.id,
           category: item.category,
           text: item.text,
@@ -838,7 +1001,9 @@ function compactStateForController(timeline, settings = DEFAULT_SETTINGS, maxIte
           concealedFromActorIds: item.concealedFromActorIds,
           intensity: item.intensity,
           dimensions: item.dimensions,
-          locked: item.locked
+          locked: item.locked,
+          pinned: item.pinned,
+          source: item.source
         }))
       } : {}
     };
@@ -882,12 +1047,40 @@ function parseJsonValue(content) {
   }
 }
 function category(value) {
-  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : "belief";
+  return value === "belief" || value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : null;
 }
 function operation(value) {
-  return value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : "add";
+  return value === "add" || value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : null;
 }
-function normalizeControllerAnalysis(value) {
+function normalizedReference(value) {
+  return value.trim().toLocaleLowerCase();
+}
+function sameReferences(left, right) {
+  const normalizedLeft = uniqueStrings(left ?? []).map(normalizedReference).sort();
+  const normalizedRight = uniqueStrings(right ?? []).map(normalizedReference).sort();
+  return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+function duplicateControllerChange(left, right) {
+  if (normalizedReference(left.subjectRef) !== normalizedReference(right.subjectRef) || left.category !== right.category) return false;
+  if (left.targetItemId && right.targetItemId) return left.targetItemId === right.targetItemId;
+  if (left.operation !== "add" || right.operation !== "add") return false;
+  if (!sameReferences(left.targetRefs, right.targetRefs) || !sameReferences(left.concealedFromRefs, right.concealedFromRefs)) return false;
+  const leftText = left.text ?? "";
+  const rightText = right.text ?? "";
+  const leftCanonical = canonicalMindText(leftText);
+  const rightCanonical = canonicalMindText(rightText);
+  return !!leftCanonical && leftCanonical === rightCanonical || mindTextsNearDuplicate(leftText, rightText);
+}
+function deduplicateControllerChanges(changes) {
+  const result = [];
+  for (const change of changes) {
+    const existingIndex = result.findIndex((candidate) => duplicateControllerChange(candidate, change));
+    if (existingIndex >= 0) result[existingIndex] = change;
+    else result.push(change);
+  }
+  return result;
+}
+function normalizeControllerAnalysisResult(value) {
   const raw = asObject2(value);
   const actorMentions = Array.isArray(raw.actorMentions) ? raw.actorMentions.flatMap((entry) => {
     const item = asObject2(entry);
@@ -909,17 +1102,23 @@ function normalizeControllerAnalysis(value) {
     const item = asObject2(entry);
     const subjectRef = text(item.subjectRef);
     const messageId = text(item.messageId);
-    if (!subjectRef || !messageId) return [];
+    const normalizedCategory = category(item.category);
+    const normalizedOperation = operation(item.operation);
+    const normalizedText = text(item.text);
+    const targetItemId = text(item.targetItemId) || null;
+    if (!subjectRef || !messageId || !normalizedCategory || !normalizedOperation) return [];
+    if ((normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText) return [];
+    if (normalizedOperation !== "add" && !targetItemId) return [];
     const dimensions = {};
     for (const [key, value2] of Object.entries(asObject2(item.dimensions))) {
       dimensions[key] = Math.min(1, Math.max(-1, numberValue(value2, 0)));
     }
     return [{
       subjectRef,
-      category: category(item.category),
-      operation: operation(item.operation),
-      targetItemId: text(item.targetItemId) || null,
-      text: text(item.text),
+      category: normalizedCategory,
+      operation: normalizedOperation,
+      targetItemId,
+      text: normalizedText,
       status: item.status === "resolved" || item.status === "abandoned" || item.status === "uncertain" ? item.status : "active",
       confidence: Math.min(1, Math.max(0, numberValue(item.confidence, 0.75))),
       targetRefs: stringArray(item.targetRefs),
@@ -930,7 +1129,12 @@ function normalizeControllerAnalysis(value) {
       evidenceExcerpt: text(item.evidenceExcerpt)
     }];
   }) : [];
-  return { actorMentions, changes };
+  const deduplicatedChanges = deduplicateControllerChanges(changes);
+  return {
+    analysis: { actorMentions, changes: deduplicatedChanges },
+    duplicatesSuppressed: changes.length - deduplicatedChanges.length,
+    invalidChangesRejected: (Array.isArray(raw.changes) ? raw.changes.length : 0) - changes.length
+  };
 }
 function policyReference(value) {
   return typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
@@ -995,20 +1199,68 @@ function applyControllerMindPolicy(analysis, compactState, settings) {
   });
   return { actorMentions, changes };
 }
+function validateControllerAnalysisContext(analysis, messages, compactState) {
+  const messageIds = new Set(messages.map((message) => message.id));
+  const actorByReference = /* @__PURE__ */ new Map();
+  for (const value of Array.isArray(compactState) ? compactState : []) {
+    const actor = asObject2(value);
+    const references = [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []];
+    for (const reference of references) {
+      const key = policyReference(reference);
+      if (key) actorByReference.set(key, actor);
+    }
+  }
+  const actorMentions = analysis.actorMentions.filter((mention) => messageIds.has(mention.messageId));
+  for (const mention of actorMentions) {
+    const actor = { items: [] };
+    for (const reference of [mention.ref, mention.name, ...mention.aliases ?? []]) {
+      const key = policyReference(reference);
+      if (key && !actorByReference.has(key)) actorByReference.set(key, actor);
+    }
+  }
+  let invalidChangesRejected = 0;
+  const changes = analysis.changes.flatMap((change) => {
+    const actor = actorByReference.get(policyReference(change.subjectRef));
+    if (!messageIds.has(change.messageId) || !actor) {
+      invalidChangesRejected += 1;
+      return [];
+    }
+    if (change.operation !== "add") {
+      const targetItemId = change.targetItemId?.trim();
+      const target = (Array.isArray(actor.items) ? actor.items : []).map(asObject2).find((item) => text(item.id) === targetItemId);
+      const protectedTarget = target && (target.locked === true || target.pinned === true || text(target.source) !== "" && text(target.source) !== "controller");
+      if (!targetItemId || !target || protectedTarget) {
+        invalidChangesRejected += 1;
+        return [];
+      }
+    }
+    const knownReferences = (values) => (values ?? []).filter((reference) => actorByReference.has(policyReference(reference)));
+    return [{
+      ...change,
+      targetRefs: knownReferences(change.targetRefs),
+      concealedFromRefs: knownReferences(change.concealedFromRefs)
+    }];
+  });
+  return { analysis: { actorMentions, changes }, invalidChangesRejected };
+}
 function isNontrivialAnalysisBatch(messages) {
   const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
   const total = lengths.reduce((sum, length) => sum + length, 0);
   return total >= 400 || lengths.some((length) => length >= 280) || messages.length >= 2 && total >= 240;
 }
-function makeControllerResponseTelemetry(raw, parsed, accepted) {
+function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}) {
   const object = asObject2(parsed);
+  const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
+  const duplicatesSuppressed = diagnostics.duplicatesSuppressed ?? 0;
   return {
     responseChars: raw.length,
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
-    rawChanges: Array.isArray(object.changes) ? object.changes.length : 0,
+    rawChanges,
     acceptedActorMentions: accepted.actorMentions.length,
-    acceptedChanges: accepted.changes.length
+    acceptedChanges: accepted.changes.length,
+    duplicatesSuppressed,
+    invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed)
   };
 }
 function mergeControllerAnalyses(first, corrective) {
@@ -1185,7 +1437,11 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
-  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked entries.",
+  "Treat mind_state as authoritative current state. Prefer updating an existing entry over adding another version of the same thought.",
+  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked, pinned, manual, or seed entries.",
+  "Add only genuinely novel state. Do not restate, paraphrase, or split information already represented by an unresolved entry.",
+  "Maintain one current relationship stance per subject-target pair; update that entry when the stance changes.",
+  "When an emotion, goal, plan, or awareness entry evolves, update or supersede the matching older entry instead of appending a new one.",
   "Bootstrap rule: when an actor has no active subjective-state entries, treat the supplied scene as initialization and add every clearly evidence-supported starting emotion, goal, awareness, relationship stance, plan, or belief.",
   "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
   "A substantive scene with character choices, reactions, attention, dialogue, or strong subtext should not return an empty changes array merely because mind_state started empty.",
@@ -1202,8 +1458,8 @@ function analysisSystemPrompt(settings, corrective = false) {
   ].join("\n") : "";
   return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
 }
-async function analyzeMessages(input) {
-  const prompt = [
+function buildAnalysisPrompt(input) {
+  return [
     "Existing actor registry and current subjective state:",
     `<mind_state>
 ${JSON.stringify(input.compactState)}
@@ -1217,7 +1473,10 @@ ${renderMessages(input.recentContext)}
 ${renderMessages(input.messages)}
 </analysis_batch>`,
     'Return {"actorMentions": [...], "changes": [...]} now.'
-  ].join("\n\n").slice(0, 12e4);
+  ].join("\n\n");
+}
+async function analyzeMessages(input) {
+  const prompt = buildAnalysisPrompt(input);
   const result = await quietJson(
     prompt,
     analysisSystemPrompt(input.settings),
@@ -1228,9 +1487,14 @@ ${renderMessages(input.messages)}
     input.fallbackConnectionId
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  const normalizedFirstAnalysis = normalizeControllerAnalysis(result.parsed);
-  const firstAnalysis = applyControllerMindPolicy(normalizedFirstAnalysis, input.compactState, input.settings);
-  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirstAnalysis);
+  const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
+  const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
+  const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
+  const firstAnalysis = validatedFirst.analysis;
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirst.analysis, {
+    duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
+    invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected
+  });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry = null;
@@ -1250,9 +1514,14 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         input.userId,
         input.fallbackConnectionId
       );
-      const normalizedCorrectiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
-      const correctiveAnalysis = applyControllerMindPolicy(normalizedCorrectiveAnalysis, input.compactState, input.settings);
-      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrectiveAnalysis);
+      const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
+      const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
+      const validatedCorrective = validateControllerAnalysisContext(policyCorrective, input.messages, input.compactState);
+      const correctiveAnalysis = validatedCorrective.analysis;
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrective.analysis, {
+        duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
+        invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected
+      });
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
@@ -1260,7 +1529,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
     }
   }
   const warningCodes = /* @__PURE__ */ new Set();
-  const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges > telemetry.acceptedChanges);
+  const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges - telemetry.acceptedChanges > telemetry.duplicatesSuppressed || telemetry.invalidChangesRejected > 0);
   if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
   if (retryError) warningCodes.add("retry_failed");
   if (nontrivial && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");

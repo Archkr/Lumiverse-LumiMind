@@ -105,6 +105,13 @@ export interface MindDelta {
   createdAt: number;
 }
 
+export interface MindReductionTelemetry {
+  duplicatesSuppressed: number;
+  entriesUpdated: number;
+  entriesSuperseded: number;
+  invalidChangesRejected: number;
+}
+
 export interface AnalysisRecord {
   id: string;
   analysisVersion: 1;
@@ -115,6 +122,7 @@ export interface AnalysisRecord {
   prefixHash: string;
   actorMentions: ActorMentionDelta[];
   deltas: MindDelta[];
+  reduction?: MindReductionTelemetry;
   skipReason?: "unmanaged_user_message";
   controller: {
     connectionId: string | null;
@@ -134,6 +142,8 @@ export interface ControllerResponseTelemetry {
   rawChanges: number;
   acceptedActorMentions: number;
   acceptedChanges: number;
+  duplicatesSuppressed: number;
+  invalidChangesRejected: number;
 }
 
 export interface ControllerBatchTelemetry {
@@ -249,6 +259,7 @@ export interface TimelineView {
   records: Array<Pick<AnalysisRecord, "id" | "messageId" | "messageIndex" | "swipeId" | "createdAt"> & {
     changeCount: number;
     mentionCount: number;
+    reduction: MindReductionTelemetry;
     controller: {
       provider: string | null;
       model: string | null;

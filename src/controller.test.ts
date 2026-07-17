@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeMessages,
   applyControllerMindPolicy,
+  buildAnalysisPrompt,
   isNontrivialAnalysisBatch,
   makeControllerResponseTelemetry,
   mergeControllerAnalyses,
@@ -33,6 +34,46 @@ describe("controller response parsing", () => {
     });
     expect(result.actorMentions[0]).toMatchObject({ kind: "npc", confidence: 1, present: true });
     expect(result.changes[0]).toMatchObject({ category: "emotion", confidence: 0, text: "Wary" });
+  });
+
+  it("rejects malformed changes instead of defaulting them to additions", () => {
+    const result = normalizeControllerAnalysis({
+      actorMentions: [],
+      changes: [
+        { subjectRef: "mira", category: "unknown", operation: "add", text: "Invented belief", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "unknown", text: "Invented belief", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "add", text: "", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "update", text: "Changed", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "add", text: "The door is locked", messageId: "m1" },
+      ],
+    });
+    expect(result.changes).toEqual([
+      expect.objectContaining({ category: "belief", operation: "add", text: "The door is locked" }),
+    ]);
+  });
+
+  it("deduplicates paraphrased additions within one controller response", () => {
+    const result = normalizeControllerAnalysis({
+      actorMentions: [],
+      changes: [
+        { subjectRef: "mira", category: "goal", operation: "add", text: "Wants to escape the tower", targetRefs: [], messageId: "m1" },
+        { subjectRef: "Mira", category: "goal", operation: "add", text: "Escape the tower", targetRefs: [], messageId: "m2" },
+      ],
+    });
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]).toMatchObject({ text: "Escape the tower", messageId: "m2" });
+  });
+
+  it("preserves the current analysis batch after very large state context", () => {
+    const prompt = buildAnalysisPrompt({
+      messages: [{ id: "current", role: "assistant", content: "CURRENT_BATCH_SENTINEL" }],
+      recentContext: [],
+      compactState: [{ ref: "mira", items: [{ text: "x".repeat(125_000) }] }],
+    });
+    expect(prompt.length).toBeGreaterThan(120_000);
+    expect(prompt).toContain('<message id="current"');
+    expect(prompt).toContain("CURRENT_BATCH_SENTINEL");
+    expect(prompt).toContain("</analysis_batch>");
   });
 
   it("detects substantive bootstrap batches without flagging trivial greetings", () => {
@@ -138,7 +179,15 @@ describe("controller response parsing", () => {
     const quiet = vi.fn()
       .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })
       .mockResolvedValueOnce({ content: JSON.stringify({
-        actorMentions: [],
+        actorMentions: [{
+          ref: "Aster",
+          name: "Aster",
+          aliases: [],
+          kind: "npc",
+          confidence: 0.9,
+          present: true,
+          messageId: "m1",
+        }],
         changes: [{
           subjectRef: "Aster",
           category: "emotion",

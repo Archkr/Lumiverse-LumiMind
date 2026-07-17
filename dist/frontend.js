@@ -205,6 +205,9 @@ function summarizeTimelineQuality(timeline) {
   for (const batch of batches) for (const code of batch.warningCodes) warningCodes.add(code);
   const acceptedMentions = records.reduce((sum, record) => sum + record.mentionCount, 0);
   const acceptedChanges = records.reduce((sum, record) => sum + record.changeCount, 0);
+  const responses = batches.flatMap((batch) => [batch.first, ...batch.retry ? [batch.retry] : []]);
+  const reducerDuplicates = records.reduce((sum, record) => sum + (record.reduction?.duplicatesSuppressed ?? 0), 0);
+  const reducerInvalid = records.reduce((sum, record) => sum + (record.reduction?.invalidChangesRejected ?? 0), 0);
   const entryCount = timeline ? Object.values(timeline.minds).reduce((sum, mind) => sum + mind.items.length, 0) : 0;
   const legacyEmptyResult = records.length > 0 && batches.length === 0 && acceptedChanges === 0 && entryCount === 0;
   return {
@@ -217,6 +220,10 @@ function summarizeTimelineQuality(timeline) {
     emptyNontrivialBatches: batches.filter((batch) => batch.warningCodes.includes("empty_nontrivial_batch")).length,
     normalizationDrops: batches.filter((batch) => batch.warningCodes.includes("normalization_drop")).length,
     retryFailures: batches.filter((batch) => batch.warningCodes.includes("retry_failed")).length,
+    duplicatesSuppressed: responses.reduce((sum, response) => sum + (response.duplicatesSuppressed ?? 0), 0) + reducerDuplicates,
+    entriesUpdated: records.reduce((sum, record) => sum + (record.reduction?.entriesUpdated ?? 0), 0),
+    entriesSuperseded: records.reduce((sum, record) => sum + (record.reduction?.entriesSuperseded ?? 0), 0),
+    invalidChangesRejected: responses.reduce((sum, response) => sum + (response.invalidChangesRejected ?? 0), 0) + reducerInvalid,
     warningCodes: [...warningCodes],
     legacyEmptyResult,
     needsAttention: warningCodes.size > 0 || legacyEmptyResult,
@@ -845,6 +852,10 @@ function setup(ctx) {
             emptyNontrivialBatches: quality.emptyNontrivialBatches,
             normalizationDrops: quality.normalizationDrops,
             retryFailures: quality.retryFailures,
+            duplicatesSuppressed: quality.duplicatesSuppressed,
+            entriesUpdated: quality.entriesUpdated,
+            entriesSuperseded: quality.entriesSuperseded,
+            invalidChangesRejected: quality.invalidChangesRejected,
             warningCodes: quality.warningCodes,
             legacyEmptyResult: quality.legacyEmptyResult,
             needsAttention: quality.needsAttention
@@ -855,6 +866,7 @@ function setup(ctx) {
             swipe: record.swipeId,
             mentions: record.mentionCount,
             changes: record.changeCount,
+            floodControl: record.reduction,
             controller: {
               provider: record.controller.provider,
               model: record.controller.model,

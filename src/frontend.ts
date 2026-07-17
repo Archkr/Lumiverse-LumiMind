@@ -363,6 +363,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
             emptyNontrivialBatches: quality.emptyNontrivialBatches,
             normalizationDrops: quality.normalizationDrops,
             retryFailures: quality.retryFailures,
+            duplicatesSuppressed: quality.duplicatesSuppressed,
+            entriesUpdated: quality.entriesUpdated,
+            entriesSuperseded: quality.entriesSuperseded,
+            invalidChangesRejected: quality.invalidChangesRejected,
             warningCodes: quality.warningCodes,
             legacyEmptyResult: quality.legacyEmptyResult,
             needsAttention: quality.needsAttention,
@@ -373,6 +377,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
             swipe: record.swipeId,
             mentions: record.mentionCount,
             changes: record.changeCount,
+            floodControl: record.reduction,
             controller: {
               provider: record.controller.provider,
               model: record.controller.model,

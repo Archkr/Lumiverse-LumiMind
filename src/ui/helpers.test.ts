@@ -108,12 +108,59 @@ describe("UI normalization", () => {
         controller: { provider: "openrouter", model: "model", dedicatedConnection: true, telemetry: null },
       }],
       minds: {},
-    } as TimelineView;
+    } as unknown as TimelineView;
     expect(summarizeTimelineQuality(timeline)).toMatchObject({
       acceptedMentions: 1,
       acceptedChanges: 0,
       legacyEmptyResult: true,
       needsAttention: true,
+    });
+  });
+
+  it("reports sanitized flood-control counters", () => {
+    const telemetry = {
+      schemaVersion: 1,
+      batchId: "batch",
+      messageCount: 1,
+      inputChars: 100,
+      nontrivial: true,
+      attempts: 1,
+      retryReason: null,
+      first: {
+        responseChars: 100,
+        responseHash: "hash",
+        rawActorMentions: 1,
+        rawChanges: 3,
+        acceptedActorMentions: 1,
+        acceptedChanges: 2,
+        duplicatesSuppressed: 1,
+        invalidChangesRejected: 0,
+      },
+      retry: null,
+      finalActorMentions: 1,
+      finalChanges: 2,
+      warningCodes: [],
+      retryError: null,
+    } as const;
+    const timeline = {
+      records: [{
+        id: "record",
+        messageId: "m1",
+        messageIndex: 0,
+        swipeId: 0,
+        createdAt: 1,
+        changeCount: 2,
+        mentionCount: 1,
+        reduction: { duplicatesSuppressed: 2, entriesUpdated: 3, entriesSuperseded: 1, invalidChangesRejected: 4 },
+        controller: { provider: "openrouter", model: "model", dedicatedConnection: true, telemetry },
+      }],
+      minds: {},
+    } as unknown as TimelineView;
+    expect(summarizeTimelineQuality(timeline)).toMatchObject({
+      duplicatesSuppressed: 3,
+      entriesUpdated: 3,
+      entriesSuperseded: 1,
+      invalidChangesRejected: 4,
     });
   });
 });

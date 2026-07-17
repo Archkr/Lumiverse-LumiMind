@@ -1,6 +1,6 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
-import { makeEmptySeed, normalizeSeed, stableHash, uniqueStrings } from "./engine";
+import { canonicalMindText, makeEmptySeed, mindTextsNearDuplicate, normalizeSeed, stableHash, uniqueStrings } from "./engine";
 import type {
   ChatMessageLike,
   ControllerBatchTelemetry,
@@ -75,17 +75,55 @@ export function parseJsonValue(content: string): unknown {
   }
 }
 
-function category(value: unknown): MindCategory {
-  return value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness"
+function category(value: unknown): MindCategory | null {
+  return value === "belief" || value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness"
     ? value
-    : "belief";
+    : null;
 }
 
-function operation(value: unknown): MindOperation {
-  return value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : "add";
+function operation(value: unknown): MindOperation | null {
+  return value === "add" || value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : null;
 }
 
-export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis {
+function normalizedReference(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function sameReferences(left: string[] | undefined, right: string[] | undefined): boolean {
+  const normalizedLeft = uniqueStrings(left ?? []).map(normalizedReference).sort();
+  const normalizedRight = uniqueStrings(right ?? []).map(normalizedReference).sort();
+  return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function duplicateControllerChange(left: ControllerChange, right: ControllerChange): boolean {
+  if (normalizedReference(left.subjectRef) !== normalizedReference(right.subjectRef) || left.category !== right.category) return false;
+  if (left.targetItemId && right.targetItemId) return left.targetItemId === right.targetItemId;
+  if (left.operation !== "add" || right.operation !== "add") return false;
+  if (!sameReferences(left.targetRefs, right.targetRefs) || !sameReferences(left.concealedFromRefs, right.concealedFromRefs)) return false;
+  const leftText = left.text ?? "";
+  const rightText = right.text ?? "";
+  const leftCanonical = canonicalMindText(leftText);
+  const rightCanonical = canonicalMindText(rightText);
+  return (!!leftCanonical && leftCanonical === rightCanonical) || mindTextsNearDuplicate(leftText, rightText);
+}
+
+function deduplicateControllerChanges(changes: ControllerChange[]): ControllerChange[] {
+  const result: ControllerChange[] = [];
+  for (const change of changes) {
+    const existingIndex = result.findIndex((candidate) => duplicateControllerChange(candidate, change));
+    if (existingIndex >= 0) result[existingIndex] = change;
+    else result.push(change);
+  }
+  return result;
+}
+
+interface ControllerNormalizationResult {
+  analysis: ControllerAnalysis;
+  duplicatesSuppressed: number;
+  invalidChangesRejected: number;
+}
+
+function normalizeControllerAnalysisResult(value: unknown): ControllerNormalizationResult {
   const raw = asObject(value);
   const actorMentions: ControllerActorMention[] = Array.isArray(raw.actorMentions)
     ? raw.actorMentions.flatMap((entry) => {
@@ -110,17 +148,23 @@ export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis 
         const item = asObject(entry);
         const subjectRef = text(item.subjectRef);
         const messageId = text(item.messageId);
-        if (!subjectRef || !messageId) return [];
+        const normalizedCategory = category(item.category);
+        const normalizedOperation = operation(item.operation);
+        const normalizedText = text(item.text);
+        const targetItemId = text(item.targetItemId) || null;
+        if (!subjectRef || !messageId || !normalizedCategory || !normalizedOperation) return [];
+        if ((normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText) return [];
+        if (normalizedOperation !== "add" && !targetItemId) return [];
         const dimensions: Record<string, number> = {};
         for (const [key, value] of Object.entries(asObject(item.dimensions))) {
           dimensions[key] = Math.min(1, Math.max(-1, numberValue(value, 0)));
         }
         return [{
           subjectRef,
-          category: category(item.category),
-          operation: operation(item.operation),
-          targetItemId: text(item.targetItemId) || null,
-          text: text(item.text),
+          category: normalizedCategory,
+          operation: normalizedOperation,
+          targetItemId,
+          text: normalizedText,
           status: item.status === "resolved" || item.status === "abandoned" || item.status === "uncertain" ? item.status : "active",
           confidence: Math.min(1, Math.max(0, numberValue(item.confidence, 0.75))),
           targetRefs: stringArray(item.targetRefs),
@@ -132,7 +176,16 @@ export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis 
         }];
       })
     : [];
-  return { actorMentions, changes };
+  const deduplicatedChanges = deduplicateControllerChanges(changes);
+  return {
+    analysis: { actorMentions, changes: deduplicatedChanges },
+    duplicatesSuppressed: changes.length - deduplicatedChanges.length,
+    invalidChangesRejected: (Array.isArray(raw.changes) ? raw.changes.length : 0) - changes.length,
+  };
+}
+
+export function normalizeControllerAnalysis(value: unknown): ControllerAnalysis {
+  return normalizeControllerAnalysisResult(value).analysis;
 }
 
 function policyReference(value: unknown): string {
@@ -208,6 +261,65 @@ export function applyControllerMindPolicy(
   return { actorMentions, changes };
 }
 
+interface ControllerContextValidationResult {
+  analysis: ControllerAnalysis;
+  invalidChangesRejected: number;
+}
+
+function validateControllerAnalysisContext(
+  analysis: ControllerAnalysis,
+  messages: ChatMessageLike[],
+  compactState: unknown,
+): ControllerContextValidationResult {
+  const messageIds = new Set(messages.map((message) => message.id));
+  const actorByReference = new Map<string, Record<string, unknown>>();
+  for (const value of Array.isArray(compactState) ? compactState : []) {
+    const actor = asObject(value);
+    const references = [actor.ref, actor.name, ...(Array.isArray(actor.aliases) ? actor.aliases : [])];
+    for (const reference of references) {
+      const key = policyReference(reference);
+      if (key) actorByReference.set(key, actor);
+    }
+  }
+  const actorMentions = analysis.actorMentions.filter((mention) => messageIds.has(mention.messageId));
+  for (const mention of actorMentions) {
+    const actor = { items: [] };
+    for (const reference of [mention.ref, mention.name, ...(mention.aliases ?? [])]) {
+      const key = policyReference(reference);
+      if (key && !actorByReference.has(key)) actorByReference.set(key, actor);
+    }
+  }
+
+  let invalidChangesRejected = 0;
+  const changes = analysis.changes.flatMap((change) => {
+    const actor = actorByReference.get(policyReference(change.subjectRef));
+    if (!messageIds.has(change.messageId) || !actor) {
+      invalidChangesRejected += 1;
+      return [];
+    }
+    if (change.operation !== "add") {
+      const targetItemId = change.targetItemId?.trim();
+      const target = (Array.isArray(actor.items) ? actor.items : [])
+        .map(asObject)
+        .find((item) => text(item.id) === targetItemId);
+      const protectedTarget = target && (
+        target.locked === true || target.pinned === true || (text(target.source) !== "" && text(target.source) !== "controller")
+      );
+      if (!targetItemId || !target || protectedTarget) {
+        invalidChangesRejected += 1;
+        return [];
+      }
+    }
+    const knownReferences = (values: string[] | undefined) => (values ?? []).filter((reference) => actorByReference.has(policyReference(reference)));
+    return [{
+      ...change,
+      targetRefs: knownReferences(change.targetRefs),
+      concealedFromRefs: knownReferences(change.concealedFromRefs),
+    }];
+  });
+  return { analysis: { actorMentions, changes }, invalidChangesRejected };
+}
+
 export function isNontrivialAnalysisBatch(messages: ChatMessageLike[]): boolean {
   const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
   const total = lengths.reduce((sum, length) => sum + length, 0);
@@ -218,15 +330,20 @@ export function makeControllerResponseTelemetry(
   raw: string,
   parsed: unknown,
   accepted: ControllerAnalysis,
+  diagnostics: Partial<Pick<ControllerResponseTelemetry, "duplicatesSuppressed" | "invalidChangesRejected">> = {},
 ): ControllerResponseTelemetry {
   const object = asObject(parsed);
+  const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
+  const duplicatesSuppressed = diagnostics.duplicatesSuppressed ?? 0;
   return {
     responseChars: raw.length,
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
-    rawChanges: Array.isArray(object.changes) ? object.changes.length : 0,
+    rawChanges,
     acceptedActorMentions: accepted.actorMentions.length,
     acceptedChanges: accepted.changes.length,
+    duplicatesSuppressed,
+    invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed),
   };
 }
 
@@ -411,7 +528,11 @@ const ANALYSIS_SYSTEM_PROMPT = [
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
-  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked entries.",
+  "Treat mind_state as authoritative current state. Prefer updating an existing entry over adding another version of the same thought.",
+  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked, pinned, manual, or seed entries.",
+  "Add only genuinely novel state. Do not restate, paraphrase, or split information already represented by an unresolved entry.",
+  "Maintain one current relationship stance per subject-target pair; update that entry when the stance changes.",
+  "When an emotion, goal, plan, or awareness entry evolves, update or supersede the matching older entry instead of appending a new one.",
   "Bootstrap rule: when an actor has no active subjective-state entries, treat the supplied scene as initialization and add every clearly evidence-supported starting emotion, goal, awareness, relationship stance, plan, or belief.",
   "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
   "A substantive scene with character choices, reactions, attention, dialogue, or strong subtext should not return an empty changes array merely because mind_state started empty.",
@@ -436,6 +557,18 @@ function analysisSystemPrompt(settings: LumiMindSettings, corrective = false): s
   return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
 }
 
+export function buildAnalysisPrompt(input: Pick<Parameters<typeof analyzeMessages>[0], "messages" | "recentContext" | "compactState">): string {
+  return [
+    "Existing actor registry and current subjective state:",
+    `<mind_state>\n${JSON.stringify(input.compactState)}\n</mind_state>`,
+    "Recent transcript context (context only; do not emit changes for these messages):",
+    `<recent_context>\n${renderMessages(input.recentContext)}\n</recent_context>`,
+    "Messages to analyze:",
+    `<analysis_batch>\n${renderMessages(input.messages)}\n</analysis_batch>`,
+    "Return {\"actorMentions\": [...], \"changes\": [...]} now.",
+  ].join("\n\n");
+}
+
 export async function analyzeMessages(input: {
   messages: ChatMessageLike[];
   recentContext: ChatMessageLike[];
@@ -444,15 +577,7 @@ export async function analyzeMessages(input: {
   userId: string;
   fallbackConnectionId?: string | null;
 }): Promise<AnalysisControllerResult> {
-  const prompt = [
-    "Existing actor registry and current subjective state:",
-    `<mind_state>\n${JSON.stringify(input.compactState)}\n</mind_state>`,
-    "Recent transcript context (context only; do not emit changes for these messages):",
-    `<recent_context>\n${renderMessages(input.recentContext)}\n</recent_context>`,
-    "Messages to analyze:",
-    `<analysis_batch>\n${renderMessages(input.messages)}\n</analysis_batch>`,
-    "Return {\"actorMentions\": [...], \"changes\": [...]} now.",
-  ].join("\n\n").slice(0, 120_000);
+  const prompt = buildAnalysisPrompt(input);
   const result = await quietJson(
     prompt,
     analysisSystemPrompt(input.settings),
@@ -463,9 +588,14 @@ export async function analyzeMessages(input: {
     input.fallbackConnectionId,
   );
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
-  const normalizedFirstAnalysis = normalizeControllerAnalysis(result.parsed);
-  const firstAnalysis = applyControllerMindPolicy(normalizedFirstAnalysis, input.compactState, input.settings);
-  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirstAnalysis);
+  const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
+  const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
+  const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
+  const firstAnalysis = validatedFirst.analysis;
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirst.analysis, {
+    duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
+    invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
+  });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry: ControllerResponseTelemetry | null = null;
@@ -484,9 +614,14 @@ export async function analyzeMessages(input: {
         input.userId,
         input.fallbackConnectionId,
       );
-      const normalizedCorrectiveAnalysis = normalizeControllerAnalysis(corrective.parsed);
-      const correctiveAnalysis = applyControllerMindPolicy(normalizedCorrectiveAnalysis, input.compactState, input.settings);
-      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrectiveAnalysis);
+      const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
+      const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
+      const validatedCorrective = validateControllerAnalysisContext(policyCorrective, input.messages, input.compactState);
+      const correctiveAnalysis = validatedCorrective.analysis;
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrective.analysis, {
+        duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
+        invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
+      });
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
@@ -496,7 +631,9 @@ export async function analyzeMessages(input: {
 
   const warningCodes = new Set<ControllerWarningCode>();
   const normalizationDropped = (telemetry: ControllerResponseTelemetry | null) => !!telemetry && (
-    telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges > telemetry.acceptedChanges
+    telemetry.rawActorMentions > telemetry.acceptedActorMentions ||
+    telemetry.rawChanges - telemetry.acceptedChanges > telemetry.duplicatesSuppressed ||
+    telemetry.invalidChangesRejected > 0
   );
   if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
   if (retryError) warningCodes.add("retry_failed");
