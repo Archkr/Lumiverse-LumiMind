@@ -678,6 +678,7 @@ function setup(ctx) {
   let currentState = null;
   let activeView = "cast";
   let selectedActorId = null;
+  const mindSectionDisclosure = /* @__PURE__ */ new Map();
   let settingsDraft = null;
   let settingsDirty = false;
   let notice = null;
@@ -1269,23 +1270,6 @@ function setup(ctx) {
     card.appendChild(heading);
     if (mind.core.selfConcept) card.appendChild(element("p", "lm-self-concept", mind.core.selfConcept));
     else card.appendChild(element("p", "lm-empty-inline", "No reviewed self-concept yet."));
-    const groups = [
-      ["Values", mind.core.values],
-      ["Desires", mind.core.desires],
-      ["Fears", mind.core.fears],
-      ["Boundaries", mind.core.boundaries]
-    ];
-    const grid = element("div", "lm-core-grid");
-    for (const [label, values] of groups) {
-      if (!values.length) continue;
-      const group = element("div", "lm-core-group");
-      group.appendChild(element("span", "lm-core-label", label));
-      const chips = element("div", "lm-chip-row");
-      for (const value of values) chips.appendChild(element("span", "lm-chip", value));
-      group.appendChild(chips);
-      grid.appendChild(group);
-    }
-    if (grid.childElementCount) card.appendChild(grid);
     return card;
   }
   function renderItem(actor, item) {
@@ -1336,7 +1320,9 @@ function setup(ctx) {
     const items = mind.items.filter((item) => item.category === category);
     const spoiler = currentState?.settings.spoilerSafe && (category === "belief" || category === "secret");
     const section = element("details", `lm-mind-section${spoiler ? " spoiler" : ""}`);
-    section.open = !spoiler;
+    const disclosureKey = `${currentState?.timeline?.chatId ?? "no-chat"}:${actor.id}:${category}`;
+    section.open = mindSectionDisclosure.get(disclosureKey) ?? !spoiler;
+    section.addEventListener("toggle", () => mindSectionDisclosure.set(disclosureKey, section.open));
     const summary = element("summary", "lm-mind-section-summary");
     const title = element("span", "lm-mind-section-name");
     title.append(element("strong", void 0, categoryLabel(category)), element("small", void 0, spoiler ? `${items.length} hidden until revealed` : `${items.length} entries`));

@@ -173,6 +173,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   let currentState: FrontendState | null = null;
   let activeView: LensView = "cast";
   let selectedActorId: string | null = null;
+  const mindSectionDisclosure = new Map<string, boolean>();
   let settingsDraft: LumiMindSettings | null = null;
   let settingsDirty = false;
   let notice: UiNotice | null = null;
@@ -803,23 +804,6 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     card.appendChild(heading);
     if (mind.core.selfConcept) card.appendChild(element("p", "lm-self-concept", mind.core.selfConcept));
     else card.appendChild(element("p", "lm-empty-inline", "No reviewed self-concept yet."));
-    const groups: Array<[string, string[]]> = [
-      ["Values", mind.core.values],
-      ["Desires", mind.core.desires],
-      ["Fears", mind.core.fears],
-      ["Boundaries", mind.core.boundaries],
-    ];
-    const grid = element("div", "lm-core-grid");
-    for (const [label, values] of groups) {
-      if (!values.length) continue;
-      const group = element("div", "lm-core-group");
-      group.appendChild(element("span", "lm-core-label", label));
-      const chips = element("div", "lm-chip-row");
-      for (const value of values) chips.appendChild(element("span", "lm-chip", value));
-      group.appendChild(chips);
-      grid.appendChild(group);
-    }
-    if (grid.childElementCount) card.appendChild(grid);
     return card;
   }
 
@@ -872,7 +856,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const items = mind.items.filter((item) => item.category === category);
     const spoiler = currentState?.settings.spoilerSafe && (category === "belief" || category === "secret");
     const section = element("details", `lm-mind-section${spoiler ? " spoiler" : ""}`);
-    section.open = !spoiler;
+    const disclosureKey = `${currentState?.timeline?.chatId ?? "no-chat"}:${actor.id}:${category}`;
+    section.open = mindSectionDisclosure.get(disclosureKey) ?? !spoiler;
+    section.addEventListener("toggle", () => mindSectionDisclosure.set(disclosureKey, section.open));
     const summary = element("summary", "lm-mind-section-summary");
     const title = element("span", "lm-mind-section-name");
     title.append(element("strong", undefined, categoryLabel(category)), element("small", undefined, spoiler ? `${items.length} hidden until revealed` : `${items.length} entries`));
