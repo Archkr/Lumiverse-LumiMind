@@ -163,12 +163,13 @@ export function stableHash(input: string): string {
 }
 
 export function analysisPolicyHash(settings: LumiMindSettings): string {
-  return stableHash(`persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  const directorPolicy = settings.characterCardDirectorMode ? "director-policy:2|" : "";
+  return stableHash(`${directorPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 
 export function actorMindEnabled(actor: ActorRecord, settings: LumiMindSettings): boolean {
   if (actor.kind === "persona") return settings.personaMindEnabled;
-  if (actor.kind === "character") return !settings.characterCardDirectorMode;
+  if (actor.kind === "character" && actor.characterId) return !settings.characterCardDirectorMode;
   return true;
 }
 
@@ -283,6 +284,12 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
   const raw = asObject(value);
   if (raw.schemaVersion !== MIND_SCHEMA_VERSION || raw.chatId !== chatId) return createTimeline(chatId);
   const fallback = createTimeline(chatId);
+  const actors = Object.fromEntries(Object.entries(asObject(raw.actors)).map(([id, value]) => {
+    const actor = { ...(value as ActorRecord), id };
+    if (actor.kind === "character" && !actor.characterId) actor.kind = "npc";
+    if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
+    return [id, actor];
+  }));
   return {
     ...fallback,
     ...(raw as unknown as Partial<ChatTimelineV1>),
@@ -292,7 +299,7 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     active: raw.active === true,
     paused: raw.paused === true,
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
-    actors: asObject(raw.actors) as Record<string, ActorRecord>,
+    actors,
     baseMinds: asObject(raw.baseMinds) as Record<string, ActorMind>,
     minds: asObject(raw.minds) as Record<string, ActorMind>,
     records: Array.isArray(raw.records) ? (raw.records as AnalysisRecord[]) : [],
@@ -585,7 +592,7 @@ export function materializeAnalysisRecords(
       const actor = upsertActor(
         timeline,
         {
-          kind: raw.kind === "character" || raw.kind === "persona" ? raw.kind : "npc",
+          kind: "npc",
           name: raw.name,
           aliases: raw.aliases ?? [],
           confidence: raw.confidence,
@@ -850,7 +857,7 @@ export function buildDirectorMindInjection(
   if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
   const totalChars = Math.max(1200, tokenBudget * 4);
   const actors = Object.values(timeline.actors)
-    .filter((actor) => actor.kind !== "character" && actorMindEnabled(actor, settings) && timeline.minds[actor.id])
+    .filter((actor) => actorMindEnabled(actor, settings) && timeline.minds[actor.id])
     .sort((left, right) =>
       Number(right.present) - Number(left.present) ||
       Number(right.confirmed) - Number(left.confirmed) ||

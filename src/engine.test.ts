@@ -9,9 +9,11 @@ import {
   createTimeline,
   makeBaseMind,
   makeEmptySeed,
+  materializeAnalysisRecords,
   mergeActors,
   nextPrefixHash,
   normalizeSettings,
+  normalizeTimeline,
   overrideItem,
   rebuildTimeline,
   resolveActorId,
@@ -78,6 +80,21 @@ describe("actor registry", () => {
     expect(mergeActors(timeline, npc.id, card.id)).toBe(true);
     expect(timeline.actors[card.id].aliases).toEqual(expect.arrayContaining(["The Scholar", "Ash"]));
   });
+
+  it("migrates controller-discovered character-shaped actors to timeline-local NPCs", () => {
+    const timeline = createTimeline("chat");
+    const legacy = upsertActor(timeline, { kind: "character", name: "Mira" });
+    const normalized = normalizeTimeline(JSON.parse(JSON.stringify(timeline)), timeline.chatId);
+    expect(normalized.actors[legacy.id]).toMatchObject({ kind: "npc", characterId: null });
+
+    const fresh = createTimeline("fresh");
+    const first = message("m1", 0, "Mira watched the door.");
+    materializeAnalysisRecords(fresh, [first], "root", {
+      actorMentions: [{ ref: "mira", name: "Mira", kind: "character", messageId: first.id }],
+      changes: [],
+    }, { connectionId: null, provider: "test", model: "test" });
+    expect(Object.values(fresh.actors)[0]).toMatchObject({ kind: "npc", characterId: null });
+  });
 });
 
 describe("timeline reducer", () => {
@@ -139,6 +156,8 @@ describe("hashing, settings, and compaction", () => {
       characterCardDirectorMode: true,
     });
     expect(normalizeSettings({ characterCardDirectorMode: true, secondaryActorLimit: 0 }).secondaryActorLimit).toBe(1);
+    expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
+    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:2|persona:1|director:1"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
   });
 
@@ -160,7 +179,7 @@ describe("hashing, settings, and compaction", () => {
     timeline.active = true;
     const card = upsertActor(timeline, { kind: "character", name: "The Director", characterId: "card" });
     const persona = upsertActor(timeline, { kind: "persona", name: "Player", personaId: "persona" });
-    const npc = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const npc = upsertActor(timeline, { kind: "character", name: "Mira" });
     const seed = makeEmptySeed({ selfConcept: "A wary scout who watches every doorway." });
     seed.startingGoals = ["Protect the caravan"];
     timeline.baseMinds[npc.id] = makeBaseMind(npc.id, seed);

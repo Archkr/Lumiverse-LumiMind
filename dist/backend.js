@@ -129,11 +129,12 @@ function stableHash(input) {
   return hash.toString(16).padStart(16, "0");
 }
 function analysisPolicyHash(settings) {
-  return stableHash(`persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  const directorPolicy = settings.characterCardDirectorMode ? "director-policy:2|" : "";
+  return stableHash(`${directorPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 function actorMindEnabled(actor, settings) {
   if (actor.kind === "persona") return settings.personaMindEnabled;
-  if (actor.kind === "character") return !settings.characterCardDirectorMode;
+  if (actor.kind === "character" && actor.characterId) return !settings.characterCardDirectorMode;
   return true;
 }
 function messageContentHash(message) {
@@ -229,6 +230,12 @@ function normalizeTimeline(value, chatId) {
   const raw = asObject(value);
   if (raw.schemaVersion !== MIND_SCHEMA_VERSION || raw.chatId !== chatId) return createTimeline(chatId);
   const fallback = createTimeline(chatId);
+  const actors = Object.fromEntries(Object.entries(asObject(raw.actors)).map(([id, value2]) => {
+    const actor = { ...value2, id };
+    if (actor.kind === "character" && !actor.characterId) actor.kind = "npc";
+    if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
+    return [id, actor];
+  }));
   return {
     ...fallback,
     ...raw,
@@ -238,7 +245,7 @@ function normalizeTimeline(value, chatId) {
     active: raw.active === true,
     paused: raw.paused === true,
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
-    actors: asObject(raw.actors),
+    actors,
     baseMinds: asObject(raw.baseMinds),
     minds: asObject(raw.minds),
     records: Array.isArray(raw.records) ? raw.records : [],
@@ -482,7 +489,7 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
       const actor2 = upsertActor(
         timeline,
         {
-          kind: raw.kind === "character" || raw.kind === "persona" ? raw.kind : "npc",
+          kind: "npc",
           name: raw.name,
           aliases: raw.aliases ?? [],
           confidence: raw.confidence
@@ -701,7 +708,7 @@ function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit
 function buildDirectorMindInjection(timeline, tokenBudget, actorLimit, settings = DEFAULT_SETTINGS) {
   if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
   const totalChars = Math.max(1200, tokenBudget * 4);
-  const actors = Object.values(timeline.actors).filter((actor) => actor.kind !== "character" && actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
+  const actors = Object.values(timeline.actors).filter((actor) => actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
     (left, right) => Number(right.present) - Number(left.present) || Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
   ).slice(0, actorLimit);
   if (!actors.length) return null;
