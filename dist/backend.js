@@ -64,10 +64,11 @@ function clamp(value, min, max, fallback) {
 function normalizeSettings(value) {
   const raw = asObject(value);
   const characterCardDirectorMode = raw.characterCardDirectorMode === true;
+  const controllerMaxTokens = typeof raw.controllerMaxTokens === "number" ? raw.controllerMaxTokens : Number(raw.controllerMaxTokens);
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
-    controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8e3, DEFAULT_SETTINGS.controllerMaxTokens)),
+    controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens) ? Math.max(300, controllerMaxTokens) : DEFAULT_SETTINGS.controllerMaxTokens),
     analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
     chatHistoryMessageLimit: Math.round(clamp(raw.chatHistoryMessageLimit, 0, 1e3, DEFAULT_SETTINGS.chatHistoryMessageLimit)),
     personaMindEnabled: raw.personaMindEnabled !== false,

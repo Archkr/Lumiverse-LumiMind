@@ -340,7 +340,7 @@ LumiMind settings are user-scoped and apply across chats.
 |---|---:|---|
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
-| Analysis output tokens | `1,800` | Maximum controller output budget per analysis call. |
+| Analysis output tokens | `1,800` | Maximum output requested per analysis call, with no LumiMind-imposed upper bound. The selected model or provider may enforce its own limit. |
 | Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
 | Chat history messages | Unlimited | Maximum number of stored chat messages retained in the main generation prompt while LumiMind is active; `0` keeps the full history. |
 

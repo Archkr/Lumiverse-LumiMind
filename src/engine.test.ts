@@ -319,6 +319,7 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
+    expect(normalizeSettings({ controllerMaxTokens: 128000 }).controllerMaxTokens).toBe(128000);
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("ledger-policy:1|persona:1|director:0"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("ledger-policy:1|director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("ledger-policy:1|persona-policy:2|persona:0|director:0"));

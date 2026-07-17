@@ -1268,19 +1268,22 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       label: string,
       key: "controllerTemperature" | "controllerMaxTokens" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
-      max: number,
+      max: number | null,
       step: number,
       description?: string,
     ) => {
       const control = element("input", "lm-input") as HTMLInputElement;
       control.type = "number";
       control.min = String(min);
-      control.max = String(max);
+      if (max !== null) control.max = String(max);
       control.step = String(step);
       control.value = String(settingsDraft?.[key] ?? 0);
       control.addEventListener("change", () => {
         if (!settingsDraft) return;
-        const value = Math.min(max, Math.max(min, Number(control.value)));
+        const parsed = Number(control.value);
+        const value = Number.isFinite(parsed)
+          ? max === null ? Math.max(min, parsed) : Math.min(max, Math.max(min, parsed))
+          : settingsDraft[key];
         settingsDraft[key] = value;
         control.value = String(value);
         markSettingsDirty(save);
@@ -1289,7 +1292,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     };
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
-      numberSetting("Analysis output tokens", "controllerMaxTokens", 300, 8000, 100),
+      numberSetting(
+        "Analysis output tokens",
+        "controllerMaxTokens",
+        300,
+        null,
+        100,
+        "Maximum output requested for each analysis call. LumiMind does not impose an upper limit; the selected model or provider may still enforce one.",
+      ),
       numberSetting(
         "Analysis context messages",
         "analysisContextMessageLimit",
