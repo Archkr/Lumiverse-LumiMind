@@ -10,6 +10,7 @@ import {
   buildMindInjection,
   compactStateForController,
   createTimeline,
+  limitChatHistoryMessages,
   makeBaseMind,
   makeEmptySeed,
   makePrivateSnapshot,
@@ -604,11 +605,12 @@ spindle.registerInterceptor(async (messages, context) => {
     const timeline = await getTimeline(chatId, userId);
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
+    const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
     let targetActorId: string | null = null;
     let injection: string | null = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
-      if (!settings.personaMindEnabled) return messages;
+      if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
@@ -626,10 +628,10 @@ spindle.registerInterceptor(async (messages, context) => {
       }
       injection = buildMindInjection(timeline, targetActorId, settings);
     }
-    if (!injection) return messages;
+    if (!injection) return promptMessages;
     const injected = { role: "system" as const, content: injection };
     return {
-      messages: [injected, ...messages],
+      messages: [injected, ...promptMessages],
       breakdown: [{ messageIndex: 0, name: "LumiMind — Private Mind" }],
     };
   } catch (error) {

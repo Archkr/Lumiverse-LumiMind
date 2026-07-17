@@ -8,6 +8,7 @@ import {
   canonicalMindText,
   compactStateForController,
   createTimeline,
+  limitChatHistoryMessages,
   makeBaseMind,
   makeEmptySeed,
   materializeAnalysisRecords,
@@ -298,11 +299,12 @@ describe("hashing, settings, and compaction", () => {
   });
 
   it("clamps persisted controller and analysis-context settings", () => {
-    const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, analysisContextMessageLimit: 99 });
+    const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, analysisContextMessageLimit: 99, chatHistoryMessageLimit: 1200 });
     expect(settings).toMatchObject({
       controllerTemperature: 2,
       controllerMaxTokens: 300,
       analysisContextMessageLimit: 50,
+      chatHistoryMessageLimit: 1000,
       personaMindEnabled: true,
       characterCardDirectorMode: false,
     });
@@ -310,8 +312,10 @@ describe("hashing, settings, and compaction", () => {
       personaMindEnabled: false,
       characterCardDirectorMode: true,
       analysisContextMessageLimit: 4,
+      chatHistoryMessageLimit: 0,
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
+    expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("persona-policy:2|persona:0|director:0"));
@@ -349,6 +353,26 @@ describe("hashing, settings, and compaction", () => {
     expect(selectAnalysisRecentContext(messages, 3, 2)).toEqual([messages[1], messages[2]]);
     expect(selectAnalysisRecentContext(messages, 3, 0)).toEqual([]);
     expect(selectAnalysisRecentContext(messages, 0, 10)).toEqual([]);
+  });
+
+  it("limits only host-marked chat history while preserving assembled prompt content", () => {
+    const prompt: Array<{ id: string; __isChatHistory?: boolean }> = [
+      { id: "system" },
+      { id: "history-1", __isChatHistory: true },
+      { id: "world-info" },
+      { id: "history-2", __isChatHistory: true },
+      { id: "history-3", __isChatHistory: true },
+      { id: "authors-note" },
+    ];
+
+    expect(limitChatHistoryMessages(prompt, 2).map((entry) => entry.id)).toEqual([
+      "system",
+      "world-info",
+      "history-2",
+      "history-3",
+      "authors-note",
+    ]);
+    expect(limitChatHistoryMessages(prompt, 0)).toBe(prompt);
   });
 
   it("injects all unresolved state for every present managed actor", () => {

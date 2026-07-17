@@ -197,6 +197,7 @@ export interface LumiMindSettings {
   controllerTemperature: number;
   controllerMaxTokens: number;
   analysisContextMessageLimit: number;
+  chatHistoryMessageLimit: number;
   personaMindEnabled: boolean;
   characterCardDirectorMode: boolean;
   cortexImportEnabled: boolean;

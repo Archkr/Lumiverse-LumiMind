@@ -804,6 +804,7 @@ function setup(ctx) {
       injection: state ? {
         presentActorsOnly: true,
         unresolvedStateOnly: true,
+        chatHistoryMessageLimit: state.settings.chatHistoryMessageLimit,
         interceptorAvailable: state.permissions.interceptor
       } : null,
       features: state ? {
@@ -1639,6 +1640,14 @@ function setup(ctx) {
         50,
         1,
         "Maximum earlier transcript messages included as context for each analysis batch. Set to 0 for none."
+      ),
+      numberSetting(
+        "Chat history messages",
+        "chatHistoryMessageLimit",
+        0,
+        1e3,
+        1,
+        "Maximum stored chat messages retained in the main generation prompt. Set to 0 for unlimited."
       )
     );
     controller.appendChild(numberGrid);

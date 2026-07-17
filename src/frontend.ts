@@ -315,6 +315,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       injection: state ? {
         presentActorsOnly: true,
         unresolvedStateOnly: true,
+        chatHistoryMessageLimit: state.settings.chatHistoryMessageLimit,
         interceptorAvailable: state.permissions.interceptor,
       } : null,
       features: state ? {
@@ -1175,7 +1176,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
-      key: "controllerTemperature" | "controllerMaxTokens" | "analysisContextMessageLimit",
+      key: "controllerTemperature" | "controllerMaxTokens" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
       max: number,
       step: number,
@@ -1206,6 +1207,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         50,
         1,
         "Maximum earlier transcript messages included as context for each analysis batch. Set to 0 for none.",
+      ),
+      numberSetting(
+        "Chat history messages",
+        "chatHistoryMessageLimit",
+        0,
+        1000,
+        1,
+        "Maximum stored chat messages retained in the main generation prompt. Set to 0 for unlimited.",
       ),
     );
     controller.appendChild(numberGrid);

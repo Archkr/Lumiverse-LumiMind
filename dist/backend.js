@@ -9,6 +9,7 @@ var DEFAULT_SETTINGS = {
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
   analysisContextMessageLimit: 4,
+  chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
   characterCardDirectorMode: false,
   cortexImportEnabled: true,
@@ -68,6 +69,7 @@ function normalizeSettings(value) {
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8e3, DEFAULT_SETTINGS.controllerMaxTokens)),
     analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
+    chatHistoryMessageLimit: Math.round(clamp(raw.chatHistoryMessageLimit, 0, 1e3, DEFAULT_SETTINGS.chatHistoryMessageLimit)),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -188,6 +190,18 @@ function selectAnalysisRecentContext(messages, analysisStart, messageLimit) {
   const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
   if (limit === 0 || analysisStart <= 0) return [];
   return messages.slice(Math.max(0, analysisStart - limit), analysisStart);
+}
+function limitChatHistoryMessages(messages, messageLimit) {
+  const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
+  if (limit === 0) return messages;
+  let remaining = limit;
+  const keep = new Array(messages.length).fill(true);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].__isChatHistory !== true) continue;
+    if (remaining > 0) remaining -= 1;
+    else keep[index] = false;
+  }
+  return messages.filter((_, index) => keep[index]);
 }
 function createActor(input) {
   const now = Date.now();
@@ -2074,11 +2088,12 @@ spindle.registerInterceptor(async (messages, context) => {
     const timeline = await getTimeline(chatId, userId);
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
+    const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
     let targetActorId = null;
     let injection = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
-      if (!settings.personaMindEnabled) return messages;
+      if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
@@ -2096,10 +2111,10 @@ spindle.registerInterceptor(async (messages, context) => {
       }
       injection = buildMindInjection(timeline, targetActorId, settings);
     }
-    if (!injection) return messages;
+    if (!injection) return promptMessages;
     const injected = { role: "system", content: injection };
     return {
-      messages: [injected, ...messages],
+      messages: [injected, ...promptMessages],
       breakdown: [{ messageIndex: 0, name: "LumiMind \u2014 Private Mind" }]
     };
   } catch (error) {

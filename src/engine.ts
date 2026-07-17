@@ -29,6 +29,7 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
   analysisContextMessageLimit: 4,
+  chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
   characterCardDirectorMode: false,
   cortexImportEnabled: true,
@@ -96,6 +97,7 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8000, DEFAULT_SETTINGS.controllerMaxTokens)),
     analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
+    chatHistoryMessageLimit: Math.round(clamp(raw.chatHistoryMessageLimit, 0, 1000, DEFAULT_SETTINGS.chatHistoryMessageLimit)),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -246,6 +248,19 @@ export function selectAnalysisRecentContext(
   const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
   if (limit === 0 || analysisStart <= 0) return [];
   return messages.slice(Math.max(0, analysisStart - limit), analysisStart);
+}
+
+export function limitChatHistoryMessages<T extends { __isChatHistory?: boolean }>(messages: T[], messageLimit: number): T[] {
+  const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
+  if (limit === 0) return messages;
+  let remaining = limit;
+  const keep = new Array<boolean>(messages.length).fill(true);
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].__isChatHistory !== true) continue;
+    if (remaining > 0) remaining -= 1;
+    else keep[index] = false;
+  }
+  return messages.filter((_, index) => keep[index]);
 }
 
 export function createActor(input: {
