@@ -282,6 +282,8 @@ Open **Mind Lens → Settings → Diagnostics** to inspect:
 
 **Copy report** produces formatted JSON suitable for a bug report. It excludes story text, beliefs, secrets, raw controller output, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
 
+**Copy developer report** includes the full available transcript, identities, mind state, evidence, seeds, overrides, analysis records, and entity IDs. API credential fields remain redacted. Treat this report as private and share it only with trusted developers.
+
 ---
 
 ## Mind Seed

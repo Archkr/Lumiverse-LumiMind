@@ -1492,6 +1492,7 @@ async function analyzeMessages(input) {
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry = null;
+  let retryRaw = null;
   let retryError = null;
   let attempts = 1;
   if (nontrivial && firstAnalysis.changes.length === 0) {
@@ -1508,6 +1509,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         input.userId,
         input.fallbackConnectionId
       );
+      retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
       const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
       const validatedCorrective = validateControllerAnalysisContext(policyCorrective, input.messages, input.compactState);
@@ -1532,6 +1534,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
     analysis: finalAnalysis,
     meta: result.meta,
     raw: result.raw,
+    rawResponses: { first: result.raw, retry: retryRaw },
     telemetry: {
       schemaVersion: 1,
       batchId: crypto.randomUUID(),
@@ -1642,6 +1645,20 @@ function makeMindLumiStateSnapshot(timeline, settings, extensionVersion, generat
   };
 }
 
+// src/diagnostics.ts
+function credentialField(key) {
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLocaleLowerCase();
+  return normalized.endsWith("apikey") && !normalized.startsWith("has") || normalized === "authorization" || normalized === "accesstoken" || normalized === "refreshtoken" || normalized === "authtoken" || normalized === "bearertoken" || normalized === "clientsecret" || normalized === "password";
+}
+function redactDiagnosticCredentials(value) {
+  if (Array.isArray(value)) return value.map(redactDiagnosticCredentials);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key,
+    credentialField(key) ? "[REDACTED]" : redactDiagnosticCredentials(entry)
+  ]));
+}
+
 // src/backend.ts
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
@@ -1657,6 +1674,7 @@ var reconcileTimers = /* @__PURE__ */ new Map();
 var generationContexts = /* @__PURE__ */ new Map();
 var latestGenerationByChat = /* @__PURE__ */ new Map();
 var connectionByChat = /* @__PURE__ */ new Map();
+var controllerDebugResponses = /* @__PURE__ */ new Map();
 var lastFrontendUserId = null;
 function cacheKey(userId, chatId) {
   return `${userId}:${chatId}`;
@@ -1766,6 +1784,32 @@ async function buildFrontendState(userId, requestedChatId, characterId) {
 }
 async function sendState(userId, chatId, characterId) {
   send({ type: "state", state: await buildFrontendState(userId, chatId, characterId) }, userId);
+}
+async function buildDeveloperDiagnostics(userId, requestedChatId) {
+  const active = activeChats.get(userId) ?? { chatId: null, characterId: null };
+  const chatId = requestedChatId ?? active.chatId;
+  const [settings, connections, timeline, transcript, character, persona] = await Promise.all([
+    getSettings(userId),
+    hasPermission("generation") ? spindle.connections.list(userId).catch(() => []) : Promise.resolve([]),
+    chatId ? getTimeline(chatId, userId).catch(() => null) : Promise.resolve(null),
+    chatId && hasPermission("chat_mutation") ? spindle.chat.getMessages(chatId, userId).catch(() => null) : Promise.resolve(null),
+    active.characterId && hasPermission("characters") ? spindle.characters.get(active.characterId, userId).catch(() => null) : Promise.resolve(null),
+    hasPermission("personas") ? spindle.personas.getActive(userId).catch(() => null) : Promise.resolve(null)
+  ]);
+  return redactDiagnosticCredentials({
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    userId,
+    activeContext: { chatId, characterId: active.characterId },
+    permissions: currentPermissions(),
+    settings,
+    connections,
+    timeline,
+    transcript,
+    activeCharacter: character,
+    activePersona: persona,
+    controllerRawResponses: chatId ? controllerDebugResponses.get(cacheKey(userId, chatId)) ?? [] : [],
+    unavailable: ["API credential values", "raw controller responses created before the current extension runtime"]
+  });
 }
 function normalizeChatMessages(value) {
   if (!Array.isArray(value)) return [];
@@ -1982,6 +2026,15 @@ async function reconcileChat(userId, chatId, force = false) {
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null
       });
+      const debugKey = cacheKey(userId, chatId);
+      const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
+      debugResponses.push({
+        batchId: result.telemetry.batchId,
+        capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        first: result.rawResponses.first,
+        retry: result.rawResponses.retry
+      });
+      controllerDebugResponses.set(debugKey, debugResponses.slice(-10));
       const records = materializeAnalysisRecords(
         timeline,
         batch,
@@ -2224,6 +2277,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   const userId = resolveUserId(chatId, eventUserId);
   if (!chatId || !userId) return;
   timelines.delete(storageTimelineKey(userId, chatId));
+  controllerDebugResponses.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 spindle.permissions.onChanged(() => {
@@ -2247,6 +2301,11 @@ spindle.onFrontendMessage(async (payload, userId) => {
     return;
   }
   try {
+    if (message.type === "developer_report") {
+      const report = await buildDeveloperDiagnostics(userId, message.chatId);
+      send({ type: "developer_report", requestId: message.requestId, report }, userId);
+      return;
+    }
     if (message.type === "activate") {
       await enqueue(userId, message.chatId, () => activateChat(userId, message.chatId));
       return;
@@ -2354,6 +2413,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    if (message.type === "developer_report") {
+      send({ type: "developer_report_error", requestId: message.requestId, message: detail }, userId);
+      return;
+    }
     send({ type: "error", message: detail }, userId);
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }

@@ -136,8 +136,9 @@ export const LUMI_MIND_CSS = `
 .lm-timeline-status-copy strong { font-size:11px; }
 .lm-timeline-status-copy span { color:var(--lm-muted); font-size:10px; }
 .lm-inline-actions { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
-.lm-analysis-quality-warning { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:start; padding:10px; border:1px solid color-mix(in srgb,var(--lm-warning) 38%,var(--lm-line)); border-radius:var(--lm-radius); background:linear-gradient(110deg,color-mix(in srgb,var(--lm-warning) 10%,var(--lm-panel)),var(--lm-panel)); }
+.lm-analysis-quality-warning { position:relative; display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:start; padding:10px 34px 10px 10px; border:1px solid color-mix(in srgb,var(--lm-warning) 38%,var(--lm-line)); border-radius:var(--lm-radius); background:linear-gradient(110deg,color-mix(in srgb,var(--lm-warning) 10%,var(--lm-panel)),var(--lm-panel)); }
 .lm-quality-marker { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border:1px solid color-mix(in srgb,var(--lm-warning) 45%,var(--lm-line)); border-radius:50%; color:var(--lm-warning); background:color-mix(in srgb,var(--lm-warning) 10%,transparent); font-size:10px; font-weight:850; }
+.lm-quality-dismiss { position:absolute; top:5px; right:5px; }
 
 .lm-section-heading { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
 .lm-section-title { color:var(--lm-muted); font-size:10px; font-weight:750; letter-spacing:.09em; text-transform:uppercase; }
@@ -273,6 +274,7 @@ export const LUMI_MIND_CSS = `
 .lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
 .lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }
 .lm-diagnostics-intro p { margin-top:4px !important; color:var(--lm-muted); font-size:10px; }
+.lm-diagnostics-intro .lm-diagnostics-private-warning { color:var(--lm-warning); }
 .lm-diagnostics-privacy { padding:3px 7px; border:1px solid color-mix(in srgb,var(--lm-success) 28%,var(--lm-line)); border-radius:999px; color:var(--lm-success); background:color-mix(in srgb,var(--lm-success) 8%,transparent); font-size:8px; font-weight:750; white-space:nowrap; text-transform:uppercase; letter-spacing:.04em; }
 .lm-diagnostics-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; }
 .lm-diagnostic-stat { display:flex; flex-direction:column; gap:2px; min-width:0; padding:8px 9px; border:1px solid var(--lm-line); border-radius:8px; background:var(--lm-fill); }

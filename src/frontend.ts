@@ -41,6 +41,7 @@ import {
   writeReviewedSeed,
 } from "./ui/helpers";
 import { LUMI_MIND_CSS } from "./ui/styles";
+import { redactDiagnosticCredentials } from "./diagnostics";
 
 type LensView = "cast" | "scene" | "history" | "settings";
 type NoticeTone = "info" | "success" | "warning" | "error";
@@ -66,6 +67,7 @@ const ICONS: Record<string, string> = {
   spark: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8c.3 2.5 1.7 3.9 4.2 4.2C9.7 6.3 8.3 7.7 8 10.2 7.7 7.7 6.3 6.3 3.8 6 6.3 5.7 7.7 4.3 8 1.8z"/><path d="M12.5 10c.2 1.3.9 2 2.2 2.2-1.3.2-2 .9-2.2 2.2-.2-1.3-.9-2-2.2-2.2 1.3-.2 2-.9 2.2-2.2z"/></svg>`,
   pause: `<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="3" width="2.5" height="10" rx=".8"/><rect x="9.5" y="3" width="2.5" height="10" rx=".8"/></svg>`,
   play: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4c0 .8.9 1.2 1.5.8l7.1-5.2a1 1 0 0 0 0-1.6L5.5 2c-.6-.4-1.5 0-1.5.8z"/></svg>`,
+  close: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>`,
 };
 
 const CATEGORY_LABELS: Record<MindCategory, string> = {
@@ -174,12 +176,18 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   let activeView: LensView = "cast";
   let selectedActorId: string | null = null;
   const mindSectionDisclosure = new Map<string, boolean>();
+  const dismissedAnalysisWarnings = new Set<string>();
   let settingsDraft: LumiMindSettings | null = null;
   let settingsDirty = false;
   let notice: UiNotice | null = null;
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
   let diagnosticsModal: ReturnType<SpindleFrontendContext["ui"]["showModal"]> | null = null;
   let diagnosticsRefresh: (() => void) | null = null;
+  const developerReportRequests = new Map<string, {
+    resolve: (report: unknown) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
 
   let seedTab: ReturnType<SpindleFrontendContext["ui"]["registerCharacterEditorTab"]> | null = null;
   let seedRoot: HTMLElement | null = null;
@@ -394,6 +402,68 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     };
   }
 
+  function requestDeveloperReport(): Promise<unknown> {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        developerReportRequests.delete(requestId);
+        reject(new Error("The developer report request timed out."));
+      }, 15_000);
+      developerReportRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "developer_report", chatId: currentState?.activeChatId ?? null, requestId });
+    });
+  }
+
+  function buildDeveloperReport(backend: unknown): Record<string, unknown> {
+    let editorState: SpindleCharacterEditorState | null = null;
+    try {
+      if (currentState?.permissions.characters) editorState = ctx.ui.characterEditor.getState();
+    } catch {
+      editorState = null;
+    }
+    return redactDiagnosticCredentials({
+      reportFormat: "lumi_mind.developer_diagnostics.v1",
+      generatedAt: new Date().toISOString(),
+      privacy: {
+        sanitized: false,
+        containsPrivateData: true,
+        excluded: ["API credential values"],
+        warning: "Contains full story, identity, mind, evidence, and entity data. Share only with trusted developers.",
+      },
+      sanitizedOverview: buildDiagnosticReport(),
+      extension: {
+        identifier: ctx.manifest.identifier,
+        name: ctx.manifest.name,
+        version: ctx.manifest.version,
+        minimumLumiverseVersion: ctx.manifest.minimum_lumiverse_version ?? null,
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        online: navigator.onLine,
+        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio },
+      },
+      frontend: {
+        activeView,
+        drawer: ctx.ui.events.getDrawerState(),
+        activeChat: safeActiveChat(ctx),
+        state: currentState,
+        settingsDraft,
+        seedEditor: {
+          state: editorState,
+          characterId: seedCharacterId,
+          draft: seedDraft,
+          persisted: seedPersisted,
+          dirty: seedDirty,
+          loading: seedLoading,
+          generating: seedGenerating,
+          notice: seedNotice,
+        },
+      },
+      backend,
+    }) as Record<string, unknown>;
+  }
+
   function openDiagnostics(): void {
     if (diagnosticsModal) {
       diagnosticsRefresh?.();
@@ -405,6 +475,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const intro = element("div", "lm-diagnostics-intro");
     const introCopy = element("div");
     introCopy.append(element("div", "lm-kicker", "Sanitized support report"), element("p", undefined, "Copy this report into a bug report or support conversation. Private mind content and credentials are excluded."));
+    introCopy.appendChild(element("p", "lm-diagnostics-private-warning", "Developer copy includes the full transcript, identities, minds, evidence, seeds, overrides, and internal records. Share it only with trusted developers."));
     const privacy = element("span", "lm-diagnostics-privacy", "No story text");
     intro.append(introCopy, privacy);
 
@@ -422,6 +493,29 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         }, 1800);
       });
     }, "primary");
+    const developerCopy = textButton("Copy developer report", () => {
+      developerCopy.disabled = true;
+      developerCopy.textContent = "Building developer report…";
+      void requestDeveloperReport()
+        .then((backend) => copyText(JSON.stringify(buildDeveloperReport(backend), null, 2)))
+        .then((copied) => {
+          developerCopy.textContent = copied ? "Developer report copied" : "Copy failed";
+          developerCopy.classList.toggle("lm-copy-failed", !copied);
+        })
+        .catch((error) => {
+          developerCopy.textContent = "Copy failed";
+          developerCopy.classList.add("lm-copy-failed");
+          showNotice("error", error instanceof Error ? error.message : "Could not build the developer report.");
+        })
+        .finally(() => {
+          setTimeout(() => {
+            developerCopy.disabled = false;
+            developerCopy.textContent = "Copy developer report";
+            developerCopy.classList.remove("lm-copy-failed");
+          }, 1800);
+        });
+    }, "secondary");
+    developerCopy.title = "Copies private story and LumiMind state. API credential fields remain redacted.";
     const refresh = textButton("Refresh snapshot", () => {
       refresh.disabled = true;
       refresh.textContent = "Refreshing…";
@@ -432,7 +526,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         refresh.textContent = "Refresh snapshot";
       }, 350);
     });
-    toolbar.append(generated, refresh, copy);
+    toolbar.append(generated, refresh, developerCopy, copy);
     shell.append(intro, summary, toolbar, output);
     modal.root.appendChild(shell);
 
@@ -606,6 +700,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const timeline = currentState?.timeline ?? null;
     const quality = summarizeTimelineQuality(timeline);
     if (!timeline || !quality.needsAttention) return null;
+    const warningKey = `${timeline.chatId}:${quality.legacyEmptyResult}:${quality.batches
+      .filter((batch) => batch.warningCodes.length > 0)
+      .map((batch) => `${batch.batchId}:${batch.warningCodes.join(",")}`)
+      .join("|")}`;
+    if (dismissedAnalysisWarnings.has(warningKey)) return null;
     const panel = element("section", "lm-analysis-quality-warning");
     const marker = element("span", "lm-quality-marker", "!");
     const copy = element("div", "lm-timeline-status-copy");
@@ -621,7 +720,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       textButton("Diagnostics", openDiagnostics, "quiet"),
       textButton("Rebuild analysis", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
     );
-    panel.append(marker, copy, actions);
+    const dismiss = iconButton("close", "Dismiss analysis warning", () => {
+      dismissedAnalysisWarnings.add(warningKey);
+      render();
+    }, "lm-quality-dismiss");
+    panel.append(marker, copy, actions, dismiss);
     return panel;
   }
 
@@ -1527,6 +1630,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       updateBadge();
       render();
       diagnosticsRefresh?.();
+    } else if (message.type === "developer_report" || message.type === "developer_report_error") {
+      const pending = developerReportRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      developerReportRequests.delete(message.requestId);
+      if (message.type === "developer_report") pending.resolve(message.report);
+      else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -1565,6 +1675,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     diagnosticsModal?.dismiss();
     diagnosticsModal = null;
     diagnosticsRefresh = null;
+    for (const pending of developerReportRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the developer report completed."));
+    }
+    developerReportRequests.clear();
     destroySeedTab();
     while (cleanups.length) {
       try { cleanups.pop()?.(); } catch { /* Best-effort teardown. */ }

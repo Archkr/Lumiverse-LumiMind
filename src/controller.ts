@@ -29,6 +29,7 @@ export interface AnalysisControllerResult {
   analysis: ControllerAnalysis;
   meta: ControllerMeta;
   raw: string;
+  rawResponses: { first: string; retry: string | null };
   telemetry: ControllerBatchTelemetry;
 }
 
@@ -656,6 +657,7 @@ export async function analyzeMessages(input: {
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry: ControllerResponseTelemetry | null = null;
+  let retryRaw: string | null = null;
   let retryError: string | null = null;
   let attempts = 1;
 
@@ -671,6 +673,7 @@ export async function analyzeMessages(input: {
         input.userId,
         input.fallbackConnectionId,
       );
+      retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
       const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
       const validatedCorrective = validateControllerAnalysisContext(policyCorrective, input.messages, input.compactState);
@@ -701,6 +704,7 @@ export async function analyzeMessages(input: {
     analysis: finalAnalysis,
     meta: result.meta,
     raw: result.raw,
+    rawResponses: { first: result.raw, retry: retryRaw },
     telemetry: {
       schemaVersion: 1,
       batchId: crypto.randomUUID(),

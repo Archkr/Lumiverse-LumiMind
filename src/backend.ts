@@ -34,6 +34,7 @@ import {
 } from "./engine";
 import { deleteTimeline, loadSettings, loadTimeline, saveSettings, saveTimeline } from "./storage";
 import { makeMindLumiStateSnapshot } from "./lumi-state";
+import { redactDiagnosticCredentials } from "./diagnostics";
 import {
   EXTENSION_KEY,
   type ActorRecord,
@@ -72,6 +73,12 @@ const reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const generationContexts = new Map<string, GenerationContext>();
 const latestGenerationByChat = new Map<string, GenerationContext>();
 const connectionByChat = new Map<string, string>();
+const controllerDebugResponses = new Map<string, Array<{
+  batchId: string;
+  capturedAt: string;
+  first: string;
+  retry: string | null;
+}>>();
 let lastFrontendUserId: string | null = null;
 
 function cacheKey(userId: string, chatId: string): string {
@@ -200,6 +207,35 @@ async function buildFrontendState(userId: string, requestedChatId?: string | nul
 
 async function sendState(userId: string, chatId?: string | null, characterId?: string | null): Promise<void> {
   send({ type: "state", state: await buildFrontendState(userId, chatId, characterId) }, userId);
+}
+
+async function buildDeveloperDiagnostics(userId: string, requestedChatId?: string | null): Promise<unknown> {
+  const active = activeChats.get(userId) ?? { chatId: null, characterId: null };
+  const chatId = requestedChatId ?? active.chatId;
+  const [settings, connections, timeline, transcript, character, persona] = await Promise.all([
+    getSettings(userId),
+    hasPermission("generation") ? spindle.connections.list(userId).catch(() => []) : Promise.resolve([]),
+    chatId ? getTimeline(chatId, userId).catch(() => null) : Promise.resolve(null),
+    chatId && hasPermission("chat_mutation")
+      ? (spindle as unknown as { chat: { getMessages(chatId: string, userId?: string): Promise<unknown> } }).chat.getMessages(chatId, userId).catch(() => null)
+      : Promise.resolve(null),
+    active.characterId && hasPermission("characters") ? spindle.characters.get(active.characterId, userId).catch(() => null) : Promise.resolve(null),
+    hasPermission("personas") ? spindle.personas.getActive(userId).catch(() => null) : Promise.resolve(null),
+  ]);
+  return redactDiagnosticCredentials({
+    generatedAt: new Date().toISOString(),
+    userId,
+    activeContext: { chatId, characterId: active.characterId },
+    permissions: currentPermissions(),
+    settings,
+    connections,
+    timeline,
+    transcript,
+    activeCharacter: character,
+    activePersona: persona,
+    controllerRawResponses: chatId ? (controllerDebugResponses.get(cacheKey(userId, chatId)) ?? []) : [],
+    unavailable: ["API credential values", "raw controller responses created before the current extension runtime"],
+  });
 }
 
 function normalizeChatMessages(value: unknown): ChatMessageLike[] {
@@ -433,6 +469,15 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
       });
+      const debugKey = cacheKey(userId, chatId);
+      const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
+      debugResponses.push({
+        batchId: result.telemetry.batchId,
+        capturedAt: new Date().toISOString(),
+        first: result.rawResponses.first,
+        retry: result.rawResponses.retry,
+      });
+      controllerDebugResponses.set(debugKey, debugResponses.slice(-10));
       const records = materializeAnalysisRecords(
         timeline,
         batch,
@@ -694,6 +739,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   const userId = resolveUserId(chatId, eventUserId);
   if (!chatId || !userId) return;
   timelines.delete(storageTimelineKey(userId, chatId));
+  controllerDebugResponses.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 
@@ -719,6 +765,11 @@ spindle.onFrontendMessage(async (payload, userId) => {
     return;
   }
   try {
+    if (message.type === "developer_report") {
+      const report = await buildDeveloperDiagnostics(userId, message.chatId);
+      send({ type: "developer_report", requestId: message.requestId, report }, userId);
+      return;
+    }
     if (message.type === "activate") {
       await enqueue(userId, message.chatId, () => activateChat(userId, message.chatId));
       return;
@@ -829,6 +880,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    if (message.type === "developer_report") {
+      send({ type: "developer_report_error", requestId: message.requestId, message: detail }, userId);
+      return;
+    }
     send({ type: "error", message: detail }, userId);
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }

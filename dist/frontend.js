@@ -379,8 +379,9 @@ var LUMI_MIND_CSS = `
 .lm-timeline-status-copy strong { font-size:11px; }
 .lm-timeline-status-copy span { color:var(--lm-muted); font-size:10px; }
 .lm-inline-actions { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
-.lm-analysis-quality-warning { display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:start; padding:10px; border:1px solid color-mix(in srgb,var(--lm-warning) 38%,var(--lm-line)); border-radius:var(--lm-radius); background:linear-gradient(110deg,color-mix(in srgb,var(--lm-warning) 10%,var(--lm-panel)),var(--lm-panel)); }
+.lm-analysis-quality-warning { position:relative; display:grid; grid-template-columns:auto minmax(0,1fr) auto; gap:9px; align-items:start; padding:10px 34px 10px 10px; border:1px solid color-mix(in srgb,var(--lm-warning) 38%,var(--lm-line)); border-radius:var(--lm-radius); background:linear-gradient(110deg,color-mix(in srgb,var(--lm-warning) 10%,var(--lm-panel)),var(--lm-panel)); }
 .lm-quality-marker { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border:1px solid color-mix(in srgb,var(--lm-warning) 45%,var(--lm-line)); border-radius:50%; color:var(--lm-warning); background:color-mix(in srgb,var(--lm-warning) 10%,transparent); font-size:10px; font-weight:850; }
+.lm-quality-dismiss { position:absolute; top:5px; right:5px; }
 
 .lm-section-heading { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
 .lm-section-title { color:var(--lm-muted); font-size:10px; font-weight:750; letter-spacing:.09em; text-transform:uppercase; }
@@ -516,6 +517,7 @@ var LUMI_MIND_CSS = `
 .lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
 .lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }
 .lm-diagnostics-intro p { margin-top:4px !important; color:var(--lm-muted); font-size:10px; }
+.lm-diagnostics-intro .lm-diagnostics-private-warning { color:var(--lm-warning); }
 .lm-diagnostics-privacy { padding:3px 7px; border:1px solid color-mix(in srgb,var(--lm-success) 28%,var(--lm-line)); border-radius:999px; color:var(--lm-success); background:color-mix(in srgb,var(--lm-success) 8%,transparent); font-size:8px; font-weight:750; white-space:nowrap; text-transform:uppercase; letter-spacing:.04em; }
 .lm-diagnostics-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:7px; }
 .lm-diagnostic-stat { display:flex; flex-direction:column; gap:2px; min-width:0; padding:8px 9px; border:1px solid var(--lm-line); border-radius:8px; background:var(--lm-fill); }
@@ -574,6 +576,20 @@ var LUMI_MIND_CSS = `
 }
 `;
 
+// src/diagnostics.ts
+function credentialField(key) {
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLocaleLowerCase();
+  return normalized.endsWith("apikey") && !normalized.startsWith("has") || normalized === "authorization" || normalized === "accesstoken" || normalized === "refreshtoken" || normalized === "authtoken" || normalized === "bearertoken" || normalized === "clientsecret" || normalized === "password";
+}
+function redactDiagnosticCredentials(value) {
+  if (Array.isArray(value)) return value.map(redactDiagnosticCredentials);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key,
+    credentialField(key) ? "[REDACTED]" : redactDiagnosticCredentials(entry)
+  ]));
+}
+
 // src/frontend.ts
 var MIND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.2 4.2a6.7 6.7 0 0 1 8.4 6.5c0 1.8-.7 3.2-1.8 4.3-.8.8-1.2 1.6-1.2 2.7v.6H8.8v-.9c0-1.2-.5-2-1.4-2.9a5.8 5.8 0 0 1-1.8-4.2c0-1.3.4-2.6 1.1-3.6"/><path d="M9.4 21h4.5"/><path d="M8.4 7.8c1.7-1.6 4.8-1.4 6.2.5"/><path d="M9 11.1c1.2-1.1 3.3-1 4.3.3"/><circle cx="6.5" cy="4.3" r="1.5" fill="currentColor" stroke="none"/></svg>`;
 var ICONS = {
@@ -589,7 +605,8 @@ var ICONS = {
   eye: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"><path d="M1.8 8s2.2-3.6 6.2-3.6S14.2 8 14.2 8 12 11.6 8 11.6 1.8 8 1.8 8z"/><circle cx="8" cy="8" r="1.6"/></svg>`,
   spark: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8c.3 2.5 1.7 3.9 4.2 4.2C9.7 6.3 8.3 7.7 8 10.2 7.7 7.7 6.3 6.3 3.8 6 6.3 5.7 7.7 4.3 8 1.8z"/><path d="M12.5 10c.2 1.3.9 2 2.2 2.2-1.3.2-2 .9-2.2 2.2-.2-1.3-.9-2-2.2-2.2 1.3-.2 2-.9 2.2-2.2z"/></svg>`,
   pause: `<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="3" width="2.5" height="10" rx=".8"/><rect x="9.5" y="3" width="2.5" height="10" rx=".8"/></svg>`,
-  play: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4c0 .8.9 1.2 1.5.8l7.1-5.2a1 1 0 0 0 0-1.6L5.5 2c-.6-.4-1.5 0-1.5.8z"/></svg>`
+  play: `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.8v10.4c0 .8.9 1.2 1.5.8l7.1-5.2a1 1 0 0 0 0-1.6L5.5 2c-.6-.4-1.5 0-1.5.8z"/></svg>`,
+  close: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>`
 };
 var CATEGORY_LABELS = {
   belief: "Beliefs",
@@ -679,12 +696,14 @@ function setup(ctx) {
   let activeView = "cast";
   let selectedActorId = null;
   const mindSectionDisclosure = /* @__PURE__ */ new Map();
+  const dismissedAnalysisWarnings = /* @__PURE__ */ new Set();
   let settingsDraft = null;
   let settingsDirty = false;
   let notice = null;
   let noticeTimer = null;
   let diagnosticsModal = null;
   let diagnosticsRefresh = null;
+  const developerReportRequests = /* @__PURE__ */ new Map();
   let seedTab = null;
   let seedRoot = null;
   let seedEditorUnsub = null;
@@ -891,6 +910,66 @@ function setup(ctx) {
       } : { available: false }
     };
   }
+  function requestDeveloperReport() {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        developerReportRequests.delete(requestId);
+        reject(new Error("The developer report request timed out."));
+      }, 15e3);
+      developerReportRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "developer_report", chatId: currentState?.activeChatId ?? null, requestId });
+    });
+  }
+  function buildDeveloperReport(backend) {
+    let editorState = null;
+    try {
+      if (currentState?.permissions.characters) editorState = ctx.ui.characterEditor.getState();
+    } catch {
+      editorState = null;
+    }
+    return redactDiagnosticCredentials({
+      reportFormat: "lumi_mind.developer_diagnostics.v1",
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      privacy: {
+        sanitized: false,
+        containsPrivateData: true,
+        excluded: ["API credential values"],
+        warning: "Contains full story, identity, mind, evidence, and entity data. Share only with trusted developers."
+      },
+      sanitizedOverview: buildDiagnosticReport(),
+      extension: {
+        identifier: ctx.manifest.identifier,
+        name: ctx.manifest.name,
+        version: ctx.manifest.version,
+        minimumLumiverseVersion: ctx.manifest.minimum_lumiverse_version ?? null
+      },
+      browser: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        online: navigator.onLine,
+        viewport: { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio }
+      },
+      frontend: {
+        activeView,
+        drawer: ctx.ui.events.getDrawerState(),
+        activeChat: safeActiveChat(ctx),
+        state: currentState,
+        settingsDraft,
+        seedEditor: {
+          state: editorState,
+          characterId: seedCharacterId,
+          draft: seedDraft,
+          persisted: seedPersisted,
+          dirty: seedDirty,
+          loading: seedLoading,
+          generating: seedGenerating,
+          notice: seedNotice
+        }
+      },
+      backend
+    });
+  }
   function openDiagnostics() {
     if (diagnosticsModal) {
       diagnosticsRefresh?.();
@@ -902,6 +981,7 @@ function setup(ctx) {
     const intro = element("div", "lm-diagnostics-intro");
     const introCopy = element("div");
     introCopy.append(element("div", "lm-kicker", "Sanitized support report"), element("p", void 0, "Copy this report into a bug report or support conversation. Private mind content and credentials are excluded."));
+    introCopy.appendChild(element("p", "lm-diagnostics-private-warning", "Developer copy includes the full transcript, identities, minds, evidence, seeds, overrides, and internal records. Share it only with trusted developers."));
     const privacy = element("span", "lm-diagnostics-privacy", "No story text");
     intro.append(introCopy, privacy);
     const summary = element("div", "lm-diagnostics-summary");
@@ -918,6 +998,25 @@ function setup(ctx) {
         }, 1800);
       });
     }, "primary");
+    const developerCopy = textButton("Copy developer report", () => {
+      developerCopy.disabled = true;
+      developerCopy.textContent = "Building developer report\u2026";
+      void requestDeveloperReport().then((backend) => copyText(JSON.stringify(buildDeveloperReport(backend), null, 2))).then((copied) => {
+        developerCopy.textContent = copied ? "Developer report copied" : "Copy failed";
+        developerCopy.classList.toggle("lm-copy-failed", !copied);
+      }).catch((error) => {
+        developerCopy.textContent = "Copy failed";
+        developerCopy.classList.add("lm-copy-failed");
+        showNotice("error", error instanceof Error ? error.message : "Could not build the developer report.");
+      }).finally(() => {
+        setTimeout(() => {
+          developerCopy.disabled = false;
+          developerCopy.textContent = "Copy developer report";
+          developerCopy.classList.remove("lm-copy-failed");
+        }, 1800);
+      });
+    }, "secondary");
+    developerCopy.title = "Copies private story and LumiMind state. API credential fields remain redacted.";
     const refresh = textButton("Refresh snapshot", () => {
       refresh.disabled = true;
       refresh.textContent = "Refreshing\u2026";
@@ -928,7 +1027,7 @@ function setup(ctx) {
         refresh.textContent = "Refresh snapshot";
       }, 350);
     });
-    toolbar.append(generated, refresh, copy);
+    toolbar.append(generated, refresh, developerCopy, copy);
     shell.append(intro, summary, toolbar, output);
     modal.root.appendChild(shell);
     diagnosticsRefresh = () => {
@@ -1087,6 +1186,8 @@ function setup(ctx) {
     const timeline = currentState?.timeline ?? null;
     const quality = summarizeTimelineQuality(timeline);
     if (!timeline || !quality.needsAttention) return null;
+    const warningKey = `${timeline.chatId}:${quality.legacyEmptyResult}:${quality.batches.filter((batch) => batch.warningCodes.length > 0).map((batch) => `${batch.batchId}:${batch.warningCodes.join(",")}`).join("|")}`;
+    if (dismissedAnalysisWarnings.has(warningKey)) return null;
     const panel = element("section", "lm-analysis-quality-warning");
     const marker = element("span", "lm-quality-marker", "!");
     const copy = element("div", "lm-timeline-status-copy");
@@ -1102,7 +1203,11 @@ function setup(ctx) {
       textButton("Diagnostics", openDiagnostics, "quiet"),
       textButton("Rebuild analysis", () => void requestTimelineRebuild(timeline.chatId), "secondary")
     );
-    panel.append(marker, copy, actions);
+    const dismiss = iconButton("close", "Dismiss analysis warning", () => {
+      dismissedAnalysisWarnings.add(warningKey);
+      render();
+    }, "lm-quality-dismiss");
+    panel.append(marker, copy, actions, dismiss);
     return panel;
   }
   function renderActorRail(actors, minds) {
@@ -1967,6 +2072,13 @@ function setup(ctx) {
       updateBadge();
       render();
       diagnosticsRefresh?.();
+    } else if (message.type === "developer_report" || message.type === "developer_report_error") {
+      const pending = developerReportRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      developerReportRequests.delete(message.requestId);
+      if (message.type === "developer_report") pending.resolve(message.report);
+      else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -2002,6 +2114,11 @@ function setup(ctx) {
     diagnosticsModal?.dismiss();
     diagnosticsModal = null;
     diagnosticsRefresh = null;
+    for (const pending of developerReportRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the developer report completed."));
+    }
+    developerReportRequests.clear();
     destroySeedTab();
     while (cleanups.length) {
       try {

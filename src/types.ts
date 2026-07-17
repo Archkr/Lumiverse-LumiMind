@@ -301,6 +301,7 @@ export interface FrontendState {
 export type FrontendToBackend =
   | { type: "ready"; chatId?: string | null; characterId?: string | null }
   | { type: "refresh"; chatId?: string | null; characterId?: string | null }
+  | { type: "developer_report"; chatId?: string | null; requestId: string }
   | { type: "activate"; chatId: string }
   | { type: "pause"; chatId: string; paused: boolean }
   | { type: "rebuild"; chatId: string }
@@ -323,6 +324,8 @@ export type FrontendToBackend =
 
 export type BackendToFrontend =
   | { type: "state"; state: FrontendState }
+  | { type: "developer_report"; requestId: string; report: unknown }
+  | { type: "developer_report_error"; requestId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }
   | { type: "notice"; tone: "info" | "success" | "warning" | "error"; message: string }
   | { type: "error"; message: string };
