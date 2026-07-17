@@ -29,6 +29,7 @@ import {
   upsertActor,
 } from "./engine";
 import { deleteTimeline, loadSettings, loadTimeline, saveSettings, saveTimeline } from "./storage";
+import { makeMindLumiStateSnapshot } from "./lumi-state";
 import {
   EXTENSION_KEY,
   type ActorRecord,
@@ -48,6 +49,7 @@ const ANALYSIS_BATCH_SIZE = 6;
 const RECENT_CONTEXT_SIZE = 4;
 const MAX_RECORDS = 5000;
 const RECONCILE_DEBOUNCE_MS = 650;
+const EXTENSION_VERSION = "0.1.1";
 
 type GenerationContext = {
   generationId: string;
@@ -458,6 +460,7 @@ async function publishScene(userId: string, timeline?: ChatTimelineV1 | null): P
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
   const settings = await getSettings(userId);
   spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved, settings), { requires: [] });
+  spindle.rpcPool.sync("state.current", makeMindLumiStateSnapshot(resolved, settings, EXTENSION_VERSION), { requires: [] });
   if (settings.privateInteropEnabled) {
     spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved, settings), { requires: ["chat_mutation"] });
   } else {
@@ -529,10 +532,24 @@ async function cloneFork(payload: unknown, eventUserId?: string): Promise<void> 
 
 spindle.rpcPool.sync("contract.v1", {
   schemaVersion: 1,
+  protocol: "lumi_state.v1",
   extension: "lumi_mind",
+  extensionVersion: EXTENSION_VERSION,
   capabilities: ["subjective_minds", "timeline_swipes", "chat_forks", "scene_presence", "spoiler_safe"],
-  endpoints: { public: "lumi_mind.scene.current", private: "lumi_mind.scene.private" },
+  endpoints: {
+    public: "lumi_mind.scene.current",
+    private: "lumi_mind.scene.private",
+    state: "lumi_mind.state.current",
+  },
+  channels: [{
+    endpoint: "lumi_mind.state.current",
+    schema: "lumi_state.snapshot.v1",
+    visibility: "public",
+    requires: [],
+    mode: "sync",
+  }],
 }, { requires: [] });
+spindle.rpcPool.sync("state.current", makeMindLumiStateSnapshot(null, DEFAULT_SETTINGS, EXTENSION_VERSION), { requires: [] });
 
 spindle.registerInterceptor(async (messages, context) => {
   try {
@@ -773,4 +790,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
   }
 });
 
-spindle.log.info("LumiMind v0.1.0 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.1.1 loaded — subjective timeline engine ready.");
