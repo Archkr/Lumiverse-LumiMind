@@ -164,7 +164,8 @@ export function stableHash(input: string): string {
 
 export function analysisPolicyHash(settings: LumiMindSettings): string {
   const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
-  return stableHash(`${directorPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  const personaPolicy = settings.personaMindEnabled ? "" : "persona-policy:2|";
+  return stableHash(`${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 
 export function actorMindEnabled(actor: ActorRecord, settings: LumiMindSettings): boolean {
@@ -186,6 +187,29 @@ export function sortMessages(messages: ChatMessageLike[]): ChatMessageLike[] {
     .filter((message) => message && typeof message.id === "string" && (message.role === "user" || message.role === "assistant"))
     .map((message, index) => ({ ...message, index_in_chat: message.index_in_chat ?? index }))
     .sort((left, right) => (left.index_in_chat ?? 0) - (right.index_in_chat ?? 0));
+}
+
+export function selectAnalysisWorkBatch(
+  messages: ChatMessageLike[],
+  start: number,
+  maxMessages: number,
+  settings: LumiMindSettings,
+): { messages: ChatMessageLike[]; skipReason: AnalysisRecord["skipReason"] | null } {
+  const first = messages[start];
+  if (!first) return { messages: [], skipReason: null };
+  const shouldSkip = (message: ChatMessageLike) => !settings.personaMindEnabled && message.role === "user";
+  const skip = shouldSkip(first);
+  const selected: ChatMessageLike[] = [];
+  const limit = Math.max(1, Math.floor(maxMessages));
+  for (let index = start; index < messages.length && selected.length < limit; index += 1) {
+    const message = messages[index];
+    if (shouldSkip(message) !== skip) break;
+    selected.push(message);
+  }
+  return {
+    messages: selected,
+    skipReason: skip ? "unmanaged_user_message" : null,
+  };
 }
 
 export function createActor(input: {
@@ -677,6 +701,21 @@ export function materializeAnalysisRecords(
   return records;
 }
 
+export function materializeSkippedAnalysisRecords(
+  timeline: ChatTimelineV1,
+  batchMessages: ChatMessageLike[],
+  startingPrefix: string,
+  skipReason: NonNullable<AnalysisRecord["skipReason"]>,
+): AnalysisRecord[] {
+  return materializeAnalysisRecords(
+    timeline,
+    batchMessages,
+    startingPrefix,
+    { actorMentions: [], changes: [] },
+    { connectionId: null, provider: null, model: null },
+  ).map((record) => ({ ...record, skipReason }));
+}
+
 export function addManualItem(timeline: ChatTimelineV1, actorId: string, category: MindCategory, text: string): void {
   const now = Date.now();
   const item: MindItem = {
@@ -937,6 +976,7 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
     minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
     records: timeline.records
       .slice()
+      .filter((record) => !record.skipReason)
       .sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt)
       .map((record) => ({
         id: record.id,

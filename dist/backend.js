@@ -130,7 +130,8 @@ function stableHash(input) {
 }
 function analysisPolicyHash(settings) {
   const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
-  return stableHash(`${directorPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  const personaPolicy = settings.personaMindEnabled ? "" : "persona-policy:2|";
+  return stableHash(`${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 function actorMindEnabled(actor, settings) {
   if (actor.kind === "persona") return settings.personaMindEnabled;
@@ -147,6 +148,23 @@ function nextPrefixHash(prefixHash, contentHash, swipeId) {
 }
 function sortMessages(messages) {
   return messages.filter((message) => message && typeof message.id === "string" && (message.role === "user" || message.role === "assistant")).map((message, index) => ({ ...message, index_in_chat: message.index_in_chat ?? index })).sort((left, right) => (left.index_in_chat ?? 0) - (right.index_in_chat ?? 0));
+}
+function selectAnalysisWorkBatch(messages, start, maxMessages, settings) {
+  const first = messages[start];
+  if (!first) return { messages: [], skipReason: null };
+  const shouldSkip = (message) => !settings.personaMindEnabled && message.role === "user";
+  const skip = shouldSkip(first);
+  const selected = [];
+  const limit = Math.max(1, Math.floor(maxMessages));
+  for (let index = start; index < messages.length && selected.length < limit; index += 1) {
+    const message = messages[index];
+    if (shouldSkip(message) !== skip) break;
+    selected.push(message);
+  }
+  return {
+    messages: selected,
+    skipReason: skip ? "unmanaged_user_message" : null
+  };
 }
 function createActor(input) {
   const now = Date.now();
@@ -569,6 +587,15 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
   }
   return records;
 }
+function materializeSkippedAnalysisRecords(timeline, batchMessages, startingPrefix, skipReason) {
+  return materializeAnalysisRecords(
+    timeline,
+    batchMessages,
+    startingPrefix,
+    { actorMentions: [], changes: [] },
+    { connectionId: null, provider: null, model: null }
+  ).map((record) => ({ ...record, skipReason }));
+}
 function addManualItem(timeline, actorId, category2, text2) {
   const now = Date.now();
   const item = {
@@ -767,7 +794,7 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
     error: timeline.error,
     actors,
     minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
-    records: timeline.records.slice().sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
+    records: timeline.records.slice().filter((record) => !record.skipReason).sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
       id: record.id,
       messageId: record.messageId,
       messageIndex: record.messageIndex,
@@ -1638,13 +1665,47 @@ async function reconcileChat(userId, chatId, force = false) {
     await persistAndPublish(timeline, userId);
     return;
   }
+  const commitSkippedWork = (batch) => {
+    if (!batch.skipReason || batch.messages.length === 0) return false;
+    timeline.records.push(...materializeSkippedAnalysisRecords(
+      timeline,
+      batch.messages,
+      derivation.nextPrefix,
+      batch.skipReason
+    ));
+    if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
+    derivation = rebuildTimeline(timeline, messages);
+    return true;
+  };
+  while (derivation.firstMissingIndex < derivation.messages.length) {
+    const batch = selectAnalysisWorkBatch(
+      derivation.messages,
+      derivation.firstMissingIndex,
+      ANALYSIS_BATCH_SIZE,
+      settings
+    );
+    if (!commitSkippedWork(batch)) break;
+  }
+  if (derivation.firstMissingIndex >= derivation.messages.length) {
+    timeline.health = "ready";
+    timeline.error = null;
+    await persistAndPublish(timeline, userId);
+    return;
+  }
   timeline.health = timeline.records.length ? "pending" : "initializing";
   timeline.error = null;
   await persistAndPublish(timeline, userId);
   try {
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
-      const batch = derivation.messages.slice(start, start + ANALYSIS_BATCH_SIZE);
+      const work = selectAnalysisWorkBatch(derivation.messages, start, ANALYSIS_BATCH_SIZE, settings);
+      if (commitSkippedWork(work)) {
+        timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
+        timeline.error = null;
+        await persistAndPublish(timeline, userId);
+        continue;
+      }
+      const batch = work.messages;
       const recentContext = derivation.messages.slice(Math.max(0, start - RECENT_CONTEXT_SIZE), start);
       const result = await analyzeMessages({
         messages: batch,

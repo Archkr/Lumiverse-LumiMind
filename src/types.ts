@@ -115,6 +115,7 @@ export interface AnalysisRecord {
   prefixHash: string;
   actorMentions: ActorMentionDelta[];
   deltas: MindDelta[];
+  skipReason?: "unmanaged_user_message";
   controller: {
     connectionId: string | null;
     provider: string | null;

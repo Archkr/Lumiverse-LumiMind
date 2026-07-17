@@ -15,6 +15,7 @@ import {
   makePrivateSnapshot,
   makePublicSnapshot,
   materializeAnalysisRecords,
+  materializeSkippedAnalysisRecords,
   mergeActors,
   normalizeSeed,
   overrideItem,
@@ -23,6 +24,7 @@ import {
   removeManualItem,
   resolveActorId,
   splitActor,
+  selectAnalysisWorkBatch,
   sortMessages,
   toTimelineView,
   uniqueStrings,
@@ -374,13 +376,49 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
     await persistAndPublish(timeline, userId);
     return;
   }
+  const commitSkippedWork = (batch: ReturnType<typeof selectAnalysisWorkBatch>): boolean => {
+    if (!batch.skipReason || batch.messages.length === 0) return false;
+    timeline.records.push(...materializeSkippedAnalysisRecords(
+      timeline,
+      batch.messages,
+      derivation.nextPrefix,
+      batch.skipReason,
+    ));
+    if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
+    derivation = rebuildTimeline(timeline, messages);
+    return true;
+  };
+
+  while (derivation.firstMissingIndex < derivation.messages.length) {
+    const batch = selectAnalysisWorkBatch(
+      derivation.messages,
+      derivation.firstMissingIndex,
+      ANALYSIS_BATCH_SIZE,
+      settings,
+    );
+    if (!commitSkippedWork(batch)) break;
+  }
+  if (derivation.firstMissingIndex >= derivation.messages.length) {
+    timeline.health = "ready";
+    timeline.error = null;
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+
   timeline.health = timeline.records.length ? "pending" : "initializing";
   timeline.error = null;
   await persistAndPublish(timeline, userId);
   try {
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
-      const batch = derivation.messages.slice(start, start + ANALYSIS_BATCH_SIZE);
+      const work = selectAnalysisWorkBatch(derivation.messages, start, ANALYSIS_BATCH_SIZE, settings);
+      if (commitSkippedWork(work)) {
+        timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
+        timeline.error = null;
+        await persistAndPublish(timeline, userId);
+        continue;
+      }
+      const batch = work.messages;
       const recentContext = derivation.messages.slice(Math.max(0, start - RECENT_CONTEXT_SIZE), start);
       const result = await analyzeMessages({
         messages: batch,

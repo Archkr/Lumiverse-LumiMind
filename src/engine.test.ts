@@ -10,6 +10,7 @@ import {
   makeBaseMind,
   makeEmptySeed,
   materializeAnalysisRecords,
+  materializeSkippedAnalysisRecords,
   mergeActors,
   nextPrefixHash,
   normalizeSettings,
@@ -17,6 +18,7 @@ import {
   overrideItem,
   rebuildTimeline,
   resolveActorId,
+  selectAnalysisWorkBatch,
   stableHash,
   toTimelineView,
   upsertActor,
@@ -133,6 +135,21 @@ describe("timeline reducer", () => {
     rebuildTimeline(timeline, []);
     expect(timeline.minds[actor.id].items[0]).toMatchObject({ category: "goal", locked: true, pinned: true, source: "manual" });
   });
+
+  it("checkpoints unmanaged user messages without exposing controller records", () => {
+    const timeline = createTimeline("chat");
+    const userMessage = message("m1", 0, "The user opens the door.");
+    timeline.records = materializeSkippedAnalysisRecords(
+      timeline,
+      [userMessage],
+      "root",
+      "unmanaged_user_message",
+    );
+
+    expect(rebuildTimeline(timeline, [userMessage]).firstMissingIndex).toBe(1);
+    expect(timeline.records[0].skipReason).toBe("unmanaged_user_message");
+    expect(toTimelineView(timeline, { ...DEFAULT_SETTINGS, personaMindEnabled: false }).records).toEqual([]);
+  });
 });
 
 describe("hashing, settings, and compaction", () => {
@@ -158,7 +175,28 @@ describe("hashing, settings, and compaction", () => {
     expect(normalizeSettings({ characterCardDirectorMode: true, secondaryActorLimit: 0 }).secondaryActorLimit).toBe(1);
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:3|persona:1|director:1"));
+    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("persona-policy:2|persona:0|director:0"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
+  });
+
+  it("routes unmanaged user turns to checkpoints and keeps them out of controller batches", () => {
+    const messages = [
+      message("m1", 0, "User turn"),
+      message("m2", 1, "Assistant turn"),
+      message("m3", 2, "Another user turn"),
+      message("m4", 3, "Another assistant turn"),
+    ];
+    const settings = { ...DEFAULT_SETTINGS, personaMindEnabled: false };
+
+    expect(selectAnalysisWorkBatch(messages, 0, 8, settings)).toMatchObject({
+      messages: [messages[0]],
+      skipReason: "unmanaged_user_message",
+    });
+    expect(selectAnalysisWorkBatch(messages, 1, 8, settings)).toMatchObject({
+      messages: [messages[1]],
+      skipReason: null,
+    });
+    expect(selectAnalysisWorkBatch(messages, 0, 8, DEFAULT_SETTINGS).messages).toEqual(messages);
   });
 
   it("keeps the injection within its approximate character budget", () => {

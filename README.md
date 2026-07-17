@@ -201,6 +201,7 @@ Enable **Character card acts as director** when the card is a narrator, scenario
 Turn it off when you alone control the persona:
 
 - LumiMind stops analyzing or displaying a persona mind.
+- User-authored turns advance the timeline without a controller call, while remaining context for the next assistant-turn analysis.
 - The persona is excluded from private state injection.
 - Impersonation receives no LumiMind persona injection.
 - Other characters may still hold beliefs and relationships about the persona.
@@ -354,7 +355,7 @@ LumiMind settings are user-scoped and apply across chats.
 
 ## Controller usage and cost
 
-LumiMind normally makes one quiet controller call after each newly committed turn.
+LumiMind normally makes one quiet controller call after each newly committed analyzable turn. When persona management is off, user-authored turns are checkpointed without calling the controller.
 
 Additional calls can occur when:
 
