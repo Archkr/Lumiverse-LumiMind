@@ -310,10 +310,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         })),
         temperature: state.settings.controllerTemperature,
         maxOutputTokens: state.settings.controllerMaxTokens,
+        contextMessageLimit: state.settings.analysisContextMessageLimit,
       } : null,
       injection: state ? {
-        tokenBudget: state.settings.injectionTokenBudget,
-        secondaryActorLimit: state.settings.secondaryActorLimit,
+        presentActorsOnly: true,
+        unresolvedStateOnly: true,
         interceptorAvailable: state.permissions.interceptor,
       } : null,
       features: state ? {
@@ -1167,7 +1168,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     });
     controller.appendChild(field("Connection", connection, "Falls back to the chat's active connection when no dedicated controller is selected."));
     const numberGrid = element("div", "lm-settings-grid");
-    const numberSetting = (label: string, key: "controllerTemperature" | "controllerMaxTokens" | "injectionTokenBudget" | "secondaryActorLimit", min: number, max: number, step: number) => {
+    const numberSetting = (
+      label: string,
+      key: "controllerTemperature" | "controllerMaxTokens" | "analysisContextMessageLimit",
+      min: number,
+      max: number,
+      step: number,
+      description?: string,
+    ) => {
       const control = element("input", "lm-input") as HTMLInputElement;
       control.type = "number";
       control.min = String(min);
@@ -1181,13 +1189,19 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         control.value = String(value);
         markSettingsDirty(save);
       });
-      return field(label, control);
+      return field(label, control, description);
     };
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
       numberSetting("Analysis output tokens", "controllerMaxTokens", 300, 8000, 100),
-      numberSetting("Injection token budget", "injectionTokenBudget", 400, 4000, 100),
-      numberSetting(settingsDraft.characterCardDirectorMode ? "Director cast actors" : "Secondary actors", "secondaryActorLimit", settingsDraft.characterCardDirectorMode ? 1 : 0, 8, 1),
+      numberSetting(
+        "Analysis context messages",
+        "analysisContextMessageLimit",
+        0,
+        50,
+        1,
+        "Maximum earlier transcript messages included as context for each analysis batch. Set to 0 for none.",
+      ),
     );
     controller.appendChild(numberGrid);
     container.appendChild(controller);

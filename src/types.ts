@@ -186,8 +186,7 @@ export interface LumiMindSettings {
   controllerConnectionId: string | null;
   controllerTemperature: number;
   controllerMaxTokens: number;
-  injectionTokenBudget: number;
-  secondaryActorLimit: number;
+  analysisContextMessageLimit: number;
   personaMindEnabled: boolean;
   characterCardDirectorMode: boolean;
   cortexImportEnabled: boolean;

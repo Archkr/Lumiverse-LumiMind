@@ -18,6 +18,7 @@ import {
   overrideItem,
   rebuildTimeline,
   resolveActorId,
+  selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
   stableHash,
   toTimelineView,
@@ -158,21 +159,21 @@ describe("hashing, settings, and compaction", () => {
     expect(nextPrefixHash("a", "b", 0)).not.toBe(nextPrefixHash("a", "b", 1));
   });
 
-  it("clamps persisted controller and budget settings", () => {
-    const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, injectionTokenBudget: 99, secondaryActorLimit: 50 });
+  it("clamps persisted controller and analysis-context settings", () => {
+    const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, analysisContextMessageLimit: 99 });
     expect(settings).toMatchObject({
       controllerTemperature: 2,
       controllerMaxTokens: 300,
-      injectionTokenBudget: 400,
-      secondaryActorLimit: 8,
+      analysisContextMessageLimit: 50,
       personaMindEnabled: true,
       characterCardDirectorMode: false,
     });
     expect(normalizeSettings({ personaMindEnabled: false, characterCardDirectorMode: true })).toMatchObject({
       personaMindEnabled: false,
       characterCardDirectorMode: true,
+      analysisContextMessageLimit: 4,
     });
-    expect(normalizeSettings({ characterCardDirectorMode: true, secondaryActorLimit: 0 }).secondaryActorLimit).toBe(1);
+    expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("persona-policy:2|persona:0|director:0"));
@@ -199,17 +200,51 @@ describe("hashing, settings, and compaction", () => {
     expect(selectAnalysisWorkBatch(messages, 0, 8, DEFAULT_SETTINGS).messages).toEqual(messages);
   });
 
-  it("keeps the injection within its approximate character budget", () => {
+  it("limits analysis context to messages before the current batch", () => {
+    const messages = [
+      message("m1", 0, "First"),
+      message("m2", 1, "Second"),
+      message("m3", 2, "Third"),
+      message("m4", 3, "Current batch"),
+    ];
+
+    expect(selectAnalysisRecentContext(messages, 3, 2)).toEqual([messages[1], messages[2]]);
+    expect(selectAnalysisRecentContext(messages, 3, 0)).toEqual([]);
+    expect(selectAnalysisRecentContext(messages, 0, 10)).toEqual([]);
+  });
+
+  it("injects all unresolved state for every present managed actor", () => {
     const timeline = createTimeline("chat");
     timeline.active = true;
     const actor = upsertActor(timeline, { kind: "character", name: "Aster", characterId: "card" });
     const seed = makeEmptySeed({ selfConcept: "A scholar who measures every word." });
     seed.startingBeliefs = Array.from({ length: 30 }, (_, index) => `Detailed private belief ${index} with supporting nuance`);
     timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seed);
+    const npc = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const npcSeed = makeEmptySeed({ selfConcept: "A vigilant scout." });
+    npcSeed.startingGoals = ["Protect the caravan"];
+    timeline.baseMinds[npc.id] = makeBaseMind(npc.id, npcSeed);
+    const absentNpc = upsertActor(timeline, { kind: "npc", name: "Rowan" });
+    const absentSeed = makeEmptySeed({ selfConcept: "An absent courier." });
+    absentSeed.startingGoals = ["Deliver the sealed letter"];
+    timeline.baseMinds[absentNpc.id] = makeBaseMind(absentNpc.id, absentSeed);
     rebuildTimeline(timeline, []);
-    const injection = buildMindInjection(timeline, actor.id, 400, 4);
+    timeline.actors[actor.id].present = true;
+    timeline.actors[npc.id].present = true;
+    timeline.minds[actor.id].items.push({
+      ...timeline.minds[actor.id].items[0],
+      id: "resolved-item",
+      text: "This resolved state must not be injected",
+      status: "resolved",
+    });
+    const injection = buildMindInjection(timeline, actor.id);
     expect(injection).toContain("private subjective continuity");
-    expect(injection?.length).toBeLessThanOrEqual(1600);
+    expect(injection).toContain("Detailed private belief 29 with supporting nuance");
+    expect(injection).toContain("Mira (npc, present)");
+    expect(injection).toContain("Protect the caravan");
+    expect(injection).not.toContain("Rowan");
+    expect(injection).not.toContain("Deliver the sealed letter");
+    expect(injection).not.toContain("This resolved state must not be injected");
   });
 
   it("keeps disabled host minds dormant and builds a director ensemble from portrayed actors", () => {
@@ -222,6 +257,7 @@ describe("hashing, settings, and compaction", () => {
     seed.startingGoals = ["Protect the caravan"];
     timeline.baseMinds[npc.id] = makeBaseMind(npc.id, seed);
     rebuildTimeline(timeline, []);
+    timeline.actors[card.id].present = true;
     timeline.actors[npc.id].present = true;
     const settings = { ...DEFAULT_SETTINGS, personaMindEnabled: false, characterCardDirectorMode: true };
 
@@ -235,9 +271,8 @@ describe("hashing, settings, and compaction", () => {
     expect(compact.find((actor) => actor.ref === persona.id)).toMatchObject({ managed: false, contextRole: "context_only_persona" });
     expect(compact.find((actor) => actor.ref === npc.id)).toMatchObject({ managed: true, contextRole: "mind" });
 
-    expect(buildMindInjection(timeline, card.id, 400, 4, { ...DEFAULT_SETTINGS, personaMindEnabled: false })).toContain("user persona is unmanaged");
-    expect(buildMindInjection(timeline, card.id, 400, 4, settings)).toBeNull();
-    const injection = buildDirectorMindInjection(timeline, 400, 4, settings);
+    expect(buildMindInjection(timeline, card.id, { ...DEFAULT_SETTINGS, personaMindEnabled: false })).toContain("user persona is unmanaged");
+    const injection = buildDirectorMindInjection(timeline, settings);
     expect(injection).toContain("private ensemble continuity");
     expect(injection).toContain("Mira");
     expect(injection).not.toContain("The Director (character");

@@ -17,7 +17,7 @@
 
 LumiMind gives characters private, evolving points of view.
 
-One character can trust a lie. Another can notice the truth but keep it secret. A third can leave the room without magically learning what happened afterward. LumiMind follows those differences across the conversation and gives the model a compact reminder of what each character currently believes, wants, fears, notices, and conceals.
+One character can trust a lie. Another can notice the truth but keep it secret. A third can leave the room without magically learning what happened afterward. LumiMind follows those differences across the conversation and gives the model the unresolved subjective state of the characters currently present.
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
@@ -65,7 +65,7 @@ It supports ordinary single-card roleplay, group chats, player personas, and dir
 | **Spoiler-safe lens** | Beliefs and secrets stay collapsed until you deliberately reveal them. |
 | **Editable state** | Correct, pin, lock, merge, split, rename, or remove inferred information. |
 | **Background analysis** | Uses a controller after committed turns without blocking normal generation. |
-| **Private injection** | Adds one compact cached system message before generation; the interceptor makes no model call. |
+| **Private injection** | Adds one cached system message containing the present cast's unresolved state; the interceptor makes no model call. |
 | **Diagnostics** | Produces a privacy-safe report for controller and timeline troubleshooting. |
 
 ---
@@ -83,7 +83,7 @@ Without separate minds, a model may:
 - abandon a goal between replies;
 - treat every character portrayed by a director card as one blended personality.
 
-LumiMind keeps a different continuity record for each actor. The model still writes the story, but it receives a small scene-specific reminder of the cast members whose inner state matters right now.
+LumiMind keeps a different continuity record for each actor. The model still writes the story, but it receives the unresolved state of the managed cast members currently present in the scene.
 
 The controller is evidence-bound. It may infer strong subtext, motives, emotions, or likely beliefs, but it is instructed not to invent objective events.
 
@@ -105,14 +105,14 @@ Background controller analysis
 Branch-aware timeline checkpoint
       │
       ▼
-Next generation receives only the relevant compact minds
+Next generation receives every present managed mind's unresolved state
 ```
 
 1. **You activate a chat.** New chats remain off until you explicitly enable them.
 2. **LumiMind reads committed history.** Existing messages are initialized in bounded background batches.
 3. **The controller returns evidence-linked changes.** Each accepted entry records its source message, swipe, confidence, and provenance.
 4. **The timeline is folded deterministically.** Current minds are rebuilt from the compatible records on the active branch.
-5. **The next reply gets a cached checkpoint.** LumiMind injects the target mind plus relevant scene actors—or an ensemble cast in Director mode.
+5. **The next reply gets a cached checkpoint.** LumiMind injects every present managed actor and all of their active or uncertain state.
 6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them.
 
 If a substantive batch produces no usable mental state, LumiMind performs at most one focused corrective pass. Continued empty or malformed results are surfaced in Mind Lens instead of being silently treated as healthy.
@@ -182,8 +182,8 @@ Use this when the active character card represents one in-world character.
 
 - The card receives its own mind.
 - Solo and group generations target the exact selected character.
-- Roughly 60% of the prompt budget is reserved for that target.
-- Present secondary actors share the remaining space.
+- Every present managed actor is included in the private injection.
+- Active and uncertain state is included without an extension-level injection cap.
 
 ### Director card
 
@@ -191,8 +191,7 @@ Enable **Character card acts as director** when the card is a narrator, scenario
 
 - The host card is not treated as an in-world mind.
 - Named individuals portrayed inside assistant messages become independent NPC actors.
-- The normal target injection becomes an ensemble injection for the currently relevant cast.
-- The **Secondary actors** setting becomes **Director cast actors** and controls the ensemble size.
+- The normal target injection becomes an ensemble injection containing every present managed cast member.
 
 ### Persona control
 
@@ -251,7 +250,7 @@ Mind Lens is LumiMind’s main drawer interface.
 <details>
 <summary><b>Settings</b> &mdash; controller, roleplay, privacy, and diagnostics</summary>
 
-- Choose the controller connection and token budgets.
+- Choose the controller connection and analysis limits.
 - Toggle persona management and Director mode.
 - Configure spoiler safety and Memory Cortex behavior.
 - Enable private extension interoperability when desired.
@@ -338,9 +337,7 @@ LumiMind settings are user-scoped and apply across chats.
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
 | Analysis output tokens | `1,800` | Maximum controller output budget per analysis call. |
-| Injection token budget | `1,600` | Approximate cap for the private cached prompt block. |
-| Secondary actors | `4` | Maximum additional actor minds in Actor-card mode. |
-| Director cast actors | `4` | Maximum ensemble minds in Director-card mode; minimum `1`. |
+| Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
 
 ### Privacy and interoperability
 
@@ -369,7 +366,7 @@ Additional calls can occur when:
 
 Initial history is analyzed in bounded batches. You can pause a timeline whenever you do not want background analysis costs.
 
-The prompt interceptor itself makes **no model call**. It only reads the latest valid cached checkpoint and adds one compact system message. Prompt Breakdown attributes that block as **LumiMind — Private Mind**.
+The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint and injects every present managed actor's active or uncertain state in one system message. Prompt Breakdown attributes that block as **LumiMind — Private Mind**.
 
 LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to the active connection for the chat. It uses Lumiverse connection profiles and does not read or store API credentials.
 
@@ -407,7 +404,7 @@ LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to 
 
 ### Controller data
 
-The selected controller receives recent transcript context, the analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
+The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
 
 Diagnostics store counts, lengths, hashes, provider metadata, and warning codes—not raw controller responses or private story content.
 

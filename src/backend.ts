@@ -24,6 +24,7 @@ import {
   removeManualItem,
   resolveActorId,
   splitActor,
+  selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
   sortMessages,
   toTimelineView,
@@ -48,7 +49,6 @@ import {
 
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
-const RECENT_CONTEXT_SIZE = 4;
 const MAX_RECORDS = 5000;
 const RECONCILE_DEBOUNCE_MS = 650;
 const EXTENSION_VERSION = "0.1.1";
@@ -419,7 +419,11 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
         continue;
       }
       const batch = work.messages;
-      const recentContext = derivation.messages.slice(Math.max(0, start - RECENT_CONTEXT_SIZE), start);
+      const recentContext = selectAnalysisRecentContext(
+        derivation.messages,
+        start,
+        settings.analysisContextMessageLimit,
+      );
       const result = await analyzeMessages({
         messages: batch,
         recentContext,
@@ -608,10 +612,10 @@ spindle.registerInterceptor(async (messages, context) => {
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+        injection = buildMindInjection(timeline, targetActorId, settings);
       }
     } else if (settings.characterCardDirectorMode) {
-      injection = buildDirectorMindInjection(timeline, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      injection = buildDirectorMindInjection(timeline, settings);
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -620,9 +624,7 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
-      }
+      injection = buildMindInjection(timeline, targetActorId, settings);
     }
     if (!injection) return messages;
     const injected = { role: "system" as const, content: injection };

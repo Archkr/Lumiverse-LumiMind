@@ -8,8 +8,7 @@ var DEFAULT_SETTINGS = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
-  injectionTokenBudget: 1600,
-  secondaryActorLimit: 4,
+  analysisContextMessageLimit: 4,
   personaMindEnabled: true,
   characterCardDirectorMode: false,
   cortexImportEnabled: true,
@@ -68,8 +67,7 @@ function normalizeSettings(value) {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8e3, DEFAULT_SETTINGS.controllerMaxTokens)),
-    injectionTokenBudget: Math.round(clamp(raw.injectionTokenBudget, 400, 4e3, DEFAULT_SETTINGS.injectionTokenBudget)),
-    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, characterCardDirectorMode ? 1 : 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -165,6 +163,11 @@ function selectAnalysisWorkBatch(messages, start, maxMessages, settings) {
     messages: selected,
     skipReason: skip ? "unmanaged_user_message" : null
   };
+}
+function selectAnalysisRecentContext(messages, analysisStart, messageLimit) {
+  const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
+  if (limit === 0 || analysisStart <= 0) return [];
+  return messages.slice(Math.max(0, analysisStart - limit), analysisStart);
 }
 function createActor(input) {
   const now = Date.now();
@@ -693,34 +696,33 @@ function itemScore(item, relevantActorIds) {
 function actorLabel(actors, id) {
   return actors[id]?.canonicalName ?? id;
 }
-function formatMind(mind, actors, maxChars, compact) {
+function formatMind(mind, actors) {
   const actor = actors[mind.actorId];
   if (!actor) return "";
   const relevant = new Set(mind.presentActorIds);
   const items = [...mind.items].filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
   const lines = [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`];
-  if (!compact && mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
-  if (!compact && mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
+  if (mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
+  if (mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
+  if (mind.core.desires.length) lines.push(`Desires: ${mind.core.desires.join("; ")}`);
+  if (mind.core.fears.length) lines.push(`Fears: ${mind.core.fears.join("; ")}`);
+  if (mind.core.boundaries.length) lines.push(`Boundaries: ${mind.core.boundaries.join("; ")}`);
+  if (mind.core.notes.length) lines.push(`Notes: ${mind.core.notes.join("; ")}`);
   for (const item of items) {
     const targets = item.targetActorIds.length ? ` [toward ${item.targetActorIds.map((id) => actorLabel(actors, id)).join(", ")}]` : "";
     const confidence = item.confidence < 0.8 ? ` (${Math.round(item.confidence * 100)}% confidence)` : "";
     const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
-    if (lines.join("\n").length + line.length + 1 > maxChars) break;
     lines.push(line);
   }
-  return lines.join("\n").slice(0, maxChars);
+  return lines.join("\n");
 }
-function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit, settings = DEFAULT_SETTINGS) {
-  const targetMind = timeline.minds[targetActorId];
-  const targetActor = timeline.actors[targetActorId];
-  if (!timeline.active || timeline.paused || !targetMind || !targetActor || !actorMindEnabled(targetActor, settings)) return null;
-  const totalChars = Math.max(1200, tokenBudget * 4);
-  const targetChars = Math.floor(totalChars * 0.6);
-  const target = formatMind(targetMind, timeline.actors, targetChars, false);
-  const secondaryActors = Object.values(timeline.actors).filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings)).sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt).slice(0, secondaryLimit);
-  const secondaryBudget = secondaryActors.length ? Math.floor((totalChars - target.length) / secondaryActors.length) : 0;
-  const secondary = secondaryActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, secondaryBudget, true)).filter(Boolean);
-  const body = [target, ...secondary].filter(Boolean).join("\n\n");
+function buildMindInjection(timeline, targetActorId, settings = DEFAULT_SETTINGS) {
+  if (!timeline.active || timeline.paused) return null;
+  const presentActors = Object.values(timeline.actors).filter((actor) => actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings)).sort(
+    (left, right) => Number(right.id === targetActorId) - Number(left.id === targetActorId) || Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
+  );
+  const minds = presentActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors)).filter(Boolean);
+  const body = minds.join("\n\n");
   if (!body.trim()) return null;
   return [
     "[LumiMind \u2014 private subjective continuity]",
@@ -730,17 +732,15 @@ function buildMindInjection(timeline, targetActorId, tokenBudget, secondaryLimit
     "",
     body,
     "[/LumiMind]"
-  ].join("\n").slice(0, totalChars);
+  ].join("\n");
 }
-function buildDirectorMindInjection(timeline, tokenBudget, actorLimit, settings = DEFAULT_SETTINGS) {
-  if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
-  const totalChars = Math.max(1200, tokenBudget * 4);
-  const actors = Object.values(timeline.actors).filter((actor) => actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
-    (left, right) => Number(right.present) - Number(left.present) || Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
-  ).slice(0, actorLimit);
+function buildDirectorMindInjection(timeline, settings = DEFAULT_SETTINGS) {
+  if (!timeline.active || timeline.paused) return null;
+  const actors = Object.values(timeline.actors).filter((actor) => actor.present && actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
+    (left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
+  );
   if (!actors.length) return null;
-  const perActorBudget = Math.max(240, Math.floor(totalChars / actors.length));
-  const body = actors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, perActorBudget, false)).filter(Boolean).join("\n\n");
+  const body = actors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors)).filter(Boolean).join("\n\n");
   if (!body.trim()) return null;
   return [
     "[LumiMind \u2014 private ensemble continuity]",
@@ -750,7 +750,7 @@ function buildDirectorMindInjection(timeline, tokenBudget, actorLimit, settings 
     "",
     body,
     "[/LumiMind]"
-  ].join("\n").slice(0, totalChars);
+  ].join("\n");
 }
 function publicStance(mind) {
   if (!mind) return "";
@@ -1381,7 +1381,6 @@ function makeMindLumiStateSnapshot(timeline, settings, extensionVersion, generat
 // src/backend.ts
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
-var RECENT_CONTEXT_SIZE = 4;
 var MAX_RECORDS = 5e3;
 var RECONCILE_DEBOUNCE_MS = 650;
 var EXTENSION_VERSION = "0.1.1";
@@ -1706,7 +1705,11 @@ async function reconcileChat(userId, chatId, force = false) {
         continue;
       }
       const batch = work.messages;
-      const recentContext = derivation.messages.slice(Math.max(0, start - RECENT_CONTEXT_SIZE), start);
+      const recentContext = selectAnalysisRecentContext(
+        derivation.messages,
+        start,
+        settings.analysisContextMessageLimit
+      );
       const result = await analyzeMessages({
         messages: batch,
         recentContext,
@@ -1882,10 +1885,10 @@ spindle.registerInterceptor(async (messages, context) => {
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+        injection = buildMindInjection(timeline, targetActorId, settings);
       }
     } else if (settings.characterCardDirectorMode) {
-      injection = buildDirectorMindInjection(timeline, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
+      injection = buildDirectorMindInjection(timeline, settings);
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -1894,9 +1897,7 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings.injectionTokenBudget, settings.secondaryActorLimit, settings);
-      }
+      injection = buildMindInjection(timeline, targetActorId, settings);
     }
     if (!injection) return messages;
     const injected = { role: "system", content: injection };

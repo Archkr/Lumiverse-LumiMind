@@ -27,8 +27,7 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
-  injectionTokenBudget: 1600,
-  secondaryActorLimit: 4,
+  analysisContextMessageLimit: 4,
   personaMindEnabled: true,
   characterCardDirectorMode: false,
   cortexImportEnabled: true,
@@ -95,8 +94,7 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(clamp(raw.controllerMaxTokens, 300, 8000, DEFAULT_SETTINGS.controllerMaxTokens)),
-    injectionTokenBudget: Math.round(clamp(raw.injectionTokenBudget, 400, 4000, DEFAULT_SETTINGS.injectionTokenBudget)),
-    secondaryActorLimit: Math.round(clamp(raw.secondaryActorLimit, characterCardDirectorMode ? 1 : 0, 8, DEFAULT_SETTINGS.secondaryActorLimit)),
+    analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -210,6 +208,16 @@ export function selectAnalysisWorkBatch(
     messages: selected,
     skipReason: skip ? "unmanaged_user_message" : null,
   };
+}
+
+export function selectAnalysisRecentContext(
+  messages: ChatMessageLike[],
+  analysisStart: number,
+  messageLimit: number,
+): ChatMessageLike[] {
+  const limit = Number.isFinite(messageLimit) ? Math.max(0, Math.floor(messageLimit)) : 0;
+  if (limit === 0 || analysisStart <= 0) return [];
+  return messages.slice(Math.max(0, analysisStart - limit), analysisStart);
 }
 
 export function createActor(input: {
@@ -831,8 +839,6 @@ function actorLabel(actors: Record<string, ActorRecord>, id: string): string {
 function formatMind(
   mind: ActorMind,
   actors: Record<string, ActorRecord>,
-  maxChars: number,
-  compact: boolean,
 ): string {
   const actor = actors[mind.actorId];
   if (!actor) return "";
@@ -841,40 +847,38 @@ function formatMind(
     .filter((item) => item.status === "active" || item.status === "uncertain")
     .sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
   const lines: string[] = [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`];
-  if (!compact && mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
-  if (!compact && mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
+  if (mind.core.selfConcept) lines.push(`Self-concept: ${mind.core.selfConcept}`);
+  if (mind.core.values.length) lines.push(`Values: ${mind.core.values.join("; ")}`);
+  if (mind.core.desires.length) lines.push(`Desires: ${mind.core.desires.join("; ")}`);
+  if (mind.core.fears.length) lines.push(`Fears: ${mind.core.fears.join("; ")}`);
+  if (mind.core.boundaries.length) lines.push(`Boundaries: ${mind.core.boundaries.join("; ")}`);
+  if (mind.core.notes.length) lines.push(`Notes: ${mind.core.notes.join("; ")}`);
   for (const item of items) {
     const targets = item.targetActorIds.length ? ` [toward ${item.targetActorIds.map((id) => actorLabel(actors, id)).join(", ")}]` : "";
     const confidence = item.confidence < 0.8 ? ` (${Math.round(item.confidence * 100)}% confidence)` : "";
     const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
-    if (lines.join("\n").length + line.length + 1 > maxChars) break;
     lines.push(line);
   }
-  return lines.join("\n").slice(0, maxChars);
+  return lines.join("\n");
 }
 
 export function buildMindInjection(
   timeline: ChatTimelineV1,
-  targetActorId: string,
-  tokenBudget: number,
-  secondaryLimit: number,
+  targetActorId: string | null,
   settings: LumiMindSettings = DEFAULT_SETTINGS,
 ): string | null {
-  const targetMind = timeline.minds[targetActorId];
-  const targetActor = timeline.actors[targetActorId];
-  if (!timeline.active || timeline.paused || !targetMind || !targetActor || !actorMindEnabled(targetActor, settings)) return null;
-  const totalChars = Math.max(1200, tokenBudget * 4);
-  const targetChars = Math.floor(totalChars * 0.6);
-  const target = formatMind(targetMind, timeline.actors, targetChars, false);
-  const secondaryActors = Object.values(timeline.actors)
-    .filter((actor) => actor.id !== targetActorId && actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings))
-    .sort((left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt)
-    .slice(0, secondaryLimit);
-  const secondaryBudget = secondaryActors.length ? Math.floor((totalChars - target.length) / secondaryActors.length) : 0;
-  const secondary = secondaryActors
-    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, secondaryBudget, true))
+  if (!timeline.active || timeline.paused) return null;
+  const presentActors = Object.values(timeline.actors)
+    .filter((actor) => actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings))
+    .sort((left, right) =>
+      Number(right.id === targetActorId) - Number(left.id === targetActorId) ||
+      Number(right.confirmed) - Number(left.confirmed) ||
+      right.updatedAt - left.updatedAt,
+    );
+  const minds = presentActors
+    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors))
     .filter(Boolean);
-  const body = [target, ...secondary].filter(Boolean).join("\n\n");
+  const body = minds.join("\n\n");
   if (!body.trim()) return null;
   return [
     "[LumiMind — private subjective continuity]",
@@ -884,29 +888,23 @@ export function buildMindInjection(
     "",
     body,
     "[/LumiMind]",
-  ].join("\n").slice(0, totalChars);
+  ].join("\n");
 }
 
 export function buildDirectorMindInjection(
   timeline: ChatTimelineV1,
-  tokenBudget: number,
-  actorLimit: number,
   settings: LumiMindSettings = DEFAULT_SETTINGS,
 ): string | null {
-  if (!timeline.active || timeline.paused || actorLimit <= 0) return null;
-  const totalChars = Math.max(1200, tokenBudget * 4);
+  if (!timeline.active || timeline.paused) return null;
   const actors = Object.values(timeline.actors)
-    .filter((actor) => actorMindEnabled(actor, settings) && timeline.minds[actor.id])
+    .filter((actor) => actor.present && actorMindEnabled(actor, settings) && timeline.minds[actor.id])
     .sort((left, right) =>
-      Number(right.present) - Number(left.present) ||
       Number(right.confirmed) - Number(left.confirmed) ||
       right.updatedAt - left.updatedAt,
-    )
-    .slice(0, actorLimit);
+    );
   if (!actors.length) return null;
-  const perActorBudget = Math.max(240, Math.floor(totalChars / actors.length));
   const body = actors
-    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, perActorBudget, false))
+    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors))
     .filter(Boolean)
     .join("\n\n");
   if (!body.trim()) return null;
@@ -918,7 +916,7 @@ export function buildDirectorMindInjection(
     "",
     body,
     "[/LumiMind]",
-  ].join("\n").slice(0, totalChars);
+  ].join("\n");
 }
 
 function publicStance(mind: ActorMind | undefined): string {
