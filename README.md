@@ -454,11 +454,12 @@ LumiMind publishes shared RPC snapshots so other extensions can use scene contex
 |---|---|---|
 | `lumi_mind.contract.v1` | Public | Schema version, capabilities, and endpoint metadata. |
 | `lumi_mind.scene.current` | Public | Active chat, revision, freshness, actor identities, aliases, presence, and public stance. |
+| `lumi_mind.state.current` | Public | The same spoiler-safe cast mapped into the shared LumiState v1 scene schema. |
 | `lumi_mind.scene.private` | Opt-in, requires `chat_mutation` | Compact private beliefs, secrets, goals, and relationships. |
 
 Every scene snapshot includes `chatId`, `revision`, and `schemaVersion: 1`. Consumers should reject unsupported schemas, snapshots for another active chat, or revisions older than the newest one already accepted.
 
-If LumiMind is missing, permission-gated, disabled, or stale, LumiWorld, Lore Recall, and future extensions should continue without LumiMind data.
+If LumiMind is missing, permission-gated, disabled, or stale, LumiState and future extensions should continue without LumiMind data.
 
 ---
 
