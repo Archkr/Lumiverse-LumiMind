@@ -115,7 +115,7 @@ Next generation receives every present managed mind's unresolved state
 5. **The next reply gets a cached checkpoint.** LumiMind injects every present managed actor and all of their active or uncertain state.
 6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them.
 
-If a substantive batch produces no usable mental state, LumiMind performs at most one focused corrective pass. Continued empty or malformed results are surfaced in Mind Lens instead of being silently treated as healthy.
+If a substantive batch leaves a genuinely uninitialized actor without usable mental state, LumiMind performs at most one focused corrective pass. An empty change set is healthy when the existing ledger already covers the scene.
 
 ---
 
@@ -365,7 +365,7 @@ Additional calls can occur when:
 - replaying edits, deletions, or changed swipes;
 - changing Persona or Director policy;
 - retrying transient failures;
-- running one corrective pass after a substantive but empty result;
+- running one corrective pass after a substantive empty bootstrap result;
 - generating a Mind Seed draft.
 
 Initial history is analyzed in bounded batches. You can pause a timeline whenever you do not want background analysis costs.
@@ -497,7 +497,7 @@ Automatic analysis needs `generation` and `chat_mutation`. Prompt injection addi
 <details>
 <summary><b>The timeline is current but contains no mind entries</b></summary>
 
-Mind Lens treats a technically compatible but suspiciously empty result as an analysis-quality problem.
+Mind Lens treats a technically compatible but suspiciously empty bootstrap result as an analysis-quality problem. Empty reconciliations for already initialized actors are valid no-ops.
 
 1. Open **Settings → Diagnostics**.
 2. Compare raw, normalized, and final accepted counts.

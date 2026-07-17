@@ -194,7 +194,7 @@ export function mindTextsNearDuplicate(left: string, right: string): boolean {
 export function analysisPolicyHash(settings: LumiMindSettings): string {
   const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
   const personaPolicy = settings.personaMindEnabled ? "" : "persona-policy:2|";
-  return stableHash(`${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  return stableHash(`ledger-policy:1|${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 
 export function actorMindEnabled(actor: ActorRecord, settings: LumiMindSettings): boolean {
@@ -1181,6 +1181,7 @@ export function compactStateForController(
             locked: item.locked,
             pinned: item.pinned,
             source: item.source,
+            controllerWritable: !protectedMindItem(item),
           })),
       } : {}),
     };

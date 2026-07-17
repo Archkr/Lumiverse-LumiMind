@@ -319,9 +319,9 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
-    expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
-    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:3|persona:1|director:1"));
-    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("persona-policy:2|persona:0|director:0"));
+    expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("ledger-policy:1|persona:1|director:0"));
+    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("ledger-policy:1|director-policy:3|persona:1|director:1"));
+    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("ledger-policy:1|persona-policy:2|persona:0|director:0"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
   });
 
@@ -410,8 +410,22 @@ describe("hashing, settings, and compaction", () => {
     expect(injection).not.toContain("Rowan");
     expect(injection).not.toContain("Deliver the sealed letter");
     expect(injection).not.toContain("This resolved state must not be injected");
-    const compact = compactStateForController(timeline) as Array<{ ref: string; items?: unknown[] }>;
-    expect(compact.find((entry) => entry.ref === actor.id)?.items).toHaveLength(30);
+    timeline.minds[actor.id].items.push({
+      ...timeline.minds[actor.id].items[0],
+      id: "controller-item",
+      text: "A newly inferred writable state",
+      source: "controller",
+      locked: false,
+      pinned: false,
+    });
+    const compact = compactStateForController(timeline) as Array<{
+      ref: string;
+      items?: Array<{ id: string; controllerWritable: boolean }>;
+    }>;
+    const compactItems = compact.find((entry) => entry.ref === actor.id)?.items ?? [];
+    expect(compactItems).toHaveLength(31);
+    expect(compactItems.find((item) => item.id === "controller-item")?.controllerWritable).toBe(true);
+    expect(compactItems.filter((item) => item.id !== "controller-item").every((item) => item.controllerWritable === false)).toBe(true);
   });
 
   it("keeps disabled host minds dormant and builds a director ensemble from portrayed actors", () => {

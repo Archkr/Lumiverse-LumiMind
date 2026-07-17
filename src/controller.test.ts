@@ -224,6 +224,34 @@ describe("controller response parsing", () => {
     ]);
   });
 
+  it("treats an empty reconciliation as healthy when existing state already initializes the actor", async () => {
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "A".repeat(500), index_in_chat: 0 }];
+    const result = await analyzeMessages({
+      messages,
+      recentContext: [],
+      compactState: [{
+        ref: "aster",
+        name: "Aster",
+        aliases: [],
+        managed: true,
+        items: [{ id: "seed:belief", category: "belief", text: "The room is safe", controllerWritable: false }],
+      }],
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    });
+
+    expect(quiet).toHaveBeenCalledTimes(1);
+    expect(result.analysis.changes).toEqual([]);
+    expect(result.telemetry).toMatchObject({ attempts: 1, finalChanges: 0, warningCodes: [] });
+    const request = quiet.mock.calls[0][0] as { messages: Array<{ role: string; content: string }> };
+    const systemPrompt = request.messages.find((message) => message.role === "system")?.content ?? "";
+    expect(systemPrompt).toContain("COVERED, EVOLVED, ENDED, PROTECTED, or NOVEL");
+    expect(systemPrompt).toContain("When uncertain between COVERED and NOVEL, choose COVERED and emit nothing.");
+    expect(systemPrompt).toContain("one concise composite emotion");
+  });
+
   it("runs exactly one corrective pass for an empty substantive bootstrap", async () => {
     const quiet = vi.fn()
       .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })

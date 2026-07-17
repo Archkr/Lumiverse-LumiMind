@@ -151,7 +151,7 @@ function mindTextsNearDuplicate(left, right) {
 function analysisPolicyHash(settings) {
   const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
   const personaPolicy = settings.personaMindEnabled ? "" : "persona-policy:2|";
-  return stableHash(`${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
+  return stableHash(`ledger-policy:1|${directorPolicy}${personaPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 function actorMindEnabled(actor, settings) {
   if (actor.kind === "persona") return settings.personaMindEnabled;
@@ -959,7 +959,8 @@ function compactStateForController(timeline, settings = DEFAULT_SETTINGS, _maxIt
           dimensions: item.dimensions,
           locked: item.locked,
           pinned: item.pinned,
-          source: item.source
+          source: item.source,
+          controllerWritable: !protectedMindItem(item)
         }))
       } : {}
     };
@@ -1430,23 +1431,44 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
-  "Treat mind_state as authoritative current state. Prefer updating an existing entry over adding another version of the same thought.",
-  "Use existing item IDs in targetItemId when updating, resolving, abandoning, or removing state. Do not modify locked, pinned, manual, or seed entries.",
-  "Add only genuinely novel state. Do not restate, paraphrase, or split information already represented by an unresolved entry.",
-  "Maintain one current relationship stance per subject-target pair; update that entry when the stance changes.",
-  "When an emotion, goal, plan, or awareness entry evolves, update or supersede the matching older entry instead of appending a new one.",
-  "Bootstrap rule: when an actor has no active subjective-state entries, treat the supplied scene as initialization and add every clearly evidence-supported starting emotion, goal, awareness, relationship stance, plan, or belief.",
+  "Treat mind_state as an authoritative ledger to reconcile, not background prose to summarize. Adds are the last resort, not the default output.",
+  "For every candidate state, compare its meaning against every unresolved item for the same subject, category, targets, and concealed audience. Compare semantic claims and functions, not wording or sentence structure.",
+  "Classify each candidate internally as exactly one of COVERED, EVOLVED, ENDED, PROTECTED, or NOVEL before emitting JSON. Do not output these labels.",
+  "COVERED: an existing item already expresses the same claim, intent, reaction, stance, or a broader state that entails it. Emit no change, even when the new wording is more vivid, specific, or paraphrased.",
+  "EVOLVED: the same continuing state materially changed and its existing item has controllerWritable=true. Emit update with that exact item ID; never add a second version.",
+  "ENDED: an existing controllerWritable=true state clearly concluded or became obsolete. Resolve, abandon, or remove that exact item rather than adding its opposite.",
+  "PROTECTED: the best semantic match has controllerWritable=false. Emit no change. Never add a replacement, workaround, refinement, contradiction, or scene-specific restatement of protected state.",
+  "NOVEL: no existing item or earlier change in this response covers the same semantic proposition or continuity function. Only NOVEL candidates may use add. When uncertain between COVERED and NOVEL, choose COVERED and emit nothing.",
+  "Use existing item IDs in targetItemId for every update, resolve, abandon, or remove operation. Never target an item with controllerWritable=false.",
+  "Represent one emotional reaction to the same event, cause, and target as one concise composite emotion; do not split its adjectives or facets into separate entries.",
+  "Represent one intended outcome as one goal and one method as one plan. Do not turn each action, sentence, observation, or rhetorical question into another state item.",
+  "Maintain one current relationship stance per subject-target pair. Update the writable stance when it changes; if the stance is protected, emit nothing.",
+  "Before returning JSON, silently audit the entire changes array: no add may overlap an unresolved item or another emitted change, no protected item may be targeted or bypassed, and each add must carry genuinely new continuity value for a future turn.",
+  "Bootstrap rule: only when an actor has no unresolved subjective-state entries, add the smallest coherent set needed for continuity. Combine related facets and omit incidental observations.",
   "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
-  "A substantive scene with character choices, reactions, attention, dialogue, or strong subtext should not return an empty changes array merely because mind_state started empty.",
+  "A substantive scene may correctly return an empty changes array when mind_state already covers its supported state. An empty result is suspicious only for a true bootstrap actor with clear subjective evidence and no unresolved entries.",
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
 ].join("\n");
+function correctiveBootstrapNeeded(compactState, mentions) {
+  const actors = (Array.isArray(compactState) ? compactState : []).map(asObject2).filter((actor) => actor.managed !== false).map((actor) => ({
+    references: [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []].map(policyReference).filter(Boolean),
+    itemCount: Array.isArray(actor.items) ? actor.items.length : 0
+  }));
+  if (actors.length === 0 || actors.every((actor) => actor.itemCount === 0)) return true;
+  return mentions.some((mention) => {
+    const mentionReferences = [mention.ref, mention.name, ...mention.aliases ?? []].map(policyReference).filter(Boolean);
+    const actor = actors.find((candidate) => candidate.references.some((reference) => mentionReferences.includes(reference)));
+    return !actor || actor.itemCount === 0;
+  });
+}
 function analysisSystemPrompt(settings, corrective = false) {
   const mode = settings.characterCardDirectorMode ? "Director-card mode: host character-card entries marked managed=false are narrators/directors, not in-world actors. Never emit a mind or presence mention for those cards. Treat each named individual the card portrays as an independent NPC, even when several speak inside one assistant message." : "Actor-card mode: host character cards are in-world actors and may receive their own subjective minds.";
   const persona = settings.personaMindEnabled ? "Persona minds are enabled: the active user persona may receive evidence-supported subjective state and may be targeted during impersonation." : "Persona minds are disabled: the user persona is context only. Never emit actorMentions or changes with the user/persona as subject, and never infer actions, goals, emotions, or beliefs for them. Other managed actors may still hold beliefs or relationships about the user.";
   const correction = corrective ? [
     "This is a single corrective pass because the first pass accepted no mental-state changes from a substantive batch.",
-    "Re-read analysis_batch actor by actor. Extract the smallest defensible bootstrap state supported by the text, especially viewpoint emotion, immediate goal, attention/awareness, relationship stance, and any clearly held belief.",
+    "This pass is permitted only because at least one managed actor genuinely lacks unresolved state. Re-read analysis_batch actor by actor and extract the smallest defensible bootstrap state supported by the text.",
+    "Apply the COVERED/EVOLVED/ENDED/PROTECTED/NOVEL reconciliation protocol before every change. Do not fill categories or duplicate state belonging to an already initialized actor.",
     "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any managed actor's subjective state."
   ].join("\n") : "";
   return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
@@ -1465,6 +1487,7 @@ ${renderMessages(input.recentContext)}
     `<analysis_batch>
 ${renderMessages(input.messages)}
 </analysis_batch>`,
+    "Reconcile; do not summarize. If every supported candidate is COVERED or PROTECTED by mind_state, return actorMentions as appropriate with an empty changes array.",
     'Return {"actorMentions": [...], "changes": [...]} now.'
   ].join("\n\n");
 }
@@ -1490,12 +1513,13 @@ async function analyzeMessages(input) {
     invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons)
   });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
+  const bootstrapNeeded = correctiveBootstrapNeeded(input.compactState, firstAnalysis.actorMentions);
   let finalAnalysis = firstAnalysis;
   let retryTelemetry = null;
   let retryRaw = null;
   let retryError = null;
   let attempts = 1;
-  if (nontrivial && firstAnalysis.changes.length === 0) {
+  if (nontrivial && bootstrapNeeded && firstAnalysis.changes.length === 0) {
     attempts = 2;
     try {
       const corrective = await quietJson(
@@ -1529,7 +1553,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
   const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges - telemetry.acceptedChanges > telemetry.duplicatesSuppressed || telemetry.invalidChangesRejected > 0);
   if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
   if (retryError) warningCodes.add("retry_failed");
-  if (nontrivial && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");
+  if (nontrivial && bootstrapNeeded && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");
   return {
     analysis: finalAnalysis,
     meta: result.meta,
