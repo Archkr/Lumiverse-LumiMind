@@ -1275,12 +1275,59 @@ async function deleteTimeline(chatId, userId) {
   await spindle.userStorage.delete(timelinePath(chatId), userId).catch(() => void 0);
 }
 
+// src/lumi-state.ts
+var LUMI_STATE_PROTOCOL = "lumi_state.v1";
+var LUMI_STATE_SCHEMA_VERSION = 1;
+var LUMI_MIND_STATE_ENDPOINT = "lumi_mind.state.current";
+function makeMindLumiStateSnapshot(timeline, settings, extensionVersion, generatedAt = Date.now()) {
+  const publicSnapshot = makePublicSnapshot(timeline, settings);
+  const cast = timeline ? publicSnapshot.actors.map((actor) => {
+    const record = timeline.actors[actor.id];
+    const links = [];
+    if (record?.characterId) links.push({ namespace: "host.character", id: record.characterId, kind: "character" });
+    if (record?.personaId) links.push({ namespace: "host.persona", id: record.personaId, kind: "persona" });
+    return {
+      id: actor.id,
+      actor: { namespace: "lumi_mind.actor", id: actor.id, kind: actor.kind },
+      links,
+      name: actor.name,
+      aliases: [...actor.aliases],
+      present: actor.present,
+      confirmed: actor.confirmed,
+      publicStance: actor.publicStance,
+      provenance: {
+        extensionId: "lumi_mind",
+        method: "derived",
+        observedAt: record?.updatedAt ?? timeline.updatedAt,
+        confidence: record?.confidence ?? 0
+      }
+    };
+  }) : [];
+  return {
+    protocol: LUMI_STATE_PROTOCOL,
+    schemaVersion: LUMI_STATE_SCHEMA_VERSION,
+    source: {
+      extensionId: "lumi_mind",
+      extensionVersion,
+      endpoint: LUMI_MIND_STATE_ENDPOINT
+    },
+    chatId: timeline?.chatId ?? null,
+    revision: timeline?.revision ?? 0,
+    freshness: !timeline ? "unavailable" : publicSnapshot.stale ? "stale" : "fresh",
+    generatedAt,
+    updatedAt: timeline?.updatedAt ?? null,
+    visibility: "public",
+    state: { locations: [], times: [], cast, objects: [], conditions: [], threads: [] }
+  };
+}
+
 // src/backend.ts
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECENT_CONTEXT_SIZE = 4;
 var MAX_RECORDS = 5e3;
 var RECONCILE_DEBOUNCE_MS = 650;
+var EXTENSION_VERSION = "0.1.1";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
@@ -1642,6 +1689,7 @@ async function publishScene(userId, timeline) {
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
   const settings = await getSettings(userId);
   spindle.rpcPool.sync("scene.current", makePublicSnapshot(resolved, settings), { requires: [] });
+  spindle.rpcPool.sync("state.current", makeMindLumiStateSnapshot(resolved, settings, EXTENSION_VERSION), { requires: [] });
   if (settings.privateInteropEnabled) {
     spindle.rpcPool.sync("scene.private", makePrivateSnapshot(resolved, settings), { requires: ["chat_mutation"] });
   } else {
@@ -1706,10 +1754,24 @@ async function cloneFork(payload, eventUserId) {
 }
 spindle.rpcPool.sync("contract.v1", {
   schemaVersion: 1,
+  protocol: "lumi_state.v1",
   extension: "lumi_mind",
+  extensionVersion: EXTENSION_VERSION,
   capabilities: ["subjective_minds", "timeline_swipes", "chat_forks", "scene_presence", "spoiler_safe"],
-  endpoints: { public: "lumi_mind.scene.current", private: "lumi_mind.scene.private" }
+  endpoints: {
+    public: "lumi_mind.scene.current",
+    private: "lumi_mind.scene.private",
+    state: "lumi_mind.state.current"
+  },
+  channels: [{
+    endpoint: "lumi_mind.state.current",
+    schema: "lumi_state.snapshot.v1",
+    visibility: "public",
+    requires: [],
+    mode: "sync"
+  }]
 }, { requires: [] });
+spindle.rpcPool.sync("state.current", makeMindLumiStateSnapshot(null, DEFAULT_SETTINGS, EXTENSION_VERSION), { requires: [] });
 spindle.registerInterceptor(async (messages, context) => {
   try {
     const chatId = extractChatId(context);
@@ -1939,4 +2001,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.1.0 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.1.1 loaded \u2014 subjective timeline engine ready.");
