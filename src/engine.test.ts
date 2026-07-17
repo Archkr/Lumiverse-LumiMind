@@ -5,6 +5,7 @@ import {
   analysisPolicyHash,
   buildDirectorMindInjection,
   buildMindInjection,
+  canonicalMindText,
   compactStateForController,
   createTimeline,
   makeBaseMind,
@@ -12,6 +13,7 @@ import {
   materializeAnalysisRecords,
   materializeSkippedAnalysisRecords,
   mergeActors,
+  mindTextsNearDuplicate,
   nextPrefixHash,
   normalizeSettings,
   normalizeTimeline,
@@ -284,6 +286,12 @@ describe("timeline reducer", () => {
 });
 
 describe("hashing, settings, and compaction", () => {
+  it("normalizes mind text without language-specific token tables", () => {
+    expect(canonicalMindText("  Ｅｌａｎ—東京！ ")).toBe("elan 東京");
+    expect(mindTextsNearDuplicate("Wants to escape the tower", "Escape the tower")).toBe(true);
+    expect(mindTextsNearDuplicate("afraid", "fearful")).toBe(false);
+  });
+
   it("produces deterministic branch hashes", () => {
     expect(stableHash("same")).toBe(stableHash("same"));
     expect(nextPrefixHash("a", "b", 0)).not.toBe(nextPrefixHash("a", "b", 1));

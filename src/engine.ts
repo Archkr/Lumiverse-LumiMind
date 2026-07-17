@@ -161,55 +161,16 @@ export function stableHash(input: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
-const MIND_TEXT_STOP_WORDS = new Set([
-  "a", "an", "and", "as", "at", "be", "because", "been", "being", "by", "for", "from", "has", "have", "he", "her", "hers",
-  "him", "his", "i", "in", "is", "it", "its", "of", "on", "or", "she", "that", "the", "their", "them", "they", "this", "to",
-  "was", "were", "will", "with", "would",
-]);
-
-const MIND_TOKEN_ALIASES: Record<string, string> = {
-  afraid: "fear",
-  fearful: "fear",
-  frightened: "fear",
-  scared: "fear",
-  angry: "anger",
-  annoyed: "anger",
-  furious: "anger",
-  irritated: "anger",
-  desires: "want",
-  wants: "want",
-  wished: "want",
-  wishes: "want",
-};
-
-function normalizedMindToken(value: string): string {
-  const aliased = MIND_TOKEN_ALIASES[value] ?? value;
-  if (aliased.length > 5 && aliased.endsWith("ing")) return aliased.slice(0, -3);
-  if (aliased.length > 4 && aliased.endsWith("ied")) return `${aliased.slice(0, -3)}y`;
-  if (aliased.length > 4 && aliased.endsWith("ed")) return aliased.slice(0, -2);
-  if (aliased.length > 4 && aliased.endsWith("es")) return aliased.slice(0, -2);
-  if (aliased.length > 3 && aliased.endsWith("s")) return aliased.slice(0, -1);
-  return aliased;
-}
-
-function mindTextTokens(value: string): string[] {
-  const words = value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .replace(/[’']/g, "")
-    .match(/[a-z0-9]+/g) ?? [];
-  return uniqueStrings(words.filter((word) => !MIND_TEXT_STOP_WORDS.has(word)).map(normalizedMindToken));
-}
-
-function mindTextHasNegation(value: string): boolean {
-  return /\b(?:no|not|never|neither|without|cannot|cant|wont|wouldnt|dont|doesnt|didnt|isnt|wasnt|shouldnt)\b/i.test(
-    value.replace(/[’']/g, ""),
-  );
+function normalizedMindText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
 }
 
 export function canonicalMindText(value: string): string {
-  return mindTextTokens(value).join(" ");
+  return normalizedMindText(value);
 }
 
 export function mindTextsNearDuplicate(left: string, right: string): boolean {
@@ -217,7 +178,6 @@ export function mindTextsNearDuplicate(left: string, right: string): boolean {
   const rightCanonical = canonicalMindText(right);
   if (!leftCanonical || !rightCanonical) return false;
   if (leftCanonical === rightCanonical) return true;
-  if (mindTextHasNegation(left) !== mindTextHasNegation(right)) return false;
   const leftTokens = new Set(leftCanonical.split(" "));
   const rightTokens = new Set(rightCanonical.split(" "));
   if (Math.min(leftTokens.size, rightTokens.size) < 2) return false;
