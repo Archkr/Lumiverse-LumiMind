@@ -157,7 +157,7 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(normalizeSettings({ characterCardDirectorMode: true, secondaryActorLimit: 0 }).secondaryActorLimit).toBe(1);
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("persona:1|director:0"));
-    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:2|persona:1|director:1"));
+    expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
   });
 

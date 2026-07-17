@@ -163,7 +163,7 @@ export function stableHash(input: string): string {
 }
 
 export function analysisPolicyHash(settings: LumiMindSettings): string {
-  const directorPolicy = settings.characterCardDirectorMode ? "director-policy:2|" : "";
+  const directorPolicy = settings.characterCardDirectorMode ? "director-policy:3|" : "";
   return stableHash(`${directorPolicy}persona:${settings.personaMindEnabled ? 1 : 0}|director:${settings.characterCardDirectorMode ? 1 : 0}`);
 }
 

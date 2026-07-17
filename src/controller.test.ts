@@ -98,6 +98,42 @@ describe("controller response parsing", () => {
     ]);
   });
 
+  it.each(["assistant", "character:card"])("preserves a portrayed NPC when its controller ref collides with %s", (collidingRef) => {
+    const analysis: ControllerAnalysis = {
+      actorMentions: [{
+        ref: collidingRef,
+        name: "Mira",
+        aliases: [],
+        kind: "character",
+        messageId: "m1",
+      }],
+      changes: [{
+        subjectRef: collidingRef,
+        category: "emotion",
+        operation: "add",
+        text: "Wary",
+        messageId: "m1",
+      }],
+    };
+    const result = applyControllerMindPolicy(analysis, [{
+      ref: "character:card",
+      name: "The Director",
+      aliases: [],
+      kind: "character",
+      managed: false,
+    }], {
+      ...DEFAULT_SETTINGS,
+      personaMindEnabled: false,
+      characterCardDirectorMode: true,
+    });
+    expect(result.actorMentions).toEqual([
+      expect.objectContaining({ ref: "Mira", name: "Mira", aliases: [], kind: "npc" }),
+    ]);
+    expect(result.changes).toEqual([
+      expect.objectContaining({ subjectRef: "Mira", text: "Wary" }),
+    ]);
+  });
+
   it("runs exactly one corrective pass for an empty substantive bootstrap", async () => {
     const quiet = vi.fn()
       .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })

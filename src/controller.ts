@@ -160,18 +160,51 @@ export function applyControllerMindPolicy(
   }
   if (settings.characterCardDirectorMode) excluded.add("assistant");
 
+  const remapCandidates = new Map<string, Set<string>>();
+  const ambiguousRemaps = new Set<string>();
   const actorMentions = analysis.actorMentions.flatMap((mention) => {
     const keys = [mention.ref, mention.name, ...(mention.aliases ?? [])].map(policyReference).filter(Boolean);
-    if (keys.some((key) => excluded.has(key)) || (!settings.personaMindEnabled && mention.kind === "persona")) {
+    const blockedKind = !settings.personaMindEnabled && mention.kind === "persona";
+    const safeName = [mention.name, ...(mention.aliases ?? [])]
+      .map((value) => value.trim())
+      .find((value) => value && !excluded.has(policyReference(value)));
+    const collidingKeys = keys.filter((key) => excluded.has(key));
+    if (blockedKind || (collidingKeys.length > 0 && !safeName)) {
+      for (const key of collidingKeys) ambiguousRemaps.add(key);
       for (const key of keys) excluded.add(key);
       return [];
     }
-    if (settings.characterCardDirectorMode && mention.kind === "character") {
-      return [{ ...mention, kind: "npc" as const }];
+
+    let normalized = mention;
+    if (collidingKeys.length > 0 && safeName) {
+      const safeRef = excluded.has(policyReference(mention.ref)) ? safeName : mention.ref;
+      normalized = {
+        ...mention,
+        ref: safeRef,
+        name: safeName,
+        aliases: (mention.aliases ?? []).filter((alias) => !excluded.has(policyReference(alias))),
+      };
+      for (const key of collidingKeys) {
+        const candidates = remapCandidates.get(key) ?? new Set<string>();
+        candidates.add(safeRef);
+        remapCandidates.set(key, candidates);
+      }
     }
-    return [mention];
+    if (settings.characterCardDirectorMode && normalized.kind === "character") {
+      return [{ ...normalized, kind: "npc" as const }];
+    }
+    return [normalized];
   });
-  const changes = analysis.changes.filter((change) => !excluded.has(policyReference(change.subjectRef)));
+  const remappedSubjects = new Map<string, string>();
+  for (const [key, candidates] of remapCandidates) {
+    if (!ambiguousRemaps.has(key) && candidates.size === 1) remappedSubjects.set(key, [...candidates][0]);
+  }
+  const changes = analysis.changes.flatMap((change) => {
+    const key = policyReference(change.subjectRef);
+    const remappedSubject = remappedSubjects.get(key);
+    if (remappedSubject) return [{ ...change, subjectRef: remappedSubject }];
+    return excluded.has(key) ? [] : [change];
+  });
   return { actorMentions, changes };
 }
 
