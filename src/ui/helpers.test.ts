@@ -134,7 +134,8 @@ describe("UI normalization", () => {
         acceptedActorMentions: 1,
         acceptedChanges: 2,
         duplicatesSuppressed: 1,
-        invalidChangesRejected: 0,
+        invalidChangesRejected: 2,
+        invalidChangeReasons: { unknown_subject: 2 },
       },
       retry: null,
       finalActorMentions: 1,
@@ -151,7 +152,13 @@ describe("UI normalization", () => {
         createdAt: 1,
         changeCount: 2,
         mentionCount: 1,
-        reduction: { duplicatesSuppressed: 2, entriesUpdated: 3, entriesSuperseded: 1, invalidChangesRejected: 4 },
+        reduction: {
+          duplicatesSuppressed: 2,
+          entriesUpdated: 3,
+          entriesSuperseded: 1,
+          invalidChangesRejected: 4,
+          invalidChangeReasons: { missing_target_id: 3, protected_target: 1 },
+        },
         controller: { provider: "openrouter", model: "model", dedicatedConnection: true, telemetry },
       }],
       minds: {},
@@ -160,7 +167,8 @@ describe("UI normalization", () => {
       duplicatesSuppressed: 3,
       entriesUpdated: 3,
       entriesSuperseded: 1,
-      invalidChangesRejected: 4,
+      invalidChangesRejected: 6,
+      invalidChangeReasons: { unknown_subject: 2, missing_target_id: 3, protected_target: 1 },
     });
   });
 });

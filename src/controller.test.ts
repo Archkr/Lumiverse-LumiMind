@@ -92,6 +92,55 @@ describe("controller response parsing", () => {
     });
   });
 
+  it("reports normalization and context rejection reasons without exposing mind content", async () => {
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({
+      actorMentions: [],
+      changes: [
+        {
+          subjectRef: "mira",
+          category: "goal",
+          operation: "update",
+          targetItemId: "seed:goal",
+          text: "Changed goal",
+          messageId: "m1",
+        },
+        {
+          subjectRef: "mira",
+          category: "emotion",
+          operation: "add",
+          text: "Wary",
+          messageId: "m1",
+        },
+        {
+          subjectRef: "mira",
+          category: "unsupported",
+          operation: "add",
+          text: "Malformed category",
+          messageId: "m1",
+        },
+      ],
+    }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "Mira becomes wary.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        items: [{ id: "seed:goal", locked: true, pinned: true, source: "seed" }],
+      }],
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    });
+
+    expect(result.analysis.changes).toHaveLength(1);
+    expect(result.telemetry.first).toMatchObject({
+      invalidChangesRejected: 2,
+      invalidChangeReasons: { invalid_category: 1, protected_target: 1 },
+    });
+  });
+
   it("merges corrective mentions while taking corrective state changes", () => {
     const first: ControllerAnalysis = {
       actorMentions: [{ ref: "aster", name: "Aster", messageId: "m1" }],

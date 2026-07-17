@@ -276,6 +276,7 @@ Open **Mind Lens → Settings → Diagnostics** to inspect:
 - aggregate actor, mind, and record counts;
 - raw-versus-normalized structured-output counts;
 - accepted mentions and mental-state changes;
+- privacy-safe rejection reasons for malformed, stale, unknown, missing-target, or protected changes;
 - corrective attempts and retry failures;
 - privacy-safe response lengths and hashes.
 
@@ -407,7 +408,7 @@ LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to 
 
 The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
 
-Diagnostics store counts, lengths, hashes, provider metadata, and warning codes—not raw controller responses or private story content.
+Diagnostics store counts, lengths, hashes, provider metadata, warning codes, and sanitized rejection reason codes—not raw controller responses or private story content.
 
 ---
 

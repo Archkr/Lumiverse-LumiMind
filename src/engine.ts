@@ -10,6 +10,7 @@ import {
   type ChatTimelineV1,
   type ControllerAnalysis,
   type EvidenceRef,
+  type InvalidMindChangeReason,
   type LumiMindSettings,
   type ManualOverride,
   type MindCategory,
@@ -508,7 +509,18 @@ function matchingMindItem(
 }
 
 function emptyReductionTelemetry(): MindReductionTelemetry {
-  return { duplicatesSuppressed: 0, entriesUpdated: 0, entriesSuperseded: 0, invalidChangesRejected: 0 };
+  return {
+    duplicatesSuppressed: 0,
+    entriesUpdated: 0,
+    entriesSuperseded: 0,
+    invalidChangesRejected: 0,
+    invalidChangeReasons: {},
+  };
+}
+
+function rejectMindChange(reduction: MindReductionTelemetry, reason: InvalidMindChangeReason): void {
+  reduction.invalidChangesRejected += 1;
+  reduction.invalidChangeReasons[reason] = (reduction.invalidChangeReasons[reason] ?? 0) + 1;
 }
 
 function itemFromDelta(delta: MindDelta): MindItem {
@@ -557,7 +569,7 @@ export function applyRecord(
     const target = targetIndex >= 0 ? mind.items[targetIndex] : null;
     if (target && protectedMindItem(target)) {
       if (delta.operation === "add") reduction.duplicatesSuppressed += 1;
-      else reduction.invalidChangesRejected += 1;
+      else rejectMindChange(reduction, "protected_target");
       continue;
     }
     if (delta.operation === "remove") {
@@ -565,7 +577,7 @@ export function applyRecord(
         mind.items.splice(targetIndex, 1);
         mind.lastUpdatedMessageId = delta.evidence.messageId;
       } else {
-        reduction.invalidChangesRejected += 1;
+        rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       }
       continue;
     }
@@ -580,12 +592,16 @@ export function applyRecord(
         mind.lastUpdatedMessageId = delta.evidence.messageId;
         reduction.entriesSuperseded += 1;
       } else {
-        reduction.invalidChangesRejected += 1;
+        rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       }
       continue;
     }
-    if (!delta.text.trim() || (delta.operation === "update" && targetIndex < 0)) {
-      reduction.invalidChangesRejected += 1;
+    if (!delta.text.trim()) {
+      rejectMindChange(reduction, "missing_text");
+      continue;
+    }
+    if (delta.operation === "update" && targetIndex < 0) {
+      rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       continue;
     }
     const next = itemFromDelta(delta);

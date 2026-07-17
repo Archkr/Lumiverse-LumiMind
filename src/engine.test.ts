@@ -236,7 +236,10 @@ describe("timeline reducer", () => {
     rebuildTimeline(timeline, [first]);
 
     expect(timeline.minds[actor.id].items).toEqual([]);
-    expect(invalidRecord.reduction).toMatchObject({ invalidChangesRejected: 1 });
+    expect(invalidRecord.reduction).toMatchObject({
+      invalidChangesRejected: 1,
+      invalidChangeReasons: { missing_target_id: 1 },
+    });
   });
 
   it("keeps protected seed and manual entries authoritative while compacting controller duplicates", () => {

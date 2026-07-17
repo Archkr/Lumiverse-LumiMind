@@ -105,11 +105,26 @@ export interface MindDelta {
   createdAt: number;
 }
 
+export type InvalidMindChangeReason =
+  | "missing_subject"
+  | "missing_message_id"
+  | "invalid_category"
+  | "invalid_operation"
+  | "missing_text"
+  | "missing_target_id"
+  | "message_outside_batch"
+  | "unknown_subject"
+  | "target_not_found"
+  | "protected_target";
+
+export type InvalidMindChangeReasonCounts = Partial<Record<InvalidMindChangeReason, number>>;
+
 export interface MindReductionTelemetry {
   duplicatesSuppressed: number;
   entriesUpdated: number;
   entriesSuperseded: number;
   invalidChangesRejected: number;
+  invalidChangeReasons: InvalidMindChangeReasonCounts;
 }
 
 export interface AnalysisRecord {
@@ -144,6 +159,7 @@ export interface ControllerResponseTelemetry {
   acceptedChanges: number;
   duplicatesSuppressed: number;
   invalidChangesRejected: number;
+  invalidChangeReasons: InvalidMindChangeReasonCounts;
 }
 
 export interface ControllerBatchTelemetry {

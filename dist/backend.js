@@ -405,7 +405,17 @@ function matchingMindItem(mind, delta) {
   return null;
 }
 function emptyReductionTelemetry() {
-  return { duplicatesSuppressed: 0, entriesUpdated: 0, entriesSuperseded: 0, invalidChangesRejected: 0 };
+  return {
+    duplicatesSuppressed: 0,
+    entriesUpdated: 0,
+    entriesSuperseded: 0,
+    invalidChangesRejected: 0,
+    invalidChangeReasons: {}
+  };
+}
+function rejectMindChange(reduction, reason) {
+  reduction.invalidChangesRejected += 1;
+  reduction.invalidChangeReasons[reason] = (reduction.invalidChangeReasons[reason] ?? 0) + 1;
 }
 function itemFromDelta(delta) {
   return {
@@ -448,7 +458,7 @@ function applyRecord(record, actors, minds) {
     const target = targetIndex >= 0 ? mind.items[targetIndex] : null;
     if (target && protectedMindItem(target)) {
       if (delta.operation === "add") reduction.duplicatesSuppressed += 1;
-      else reduction.invalidChangesRejected += 1;
+      else rejectMindChange(reduction, "protected_target");
       continue;
     }
     if (delta.operation === "remove") {
@@ -456,7 +466,7 @@ function applyRecord(record, actors, minds) {
         mind.items.splice(targetIndex, 1);
         mind.lastUpdatedMessageId = delta.evidence.messageId;
       } else {
-        reduction.invalidChangesRejected += 1;
+        rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       }
       continue;
     }
@@ -471,12 +481,16 @@ function applyRecord(record, actors, minds) {
         mind.lastUpdatedMessageId = delta.evidence.messageId;
         reduction.entriesSuperseded += 1;
       } else {
-        reduction.invalidChangesRejected += 1;
+        rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       }
       continue;
     }
-    if (!delta.text.trim() || delta.operation === "update" && targetIndex < 0) {
-      reduction.invalidChangesRejected += 1;
+    if (!delta.text.trim()) {
+      rejectMindChange(reduction, "missing_text");
+      continue;
+    }
+    if (delta.operation === "update" && targetIndex < 0) {
+      rejectMindChange(reduction, delta.targetItemId ? "target_not_found" : "missing_target_id");
       continue;
     }
     const next = itemFromDelta(delta);
@@ -1022,8 +1036,24 @@ function deduplicateControllerChanges(changes) {
   }
   return result;
 }
+function incrementInvalidReason(counts, reason) {
+  counts[reason] = (counts[reason] ?? 0) + 1;
+}
+function mergeInvalidReasons(...sources) {
+  const result = {};
+  for (const source of sources) {
+    for (const [reason, count] of Object.entries(source)) {
+      if (count > 0) result[reason] = (result[reason] ?? 0) + count;
+    }
+  }
+  return result;
+}
+function invalidReasonTotal(counts) {
+  return Object.values(counts).reduce((sum, count) => sum + (count ?? 0), 0);
+}
 function normalizeControllerAnalysisResult(value) {
   const raw = asObject2(value);
+  const invalidChangeReasons = {};
   const actorMentions = Array.isArray(raw.actorMentions) ? raw.actorMentions.flatMap((entry) => {
     const item = asObject2(entry);
     const name = text(item.name);
@@ -1048,9 +1078,12 @@ function normalizeControllerAnalysisResult(value) {
     const normalizedOperation = operation(item.operation);
     const normalizedText = text(item.text);
     const targetItemId = text(item.targetItemId) || null;
-    if (!subjectRef || !messageId || !normalizedCategory || !normalizedOperation) return [];
-    if ((normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText) return [];
-    if (normalizedOperation !== "add" && !targetItemId) return [];
+    const rejectionReason = !subjectRef ? "missing_subject" : !messageId ? "missing_message_id" : !normalizedCategory ? "invalid_category" : !normalizedOperation ? "invalid_operation" : (normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText ? "missing_text" : normalizedOperation !== "add" && !targetItemId ? "missing_target_id" : null;
+    if (rejectionReason) {
+      incrementInvalidReason(invalidChangeReasons, rejectionReason);
+      return [];
+    }
+    if (!normalizedCategory || !normalizedOperation) return [];
     const dimensions = {};
     for (const [key, value2] of Object.entries(asObject2(item.dimensions))) {
       dimensions[key] = Math.min(1, Math.max(-1, numberValue(value2, 0)));
@@ -1075,7 +1108,8 @@ function normalizeControllerAnalysisResult(value) {
   return {
     analysis: { actorMentions, changes: deduplicatedChanges },
     duplicatesSuppressed: changes.length - deduplicatedChanges.length,
-    invalidChangesRejected: (Array.isArray(raw.changes) ? raw.changes.length : 0) - changes.length
+    invalidChangesRejected: invalidReasonTotal(invalidChangeReasons),
+    invalidChangeReasons
   };
 }
 function policyReference(value) {
@@ -1160,19 +1194,31 @@ function validateControllerAnalysisContext(analysis, messages, compactState) {
       if (key && !actorByReference.has(key)) actorByReference.set(key, actor);
     }
   }
-  let invalidChangesRejected = 0;
+  const invalidChangeReasons = {};
   const changes = analysis.changes.flatMap((change) => {
     const actor = actorByReference.get(policyReference(change.subjectRef));
-    if (!messageIds.has(change.messageId) || !actor) {
-      invalidChangesRejected += 1;
+    if (!messageIds.has(change.messageId)) {
+      incrementInvalidReason(invalidChangeReasons, "message_outside_batch");
+      return [];
+    }
+    if (!actor) {
+      incrementInvalidReason(invalidChangeReasons, "unknown_subject");
       return [];
     }
     if (change.operation !== "add") {
       const targetItemId = change.targetItemId?.trim();
+      if (!targetItemId) {
+        incrementInvalidReason(invalidChangeReasons, "missing_target_id");
+        return [];
+      }
       const target = (Array.isArray(actor.items) ? actor.items : []).map(asObject2).find((item) => text(item.id) === targetItemId);
+      if (!target) {
+        incrementInvalidReason(invalidChangeReasons, "target_not_found");
+        return [];
+      }
       const protectedTarget = target && (target.locked === true || target.pinned === true || text(target.source) !== "" && text(target.source) !== "controller");
-      if (!targetItemId || !target || protectedTarget) {
-        invalidChangesRejected += 1;
+      if (protectedTarget) {
+        incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
       }
     }
@@ -1183,7 +1229,11 @@ function validateControllerAnalysisContext(analysis, messages, compactState) {
       concealedFromRefs: knownReferences(change.concealedFromRefs)
     }];
   });
-  return { analysis: { actorMentions, changes }, invalidChangesRejected };
+  return {
+    analysis: { actorMentions, changes },
+    invalidChangesRejected: invalidReasonTotal(invalidChangeReasons),
+    invalidChangeReasons
+  };
 }
 function isNontrivialAnalysisBatch(messages) {
   const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
@@ -1202,7 +1252,8 @@ function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}
     acceptedActorMentions: accepted.actorMentions.length,
     acceptedChanges: accepted.changes.length,
     duplicatesSuppressed,
-    invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed)
+    invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed),
+    invalidChangeReasons: diagnostics.invalidChangeReasons ?? {}
   };
 }
 function mergeControllerAnalyses(first, corrective) {
@@ -1435,7 +1486,8 @@ async function analyzeMessages(input) {
   const firstAnalysis = validatedFirst.analysis;
   const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirst.analysis, {
     duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
-    invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected
+    invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
+    invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons)
   });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
@@ -1462,7 +1514,8 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
       const correctiveAnalysis = validatedCorrective.analysis;
       retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrective.analysis, {
         duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
-        invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected
+        invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
+        invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons)
       });
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);

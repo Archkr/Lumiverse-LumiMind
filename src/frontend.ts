@@ -368,6 +368,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
             entriesUpdated: quality.entriesUpdated,
             entriesSuperseded: quality.entriesSuperseded,
             invalidChangesRejected: quality.invalidChangesRejected,
+            invalidChangeReasons: quality.invalidChangeReasons,
             warningCodes: quality.warningCodes,
             legacyEmptyResult: quality.legacyEmptyResult,
             needsAttention: quality.needsAttention,

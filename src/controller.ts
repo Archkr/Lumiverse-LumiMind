@@ -9,6 +9,8 @@ import type {
   ControllerChange,
   ControllerResponseTelemetry,
   ControllerWarningCode,
+  InvalidMindChangeReason,
+  InvalidMindChangeReasonCounts,
   LumiMindSettings,
   MindCategory,
   MindOperation,
@@ -121,10 +123,30 @@ interface ControllerNormalizationResult {
   analysis: ControllerAnalysis;
   duplicatesSuppressed: number;
   invalidChangesRejected: number;
+  invalidChangeReasons: InvalidMindChangeReasonCounts;
+}
+
+function incrementInvalidReason(counts: InvalidMindChangeReasonCounts, reason: InvalidMindChangeReason): void {
+  counts[reason] = (counts[reason] ?? 0) + 1;
+}
+
+function mergeInvalidReasons(...sources: InvalidMindChangeReasonCounts[]): InvalidMindChangeReasonCounts {
+  const result: InvalidMindChangeReasonCounts = {};
+  for (const source of sources) {
+    for (const [reason, count] of Object.entries(source) as Array<[InvalidMindChangeReason, number]>) {
+      if (count > 0) result[reason] = (result[reason] ?? 0) + count;
+    }
+  }
+  return result;
+}
+
+function invalidReasonTotal(counts: InvalidMindChangeReasonCounts): number {
+  return Object.values(counts).reduce((sum, count) => sum + (count ?? 0), 0);
 }
 
 function normalizeControllerAnalysisResult(value: unknown): ControllerNormalizationResult {
   const raw = asObject(value);
+  const invalidChangeReasons: InvalidMindChangeReasonCounts = {};
   const actorMentions: ControllerActorMention[] = Array.isArray(raw.actorMentions)
     ? raw.actorMentions.flatMap((entry) => {
         const item = asObject(entry);
@@ -152,9 +174,24 @@ function normalizeControllerAnalysisResult(value: unknown): ControllerNormalizat
         const normalizedOperation = operation(item.operation);
         const normalizedText = text(item.text);
         const targetItemId = text(item.targetItemId) || null;
-        if (!subjectRef || !messageId || !normalizedCategory || !normalizedOperation) return [];
-        if ((normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText) return [];
-        if (normalizedOperation !== "add" && !targetItemId) return [];
+        const rejectionReason: InvalidMindChangeReason | null = !subjectRef
+          ? "missing_subject"
+          : !messageId
+            ? "missing_message_id"
+            : !normalizedCategory
+              ? "invalid_category"
+              : !normalizedOperation
+                ? "invalid_operation"
+                : (normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText
+                  ? "missing_text"
+                  : normalizedOperation !== "add" && !targetItemId
+                    ? "missing_target_id"
+                    : null;
+        if (rejectionReason) {
+          incrementInvalidReason(invalidChangeReasons, rejectionReason);
+          return [];
+        }
+        if (!normalizedCategory || !normalizedOperation) return [];
         const dimensions: Record<string, number> = {};
         for (const [key, value] of Object.entries(asObject(item.dimensions))) {
           dimensions[key] = Math.min(1, Math.max(-1, numberValue(value, 0)));
@@ -180,7 +217,8 @@ function normalizeControllerAnalysisResult(value: unknown): ControllerNormalizat
   return {
     analysis: { actorMentions, changes: deduplicatedChanges },
     duplicatesSuppressed: changes.length - deduplicatedChanges.length,
-    invalidChangesRejected: (Array.isArray(raw.changes) ? raw.changes.length : 0) - changes.length,
+    invalidChangesRejected: invalidReasonTotal(invalidChangeReasons),
+    invalidChangeReasons,
   };
 }
 
@@ -264,6 +302,7 @@ export function applyControllerMindPolicy(
 interface ControllerContextValidationResult {
   analysis: ControllerAnalysis;
   invalidChangesRejected: number;
+  invalidChangeReasons: InvalidMindChangeReasonCounts;
 }
 
 function validateControllerAnalysisContext(
@@ -290,23 +329,35 @@ function validateControllerAnalysisContext(
     }
   }
 
-  let invalidChangesRejected = 0;
+  const invalidChangeReasons: InvalidMindChangeReasonCounts = {};
   const changes = analysis.changes.flatMap((change) => {
     const actor = actorByReference.get(policyReference(change.subjectRef));
-    if (!messageIds.has(change.messageId) || !actor) {
-      invalidChangesRejected += 1;
+    if (!messageIds.has(change.messageId)) {
+      incrementInvalidReason(invalidChangeReasons, "message_outside_batch");
+      return [];
+    }
+    if (!actor) {
+      incrementInvalidReason(invalidChangeReasons, "unknown_subject");
       return [];
     }
     if (change.operation !== "add") {
       const targetItemId = change.targetItemId?.trim();
+      if (!targetItemId) {
+        incrementInvalidReason(invalidChangeReasons, "missing_target_id");
+        return [];
+      }
       const target = (Array.isArray(actor.items) ? actor.items : [])
         .map(asObject)
         .find((item) => text(item.id) === targetItemId);
+      if (!target) {
+        incrementInvalidReason(invalidChangeReasons, "target_not_found");
+        return [];
+      }
       const protectedTarget = target && (
         target.locked === true || target.pinned === true || (text(target.source) !== "" && text(target.source) !== "controller")
       );
-      if (!targetItemId || !target || protectedTarget) {
-        invalidChangesRejected += 1;
+      if (protectedTarget) {
+        incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
       }
     }
@@ -317,7 +368,11 @@ function validateControllerAnalysisContext(
       concealedFromRefs: knownReferences(change.concealedFromRefs),
     }];
   });
-  return { analysis: { actorMentions, changes }, invalidChangesRejected };
+  return {
+    analysis: { actorMentions, changes },
+    invalidChangesRejected: invalidReasonTotal(invalidChangeReasons),
+    invalidChangeReasons,
+  };
 }
 
 export function isNontrivialAnalysisBatch(messages: ChatMessageLike[]): boolean {
@@ -330,7 +385,7 @@ export function makeControllerResponseTelemetry(
   raw: string,
   parsed: unknown,
   accepted: ControllerAnalysis,
-  diagnostics: Partial<Pick<ControllerResponseTelemetry, "duplicatesSuppressed" | "invalidChangesRejected">> = {},
+  diagnostics: Partial<Pick<ControllerResponseTelemetry, "duplicatesSuppressed" | "invalidChangesRejected" | "invalidChangeReasons">> = {},
 ): ControllerResponseTelemetry {
   const object = asObject(parsed);
   const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
@@ -344,6 +399,7 @@ export function makeControllerResponseTelemetry(
     acceptedChanges: accepted.changes.length,
     duplicatesSuppressed,
     invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed),
+    invalidChangeReasons: diagnostics.invalidChangeReasons ?? {},
   };
 }
 
@@ -595,6 +651,7 @@ export async function analyzeMessages(input: {
   const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirst.analysis, {
     duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
     invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
+    invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons),
   });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   let finalAnalysis = firstAnalysis;
@@ -621,6 +678,7 @@ export async function analyzeMessages(input: {
       retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrective.analysis, {
         duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
         invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
+        invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons),
       });
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);

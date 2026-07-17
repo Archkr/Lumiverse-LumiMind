@@ -208,6 +208,14 @@ function summarizeTimelineQuality(timeline) {
   const responses = batches.flatMap((batch) => [batch.first, ...batch.retry ? [batch.retry] : []]);
   const reducerDuplicates = records.reduce((sum, record) => sum + (record.reduction?.duplicatesSuppressed ?? 0), 0);
   const reducerInvalid = records.reduce((sum, record) => sum + (record.reduction?.invalidChangesRejected ?? 0), 0);
+  const invalidChangeReasons = {};
+  const addInvalidReasons = (source) => {
+    for (const [reason, count] of Object.entries(source ?? {})) {
+      if (count > 0) invalidChangeReasons[reason] = (invalidChangeReasons[reason] ?? 0) + count;
+    }
+  };
+  for (const response of responses) addInvalidReasons(response.invalidChangeReasons);
+  for (const record of records) addInvalidReasons(record.reduction?.invalidChangeReasons);
   const entryCount = timeline ? Object.values(timeline.minds).reduce((sum, mind) => sum + mind.items.length, 0) : 0;
   const legacyEmptyResult = records.length > 0 && batches.length === 0 && acceptedChanges === 0 && entryCount === 0;
   return {
@@ -224,6 +232,7 @@ function summarizeTimelineQuality(timeline) {
     entriesUpdated: records.reduce((sum, record) => sum + (record.reduction?.entriesUpdated ?? 0), 0),
     entriesSuperseded: records.reduce((sum, record) => sum + (record.reduction?.entriesSuperseded ?? 0), 0),
     invalidChangesRejected: responses.reduce((sum, response) => sum + (response.invalidChangesRejected ?? 0), 0) + reducerInvalid,
+    invalidChangeReasons,
     warningCodes: [...warningCodes],
     legacyEmptyResult,
     needsAttention: warningCodes.size > 0 || legacyEmptyResult,
@@ -857,6 +866,7 @@ function setup(ctx) {
             entriesUpdated: quality.entriesUpdated,
             entriesSuperseded: quality.entriesSuperseded,
             invalidChangesRejected: quality.invalidChangesRejected,
+            invalidChangeReasons: quality.invalidChangeReasons,
             warningCodes: quality.warningCodes,
             legacyEmptyResult: quality.legacyEmptyResult,
             needsAttention: quality.needsAttention
