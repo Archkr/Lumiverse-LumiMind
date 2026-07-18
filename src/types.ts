@@ -3,6 +3,7 @@ export const ANALYSIS_SCHEMA_VERSION = 1 as const;
 export const EXTENSION_KEY = "lumi_mind" as const;
 
 export type ActorKind = "character" | "persona" | "npc";
+export type CortexLinkResolution = "source" | "target";
 export type MindCategory = "belief" | "secret" | "goal" | "plan" | "emotion" | "relationship" | "awareness";
 export type MindOperation = "add" | "update" | "resolve" | "abandon" | "remove";
 export type MindItemStatus = "active" | "resolved" | "abandoned" | "uncertain";
@@ -212,6 +213,7 @@ export interface ChatTimelineV1 {
   health: TimelineHealth;
   error: string | null;
   actors: Record<string, ActorRecord>;
+  suppressedCortexEntityIds: string[];
   baseMinds: Record<string, ActorMind>;
   minds: Record<string, ActorMind>;
   records: AnalysisRecord[];
@@ -355,7 +357,7 @@ export type FrontendToBackend =
   | { type: "remove_alias"; chatId: string; actorId: string; alias: string }
   | { type: "confirm_actor"; chatId: string; actorId: string }
   | { type: "remove_actor"; chatId: string; actorId: string }
-  | { type: "merge_actor"; chatId: string; sourceActorId: string; targetActorId: string }
+  | { type: "merge_actor"; chatId: string; sourceActorId: string; targetActorId: string; cortexLink?: CortexLinkResolution }
   | { type: "split_actor"; chatId: string; actorId: string; name: string }
   | { type: "add_item"; chatId: string; actorId: string; category: MindCategory; text: string }
   | { type: "edit_core"; chatId: string; actorId: string; core: MindCore }

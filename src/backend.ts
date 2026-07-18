@@ -8,7 +8,9 @@ import {
   analysisPolicyHash,
   buildProjectedDirectorMindInjection,
   buildProjectedMindInjection,
+  clearCortexBindings,
   compactStateForController,
+  confirmActor,
   createCheckpointTimeline,
   createTimeline,
   limitChatHistoryMessages,
@@ -24,6 +26,7 @@ import {
   normalizeTimeline,
   overrideItem,
   rebuildTimeline,
+  reconcileCortexIdentities,
   removeActor,
   removeManualItem,
   resolveActorId,
@@ -126,6 +129,7 @@ function timelineFromDatabaseArchive(value: unknown): ChatTimelineV1 {
 }
 
 function remapImportedTimeline(source: ChatTimelineV1, targetChatId: string, targetMessages: ChatMessageLike[]): ChatTimelineV1 {
+  const crossChat = source.chatId !== targetChatId;
   const imported = cloneJson(source);
   const targetByIndex = new Map(targetMessages.map((message) => [message.index_in_chat ?? 0, message]));
   imported.chatId = targetChatId;
@@ -150,6 +154,7 @@ function remapImportedTimeline(source: ChatTimelineV1, targetChatId: string, tar
   imported.updatedAt = Date.now();
   imported.health = imported.paused ? "paused" : "ready";
   imported.error = null;
+  if (crossChat) clearCortexBindings(imported);
   rebuildTimeline(imported, targetMessages);
   return imported;
 }
@@ -425,22 +430,54 @@ async function initializeHostActors(timeline: ChatTimelineV1, userId: string): P
       timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seedFromPersona(persona));
     }
   }
-  const settings = await getSettings(userId);
-  if (settings.cortexImportEnabled && permissions.memories) {
-    const entities = await spindle.memories.entities.list(timeline.chatId, { activeOnly: false, limit: 250, userId }).catch(() => []);
-    for (const entity of entities) {
-      if (entity.entityType !== "character") continue;
-      upsertActor(timeline, {
-        kind: "npc",
-        name: entity.name,
-        aliases: entity.aliases,
-        cortexEntityId: entity.id,
-        confidence: entity.confidence === "confirmed" ? 1 : 0.65,
-        confirmed: entity.confidence === "confirmed",
-      });
-    }
-  }
+  await refreshCortexBridge(timeline, userId);
   rebuildTimeline(timeline, []);
+}
+
+async function refreshCortexBridge(timeline: ChatTimelineV1, userId: string): Promise<void> {
+  const settings = await getSettings(userId);
+  if (!settings.cortexImportEnabled || !hasPermission("memories")) return;
+  let entities: Awaited<ReturnType<typeof spindle.memories.entities.list>>;
+  try {
+    entities = await spindle.memories.entities.list(timeline.chatId, { activeOnly: false, limit: 250, userId });
+  } catch {
+    return;
+  }
+
+  const byId = new Map(entities.map((entity) => [entity.id, entity]));
+  const unavailableLinkedIds = new Set<string>();
+  const missingLinkedIds = uniqueStrings(Object.values(timeline.actors)
+    .map((actor) => actor.cortexEntityId ?? "")
+    .filter((id) => id && !byId.has(id)));
+  await Promise.all(missingLinkedIds.map(async (entityId) => {
+    try {
+      const entity = await spindle.memories.entities.get(entityId, userId);
+      if (entity) byId.set(entity.id, entity);
+    } catch {
+      unavailableLinkedIds.add(entityId);
+    }
+  }));
+
+  const identities = [...byId.values()]
+    .filter((entity) => entity.entityType === "character")
+    .map((entity) => ({
+      id: entity.id,
+      name: entity.name,
+      aliases: entity.aliases,
+      confidence: entity.confidence === "confirmed" ? 1 : 0.65,
+      confirmed: entity.confidence === "confirmed",
+    }));
+  for (const entityId of unavailableLinkedIds) {
+    const actor = Object.values(timeline.actors).find((candidate) => candidate.cortexEntityId === entityId);
+    if (actor) identities.push({
+      id: entityId,
+      name: actor.canonicalName,
+      aliases: actor.aliases,
+      confidence: actor.confidence,
+      confirmed: actor.confirmed,
+    });
+  }
+  reconcileCortexIdentities(timeline, identities);
 }
 
 async function ensurePersonaActor(timeline: ChatTimelineV1, personaId: string, userId: string): Promise<ActorRecord> {
@@ -495,6 +532,7 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   if (force) rebuildRequests.delete(key);
   if (pauseRequests.has(key) || (!force && rebuildRequests.has(key))) return;
   const timeline = await getTimeline(chatId, userId);
+  await refreshCortexBridge(timeline, userId);
   const settings = await getSettings(userId);
   const policyHash = analysisPolicyHash(settings);
   const policyChanged = timeline.analysisPolicyHash !== policyHash;
@@ -675,6 +713,7 @@ async function writeActorToCortex(userId: string, timeline: ChatTimelineV1, acto
     { userId },
   );
   actor.cortexEntityId = entity.id;
+  timeline.suppressedCortexEntityIds = (timeline.suppressedCortexEntityIds ?? []).filter((id) => id !== entity.id);
   actor.updatedAt = Date.now();
 }
 
@@ -746,6 +785,8 @@ async function cloneFork(payload: unknown, eventUserId?: string): Promise<void> 
     serialized.updatedAt = Date.now();
     serialized.health = serialized.paused ? "paused" : "ready";
     serialized.error = null;
+    clearCortexBindings(serialized);
+    await refreshCortexBridge(serialized, userId);
     rebuildTimeline(serialized, forkMessages);
     timelines.set(storageTimelineKey(userId, forkedChatId), serialized);
     await persistAndPublish(serialized, userId, false);
@@ -882,6 +923,18 @@ for (const event of ["MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWI
 
 onEvent("CHAT_FORKED", (payload, eventUserId) => { void cloneFork(payload, eventUserId); });
 
+for (const event of ["CORTEX_INGESTION_PROGRESS", "CORTEX_REBUILD_PROGRESS"] as const) {
+  onEvent(event, (payload, eventUserId) => {
+    const raw = asObject(payload);
+    if (raw.status !== "complete" && raw.phase !== "complete") return;
+    const chatId = extractChatId(payload);
+    const userId = resolveUserId(chatId, eventUserId);
+    if (!chatId || !userId) return;
+    rememberChatUser(chatId, userId);
+    scheduleReconcile(userId, chatId, 100);
+  });
+}
+
 onEvent("CHAT_DELETED", (payload, eventUserId) => {
   const chatId = extractChatId(payload) ?? readString(payload, ["id"]);
   const userId = resolveUserId(chatId, eventUserId);
@@ -899,6 +952,8 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
 spindle.permissions.onChanged(() => {
   if (!lastFrontendUserId) return;
   void sendState(lastFrontendUserId);
+  const chatId = activeChats.get(lastFrontendUserId)?.chatId;
+  if (chatId) scheduleReconcile(lastFrontendUserId, chatId, 0);
 });
 
 spindle.onFrontendMessage(async (payload, userId) => {
@@ -912,9 +967,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
     const timeline = chatId ? await getTimeline(chatId, userId) : null;
     await publishScene(userId, timeline);
     await sendState(userId, chatId, characterId);
-    if (timeline?.active && timeline.analysisPolicyHash !== analysisPolicyHash(await getSettings(userId))) {
-      scheduleReconcile(userId, timeline.chatId, 0);
-    }
+    if (timeline?.active) scheduleReconcile(userId, timeline.chatId, 0);
     return;
   }
   try {
@@ -937,6 +990,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const imported = message.mode === "full"
           ? remapImportedTimeline(source, message.chatId, targetMessages)
           : createCheckpointTimeline(source, message.chatId);
+        await refreshCortexBridge(imported, userId);
         imported.analysisPolicyHash = analysisPolicyHash(await getSettings(userId));
         pauseRequests.delete(cacheKey(userId, message.chatId));
         rebuildRequests.delete(cacheKey(userId, message.chatId));
@@ -1005,11 +1059,15 @@ spindle.onFrontendMessage(async (payload, userId) => {
       settingsCache.set(userId, next);
       const roleplayModeChanged = previous.personaMindEnabled !== next.personaMindEnabled
         || previous.characterCardDirectorMode !== next.characterCardDirectorMode;
+      const cortexImportChanged = previous.cortexImportEnabled !== next.cortexImportEnabled;
       await publishScene(userId);
       await sendState(userId, message.chatId);
       if (roleplayModeChanged && message.chatId) {
         const timeline = await getTimeline(message.chatId, userId);
         if (timeline.active) scheduleReconcile(userId, message.chatId, 0);
+      }
+      if (cortexImportChanged && next.cortexImportEnabled && message.chatId) {
+        scheduleReconcile(userId, message.chatId, 0);
       }
       notice(userId, "success", roleplayModeChanged
         ? "LumiMind settings saved. Activated timelines will rebuild for the new roleplay mode when opened."
@@ -1047,11 +1105,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== removed.toLocaleLowerCase());
         actor.updatedAt = Date.now();
       } else if (message.type === "confirm_actor") {
-        const actor = timeline.actors[message.actorId];
-        if (!actor) throw new Error("Actor not found.");
-        actor.confirmed = true;
-        actor.confidence = 1;
-        if ((await getSettings(userId)).cortexWritebackEnabled) await writeActorToCortex(userId, timeline, actor);
+        if (!confirmActor(timeline, message.actorId)) throw new Error("Actor not found.");
       } else if (message.type === "writeback_actor") {
         const actor = timeline.actors[message.actorId];
         if (!actor) throw new Error("Actor not found.");
@@ -1059,7 +1113,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       } else if (message.type === "remove_actor") {
         if (!removeActor(timeline, message.actorId)) throw new Error("Actor not found.");
       } else if (message.type === "merge_actor") {
-        if (!mergeActors(timeline, message.sourceActorId, message.targetActorId)) throw new Error("Could not merge those actors.");
+        if (!mergeActors(timeline, message.sourceActorId, message.targetActorId, message.cortexLink)) {
+          throw new Error("Could not merge those actors. Choose which Cortex identity to keep when both actors are linked.");
+        }
       } else if (message.type === "split_actor") {
         if (!splitActor(timeline, message.actorId, message.name)) throw new Error("Could not split this actor.");
       } else if (message.type === "add_item") {

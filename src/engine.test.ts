@@ -7,7 +7,9 @@ import {
   buildMindInjection,
   buildProjectedMindInjection,
   canonicalMindText,
+  clearCortexBindings,
   compactStateForController,
+  confirmActor,
   createCheckpointTimeline,
   createTimeline,
   limitChatHistoryMessages,
@@ -24,6 +26,8 @@ import {
   overrideItem,
   projectControllerState,
   rebuildTimeline,
+  reconcileCortexIdentities,
+  removeActor,
   resolveActorId,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
@@ -101,6 +105,105 @@ describe("actor registry", () => {
     expect(timeline.actors[card.id].aliases).toEqual(expect.arrayContaining(["The Scholar", "Ash"]));
   });
 
+  it("confirms an actor without changing or creating a Cortex link", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira", confidence: 0.6, confirmed: false });
+
+    expect(confirmActor(timeline, actor.id)).toBe(true);
+    expect(actor).toMatchObject({ confirmed: true, confidence: 1, cortexEntityId: null });
+  });
+
+  it("refreshes Cortex identities while preserving local names and alias suppression", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira Prime", aliases: ["Mira", "Scout"] });
+    actor.suppressedAliases = ["Scout"];
+    actor.aliases = ["Mira"];
+
+    reconcileCortexIdentities(timeline, [{
+      id: "entity-mira",
+      name: "Mira",
+      aliases: ["Scout", "Seer"],
+      confidence: 1,
+      confirmed: true,
+    }]);
+
+    expect(actor.canonicalName).toBe("Mira Prime");
+    expect(actor.aliases).toEqual(expect.arrayContaining(["Mira", "Seer"]));
+    expect(actor.aliases).not.toContain("Scout");
+    expect(actor.cortexEntityId).toBe("entity-mira");
+
+    reconcileCortexIdentities(timeline, []);
+    expect(actor.cortexEntityId).toBeNull();
+  });
+
+  it("does not re-import a removed Cortex identity", () => {
+    const timeline = createTimeline("chat");
+    const identity = { id: "entity-mira", name: "Mira", aliases: [], confidence: 1, confirmed: true };
+    reconcileCortexIdentities(timeline, [identity]);
+    const actor = Object.values(timeline.actors).find((candidate) => candidate.cortexEntityId === identity.id)!;
+
+    expect(removeActor(timeline, actor.id)).toBe(true);
+    expect(timeline.suppressedCortexEntityIds).toEqual([identity.id]);
+    reconcileCortexIdentities(timeline, [identity]);
+
+    expect(Object.values(timeline.actors).some((candidate) => candidate.cortexEntityId === identity.id)).toBe(false);
+  });
+
+  it("reattaches a Cortex identity only when its local match is unambiguous", () => {
+    const timeline = createTimeline("chat");
+    const first = upsertActor(timeline, { kind: "npc", name: "Mira", aliases: ["Captain"] });
+    const second = upsertActor(timeline, { kind: "npc", name: "Rin", aliases: ["Captain"] });
+
+    reconcileCortexIdentities(timeline, [{
+      id: "entity-captain",
+      name: "Captain",
+      aliases: [],
+      confidence: 0.65,
+      confirmed: false,
+    }]);
+
+    expect(first.cortexEntityId).toBeNull();
+    expect(second.cortexEntityId).toBeNull();
+    expect(timeline.actors["cortex:entity-captain"].cortexEntityId).toBe("entity-captain");
+  });
+
+  it("does not guess when one local actor matches multiple Cortex identities", () => {
+    const timeline = createTimeline("chat");
+    const local = upsertActor(timeline, { kind: "npc", name: "Mira" });
+
+    reconcileCortexIdentities(timeline, [
+      { id: "entity-one", name: "Mira", aliases: [], confidence: 0.65, confirmed: false },
+      { id: "entity-two", name: "Mira", aliases: [], confidence: 0.65, confirmed: false },
+    ]);
+
+    expect(local.cortexEntityId).toBeNull();
+    expect(timeline.actors["cortex:entity-one"].cortexEntityId).toBe("entity-one");
+    expect(timeline.actors["cortex:entity-two"].cortexEntityId).toBe("entity-two");
+  });
+
+  it("requires an explicit local Cortex-link choice when merging linked actors", () => {
+    const timeline = createTimeline("chat");
+    const source = upsertActor(timeline, { kind: "npc", name: "Mira", cortexEntityId: "entity-source" });
+    const target = upsertActor(timeline, { kind: "npc", name: "Rin", cortexEntityId: "entity-target" });
+
+    expect(mergeActors(timeline, source.id, target.id)).toBe(false);
+    expect(timeline.actors[source.id]).toBeDefined();
+    expect(mergeActors(timeline, source.id, target.id, "target")).toBe(true);
+    expect(timeline.actors[target.id].cortexEntityId).toBe("entity-target");
+    expect(timeline.suppressedCortexEntityIds).toEqual(["entity-source"]);
+  });
+
+  it("clears Cortex links and suppressions when moving a timeline between chats", () => {
+    const timeline = createTimeline("source");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira", cortexEntityId: "source-entity" });
+    timeline.suppressedCortexEntityIds = ["source-hidden"];
+
+    clearCortexBindings(timeline);
+
+    expect(actor.cortexEntityId).toBeNull();
+    expect(timeline.suppressedCortexEntityIds).toEqual([]);
+  });
+
   it("keeps a deliberately removed alias suppressed across analysis replay", () => {
     const timeline = createTimeline("chat");
     const actor = upsertActor(timeline, { kind: "npc", name: "Mira", aliases: ["Scout"] });
@@ -148,8 +251,11 @@ describe("actor registry", () => {
   it("migrates controller-discovered character-shaped actors to timeline-local NPCs", () => {
     const timeline = createTimeline("chat");
     const legacy = upsertActor(timeline, { kind: "character", name: "Mira" });
-    const normalized = normalizeTimeline(JSON.parse(JSON.stringify(timeline)), timeline.chatId);
+    const serialized = JSON.parse(JSON.stringify(timeline)) as Record<string, unknown>;
+    delete serialized.suppressedCortexEntityIds;
+    const normalized = normalizeTimeline(serialized, timeline.chatId);
     expect(normalized.actors[legacy.id]).toMatchObject({ kind: "npc", characterId: null });
+    expect(normalized.suppressedCortexEntityIds).toEqual([]);
 
     const fresh = createTimeline("fresh");
     const first = message("m1", 0, "Mira watched the door.");
@@ -461,7 +567,8 @@ describe("hashing, settings, and compaction", () => {
   it("creates a sequel checkpoint from the exported folded state", () => {
     const source = createTimeline("source");
     source.active = true;
-    const actor = upsertActor(source, { kind: "npc", name: "Mira" });
+    const actor = upsertActor(source, { kind: "npc", name: "Mira", cortexEntityId: "source-entity" });
+    source.suppressedCortexEntityIds = ["source-hidden"];
     addManualItem(source, actor.id, "goal", "Reach the northern city");
     rebuildTimeline(source, []);
 
@@ -470,6 +577,8 @@ describe("hashing, settings, and compaction", () => {
     expect(checkpoint).toMatchObject({ chatId: "sequel", active: true, records: [], manualOverrides: [] });
     expect(checkpoint.baseMinds[actor.id].items[0].text).toBe("Reach the northern city");
     expect(checkpoint.minds[actor.id].items[0].text).toBe("Reach the northern city");
+    expect(checkpoint.actors[actor.id].cortexEntityId).toBeNull();
+    expect(checkpoint.suppressedCortexEntityIds).toEqual([]);
   });
 
   it("replays 500+ messages for 12 actors deterministically and projects without deleting state", async () => {

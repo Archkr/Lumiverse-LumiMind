@@ -9,6 +9,7 @@ import {
   type ChatMessageLike,
   type ChatTimelineV1,
   type ControllerAnalysis,
+  type CortexLinkResolution,
   type EvidenceRef,
   type InvalidMindChangeReason,
   type LumiMindSettings,
@@ -394,6 +395,7 @@ export function createTimeline(chatId: string): ChatTimelineV1 {
     health: "inactive",
     error: null,
     actors: {},
+    suppressedCortexEntityIds: [],
     baseMinds: {},
     minds: {},
     records: [],
@@ -428,6 +430,11 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     paused: raw.paused === true,
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
     actors,
+    suppressedCortexEntityIds: uniqueStrings(
+      Array.isArray(raw.suppressedCortexEntityIds)
+        ? raw.suppressedCortexEntityIds.filter((id): id is string => typeof id === "string")
+        : [],
+    ),
     baseMinds: asObject(raw.baseMinds) as Record<string, ActorMind>,
     minds: asObject(raw.minds) as Record<string, ActorMind>,
     records: Array.isArray(raw.records) ? (raw.records as AnalysisRecord[]) : [],
@@ -496,6 +503,102 @@ export function upsertActor(
   return actor;
 }
 
+export interface CortexIdentityInput {
+  id: string;
+  name: string;
+  aliases: string[];
+  confidence: number;
+  confirmed: boolean;
+}
+
+function attachCortexIdentity(actor: ActorRecord, identity: CortexIdentityInput): void {
+  actor.suppressedAliases ??= [];
+  const suppressedAliases = new Set(actor.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
+  actor.aliases = uniqueStrings([
+    ...actor.aliases,
+    ...identity.aliases,
+    ...(actor.canonicalName.toLocaleLowerCase() !== identity.name.toLocaleLowerCase() ? [identity.name] : []),
+  ]).filter((alias) => !suppressedAliases.has(alias.toLocaleLowerCase()));
+  actor.cortexEntityId = identity.id;
+  actor.confidence = Math.max(actor.confidence, clamp(identity.confidence, 0, 1, actor.confidence));
+  actor.confirmed = actor.confirmed || identity.confirmed;
+  actor.updatedAt = Date.now();
+}
+
+/** Clear chat-scoped Cortex bindings before moving a timeline into another chat. */
+export function clearCortexBindings(timeline: ChatTimelineV1): void {
+  for (const actor of Object.values(timeline.actors)) actor.cortexEntityId = null;
+  timeline.suppressedCortexEntityIds = [];
+}
+
+/**
+ * Reconcile Cortex's current character identities into LumiMind without changing
+ * local canonical names or reviving identities the user removed locally.
+ */
+export function reconcileCortexIdentities(timeline: ChatTimelineV1, input: CortexIdentityInput[]): void {
+  timeline.suppressedCortexEntityIds ??= [];
+  const suppressedIds = new Set(timeline.suppressedCortexEntityIds);
+  const identities = input.filter((identity) => identity.id.trim() && identity.name.trim() && !suppressedIds.has(identity.id));
+  const currentIds = new Set(identities.map((identity) => identity.id));
+
+  for (const actor of Object.values(timeline.actors)) {
+    if (actor.cortexEntityId && !currentIds.has(actor.cortexEntityId)) {
+      actor.cortexEntityId = null;
+      actor.updatedAt = Date.now();
+    }
+  }
+
+  const identityNames = new Map(identities.map((identity) => [
+    identity.id,
+    new Set([identity.name, ...identity.aliases].map((name) => name.trim().toLocaleLowerCase()).filter(Boolean)),
+  ]));
+  const unlinkedActors = Object.values(timeline.actors).filter((actor) => !actor.cortexEntityId);
+  const matchesByIdentity = new Map<string, ActorRecord[]>();
+  const matchCountByActor = new Map<string, number>();
+  for (const identity of identities) {
+    const names = identityNames.get(identity.id) ?? new Set<string>();
+    const matches = unlinkedActors.filter((actor) => actorNames(actor).some((name) => names.has(name)));
+    matchesByIdentity.set(identity.id, matches);
+    for (const actor of matches) matchCountByActor.set(actor.id, (matchCountByActor.get(actor.id) ?? 0) + 1);
+  }
+
+  for (const identity of identities) {
+    const linked = Object.values(timeline.actors).find((actor) => actor.cortexEntityId === identity.id);
+    if (linked) {
+      attachCortexIdentity(linked, identity);
+      continue;
+    }
+    const matches = (matchesByIdentity.get(identity.id) ?? [])
+      .filter((actor) => !actor.cortexEntityId && matchCountByActor.get(actor.id) === 1);
+    if (matches.length === 1) {
+      attachCortexIdentity(matches[0], identity);
+      continue;
+    }
+    const preferredId = `cortex:${identity.id}`;
+    const actor = createActor({
+      id: timeline.actors[preferredId] ? `actor:${crypto.randomUUID()}` : preferredId,
+      kind: "npc",
+      name: identity.name,
+      aliases: identity.aliases,
+      cortexEntityId: identity.id,
+      confidence: identity.confidence,
+      confirmed: identity.confirmed,
+    });
+    timeline.actors[actor.id] = actor;
+    timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+    attachCortexIdentity(actor, identity);
+  }
+}
+
+export function confirmActor(timeline: ChatTimelineV1, actorId: string): boolean {
+  const actor = timeline.actors[actorId];
+  if (!actor) return false;
+  actor.confirmed = true;
+  actor.confidence = 1;
+  actor.updatedAt = Date.now();
+  return true;
+}
+
 function cloneMind(mind: ActorMind): ActorMind {
   return {
     ...mind,
@@ -522,6 +625,8 @@ export function createCheckpointTimeline(source: ChatTimelineV1, targetChatId: s
     aliases: [...actor.aliases],
     suppressedAliases: [...(actor.suppressedAliases ?? [])],
   }]));
+  checkpoint.suppressedCortexEntityIds = [...(source.suppressedCortexEntityIds ?? [])];
+  if (source.chatId !== targetChatId) clearCortexBindings(checkpoint);
   checkpoint.baseMinds = Object.fromEntries(Object.keys(checkpoint.actors).map((actorId) => {
     const sourceMind = source.minds[actorId] ?? source.baseMinds[actorId] ?? makeBaseMind(actorId);
     const cloned = cloneMind(sourceMind);
@@ -1008,10 +1113,25 @@ export function removeManualItem(timeline: ChatTimelineV1, actorId: string, item
   timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "remove", item: null, targetItemId: itemId, createdAt: Date.now() });
 }
 
-export function mergeActors(timeline: ChatTimelineV1, sourceActorId: string, targetActorId: string): boolean {
+export function mergeActors(
+  timeline: ChatTimelineV1,
+  sourceActorId: string,
+  targetActorId: string,
+  cortexLink?: CortexLinkResolution,
+): boolean {
   const source = timeline.actors[sourceActorId];
   const target = timeline.actors[targetActorId];
   if (!source || !target || sourceActorId === targetActorId) return false;
+  const cortexConflict = !!source.cortexEntityId
+    && !!target.cortexEntityId
+    && source.cortexEntityId !== target.cortexEntityId;
+  if (cortexConflict && !cortexLink) return false;
+  timeline.suppressedCortexEntityIds ??= [];
+  if (cortexConflict) {
+    const discardedId = cortexLink === "source" ? target.cortexEntityId : source.cortexEntityId;
+    if (discardedId) timeline.suppressedCortexEntityIds = uniqueStrings([...timeline.suppressedCortexEntityIds, discardedId]);
+    if (cortexLink === "source") target.cortexEntityId = source.cortexEntityId;
+  }
   target.suppressedAliases = uniqueStrings([...(target.suppressedAliases ?? []), ...(source.suppressedAliases ?? [])]);
   const suppressed = new Set(target.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
   target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases])
@@ -1040,7 +1160,12 @@ export function mergeActors(timeline: ChatTimelineV1, sourceActorId: string, tar
 }
 
 export function removeActor(timeline: ChatTimelineV1, actorId: string): boolean {
-  if (!timeline.actors[actorId]) return false;
+  const actor = timeline.actors[actorId];
+  if (!actor) return false;
+  timeline.suppressedCortexEntityIds ??= [];
+  if (actor.cortexEntityId) {
+    timeline.suppressedCortexEntityIds = uniqueStrings([...timeline.suppressedCortexEntityIds, actor.cortexEntityId]);
+  }
   delete timeline.actors[actorId];
   delete timeline.baseMinds[actorId];
   delete timeline.minds[actorId];

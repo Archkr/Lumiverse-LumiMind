@@ -1612,6 +1612,27 @@ function setup(ctx) {
       select.appendChild(option);
     }
     form.appendChild(field("Keep this identity", select, `${actor.canonicalName} will be folded into the selected actor. Aliases and compatible state are preserved.`));
+    const cortexChoice = element("div");
+    const cortexSelect = element("select", "lm-select");
+    const renderCortexChoice = () => {
+      cortexChoice.replaceChildren();
+      const target = candidates.find((candidate) => candidate.id === select.value);
+      if (!target?.cortexEntityId || !actor.cortexEntityId || target.cortexEntityId === actor.cortexEntityId) return;
+      cortexSelect.replaceChildren();
+      const keepTarget = element("option", void 0, `Keep ${target.canonicalName}'s Cortex identity`);
+      keepTarget.value = "target";
+      const keepSource = element("option", void 0, `Keep ${actor.canonicalName}'s Cortex identity`);
+      keepSource.value = "source";
+      cortexSelect.append(keepTarget, keepSource);
+      cortexChoice.appendChild(field(
+        "Cortex link",
+        cortexSelect,
+        "Both actors point to different chat-local Cortex entities. Choose which link LumiMind keeps; the other remains unchanged in Cortex and stays hidden from this timeline."
+      ));
+    };
+    select.addEventListener("change", renderCortexChoice);
+    renderCortexChoice();
+    form.appendChild(cortexChoice);
     const actions = element("div", "lm-modal-actions");
     actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", "Merge actors"));
     actions.lastElementChild.type = "submit";
@@ -1619,7 +1640,15 @@ function setup(ctx) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const timeline = currentState?.timeline;
-      if (timeline) send({ type: "merge_actor", chatId: timeline.chatId, sourceActorId: actor.id, targetActorId: select.value });
+      const target = candidates.find((candidate) => candidate.id === select.value);
+      const cortexLink = target?.cortexEntityId && actor.cortexEntityId && target.cortexEntityId !== actor.cortexEntityId ? cortexSelect.value : void 0;
+      if (timeline) send({
+        type: "merge_actor",
+        chatId: timeline.chatId,
+        sourceActorId: actor.id,
+        targetActorId: select.value,
+        cortexLink
+      });
       selectedActorId = select.value;
       modal.dismiss();
     });

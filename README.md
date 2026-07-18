@@ -443,7 +443,7 @@ LumiMind has its own actor registry and works normally without Memory Cortex. Co
 
 ### Identity import — on by default
 
-When **Import Cortex identities** is enabled and the `memories` permission is available, LumiMind can read Memory Cortex `character` entities for the active chat.
+When **Import Cortex identities** is enabled and the `memories` permission is available, LumiMind reads Memory Cortex `character` entities for the active chat. It refreshes the bridge during activation and timeline reconciliation, after completed Cortex ingestion or rebuild events, and when the relevant setting or permission becomes available.
 
 It uses only:
 
@@ -453,6 +453,8 @@ It uses only:
 - the Cortex entity ID needed to preserve the optional link.
 
 This helps LumiMind recognize that “Captain Mira,” “Mira,” and an already-known Cortex character refer to the same actor. Imported identities join the chat-local registry, while unrelated chats still do not automatically share LumiMind’s discovered NPC IDs.
+
+Cortex entity IDs are chat-scoped. Forks and cross-chat timeline imports therefore discard inherited links and match against the destination chat again only when the identity is unambiguous. Removing an imported actor suppresses that Cortex entity locally so it is not immediately re-imported. When two actors with different Cortex links are merged, Mind Lens requires you to choose which local link to keep; Cortex itself is not changed.
 
 ### Identity writeback — off by default
 
