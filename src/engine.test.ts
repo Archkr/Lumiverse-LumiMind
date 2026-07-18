@@ -5,6 +5,7 @@ import {
   analysisPolicyHash,
   buildDirectorMindInjection,
   buildMindInjection,
+  buildProjectedMindInjection,
   canonicalMindText,
   compactStateForController,
   createTimeline,
@@ -19,6 +20,7 @@ import {
   normalizeSettings,
   normalizeTimeline,
   overrideItem,
+  projectControllerState,
   rebuildTimeline,
   resolveActorId,
   selectAnalysisRecentContext,
@@ -26,6 +28,7 @@ import {
   stableHash,
   toTimelineView,
   upsertActor,
+  type TokenCounter,
 } from "./engine";
 import type { AnalysisRecord, ChatMessageLike, MindDelta } from "./types";
 
@@ -68,6 +71,14 @@ function record(messageValue: ChatMessageLike, prefixHash: string, deltas: MindD
     createdAt: 20,
   };
 }
+
+const countByCharacters: TokenCounter = async (value) => ({
+  totalTokens: Math.ceil(value.length / 4),
+  model: "test-model",
+  tokenizerName: "test-tokenizer",
+  approximate: false,
+  fallback: false,
+});
 
 describe("actor registry", () => {
   it("resolves canonical names and aliases only when unambiguous", () => {
@@ -287,6 +298,24 @@ describe("timeline reducer", () => {
     expect(timeline.records[0].skipReason).toBe("unmanaged_user_message");
     expect(toTimelineView(timeline, { ...DEFAULT_SETTINGS, personaMindEnabled: false }).records).toEqual([]);
   });
+
+  it("checkpoints an intentionally skipped activation prefix without exposing it in Mind Lens", () => {
+    const timeline = createTimeline("existing-chat");
+    const messages = Array.from({ length: 600 }, (_, index) => message(`m${index}`, index, `Committed message ${index}`));
+    timeline.records = materializeSkippedAnalysisRecords(
+      timeline,
+      messages.slice(0, 550),
+      "root",
+      "pre_activation_history",
+    );
+
+    const replay = rebuildTimeline(timeline, messages);
+    expect(replay.firstMissingIndex).toBe(550);
+    expect(timeline.lastValidMessageIndex).toBe(549);
+    expect(timeline.records).toHaveLength(550);
+    expect(timeline.records.every((entry) => entry.skipReason === "pre_activation_history")).toBe(true);
+    expect(toTimelineView(timeline).records).toEqual([]);
+  });
 });
 
 describe("hashing, settings, and compaction", () => {
@@ -301,21 +330,36 @@ describe("hashing, settings, and compaction", () => {
     expect(nextPrefixHash("a", "b", 0)).not.toBe(nextPrefixHash("a", "b", 1));
   });
 
-  it("clamps persisted controller and analysis-context settings", () => {
-    const settings = normalizeSettings({ controllerTemperature: 9, controllerMaxTokens: 20, analysisContextMessageLimit: 99, chatHistoryMessageLimit: 1200 });
+  it("normalizes limits without imposing former message or token ceilings", () => {
+    const settings = normalizeSettings({
+      controllerTemperature: 9,
+      controllerMaxTokens: 20,
+      analysisStateTokenBudget: 240_000,
+      injectionTokenBudget: 80_000,
+      analysisContextMessageLimit: 99,
+      chatHistoryMessageLimit: 1200,
+    });
     expect(settings).toMatchObject({
       controllerTemperature: 2,
       controllerMaxTokens: 300,
-      analysisContextMessageLimit: 50,
-      chatHistoryMessageLimit: 1000,
+      analysisStateTokenBudget: 240_000,
+      injectionTokenBudget: 80_000,
+      analysisContextMessageLimit: 99,
+      chatHistoryMessageLimit: 1200,
       personaMindEnabled: true,
       characterCardDirectorMode: false,
     });
     expect(normalizeSettings({ personaMindEnabled: false, characterCardDirectorMode: true })).toMatchObject({
       personaMindEnabled: false,
       characterCardDirectorMode: true,
+      analysisStateTokenBudget: 24_000,
+      injectionTokenBudget: 8_000,
       analysisContextMessageLimit: 4,
       chatHistoryMessageLimit: 0,
+    });
+    expect(normalizeSettings({ analysisStateTokenBudget: 0, injectionTokenBudget: 0 })).toMatchObject({
+      analysisStateTokenBudget: 0,
+      injectionTokenBudget: 0,
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
@@ -324,6 +368,189 @@ describe("hashing, settings, and compaction", () => {
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("ledger-policy:1|director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("ledger-policy:1|persona-policy:2|persona:0|director:0"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
+  });
+
+  it("replays 500+ messages for 12 actors deterministically and projects without deleting state", async () => {
+    const timeline = createTimeline("long-chat");
+    timeline.active = true;
+    const actors = Array.from({ length: 12 }, (_, index) => upsertActor(timeline, {
+      kind: "npc",
+      name: `Actor ${index + 1}`,
+      aliases: [`Callsign ${index + 1}`],
+    }));
+    const messages = Array.from({ length: 504 }, (_, index) => message(
+      `message-${index}`,
+      index,
+      `Actor ${(index % actors.length) + 1} records event ${index} in the ongoing scene.`,
+    ));
+    const selectedForAnalysis: ChatMessageLike[] = [];
+    for (let cursor = 0; cursor < messages.length;) {
+      const batch = selectAnalysisWorkBatch(messages, cursor, 6, DEFAULT_SETTINGS);
+      expect(batch.messages.length).toBeGreaterThan(0);
+      expect(batch.messages.length).toBeLessThanOrEqual(6);
+      selectedForAnalysis.push(...batch.messages);
+      cursor += batch.messages.length;
+    }
+    expect(selectedForAnalysis.map((entry) => entry.id)).toEqual(messages.map((entry) => entry.id));
+    let prefixHash = "root";
+    timeline.records = messages.map((entry, index) => {
+      const actor = actors[index % actors.length];
+      const next = record(entry, prefixHash, [delta(actor.id, entry.id, index, {
+        id: `delta-${index}`,
+        text: `Cipherword${index} waypoint${index} consequence${index} private-state-${index} remains unresolved`,
+      })]);
+      prefixHash = nextPrefixHash(prefixHash, next.contentHash, next.swipeId);
+      return next;
+    });
+
+    const firstReplay = rebuildTimeline(timeline, messages);
+    expect(firstReplay.firstMissingIndex).toBe(504);
+    expect(Object.values(timeline.minds).reduce((sum, mind) => sum + mind.items.length, 0)).toBe(504);
+    expect(actors.every((actor) => resolveActorId(timeline.actors, actor.canonicalName) === actor.id)).toBe(true);
+    const storedRecords = JSON.stringify(timeline.records);
+    const storedMinds = JSON.stringify(timeline.minds);
+
+    const secondReplay = rebuildTimeline(timeline, messages);
+    expect(secondReplay.firstMissingIndex).toBe(504);
+    expect(JSON.stringify(timeline.records)).toBe(storedRecords);
+    expect(JSON.stringify(timeline.minds)).toBe(storedMinds);
+
+    const compact = compactStateForController(timeline);
+    const projected = await projectControllerState(
+      compact,
+      [messages.at(-1)!],
+      messages.slice(-8, -1),
+      DEFAULT_SETTINGS.analysisStateTokenBudget,
+      countByCharacters,
+    );
+    expect(projected.telemetry).toMatchObject({
+      tokenBudget: 24_000,
+      itemsAvailable: 504,
+      actorCount: 12,
+      tokenModel: "test-model",
+      tokenizerName: "test-tokenizer",
+    });
+    expect(projected.telemetry.totalTokens).toBeLessThanOrEqual(24_000);
+    expect(projected.telemetry.itemsOmitted).toBeGreaterThan(0);
+    expect(projected.state).toEqual(expect.arrayContaining(actors.map((actor) => expect.objectContaining({ ref: actor.id }))));
+    expect(JSON.stringify(timeline.records)).toBe(storedRecords);
+    expect(JSON.stringify(timeline.minds)).toBe(storedMinds);
+
+    const unlimited = await projectControllerState(compact, [messages.at(-1)!], [], 0, countByCharacters);
+    expect(unlimited.telemetry).toMatchObject({ itemsAvailable: 504, itemsIncluded: 504, itemsOmitted: 0 });
+    const unlimitedActors = unlimited.state as Array<{ ref: string; items?: unknown[] }>;
+    expect(unlimitedActors.find((actor) => actor.ref === actors[0].id)?.items?.length).toBe(42);
+  });
+
+  it("ranks protected and relevant state, allocates relevant actors fairly, and keeps every actor stub", async () => {
+    const item = (id: string, text: string, extra: Record<string, unknown> = {}) => ({
+      id,
+      category: "belief",
+      text,
+      controllerWritable: true,
+      ...extra,
+    });
+    const compact = [
+      {
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        present: true,
+        items: [
+          item("mira-protected", "Mira guards the obsidian key", { locked: true, pinned: true, controllerWritable: false }),
+          ...Array.from({ length: 8 }, (_, index) => item(`mira-${index}`, `Mira detail ${index} with extended private nuance`)),
+        ],
+      },
+      {
+        ref: "aster",
+        name: "Aster",
+        aliases: [],
+        present: true,
+        items: Array.from({ length: 9 }, (_, index) => item(`aster-${index}`, `Aster clue ${index} about the obsidian key`)),
+      },
+      {
+        ref: "rowan",
+        name: "Rowan",
+        aliases: [],
+        present: false,
+        items: Array.from({ length: 9 }, (_, index) => item(`rowan-${index}`, `Rowan unrelated detail ${index}`)),
+      },
+    ];
+    const base = await projectControllerState(compact, [], [], 1, countByCharacters);
+    const projected = await projectControllerState(
+      compact,
+      [{ id: "current", role: "assistant", content: "Mira shows Aster the obsidian key." }],
+      [],
+      base.telemetry.totalTokens + 190,
+      countByCharacters,
+    );
+    const actors = projected.state as Array<{ ref: string; items: Array<{ id: string }> }>;
+    expect(actors.map((actor) => actor.ref)).toEqual(["mira", "aster", "rowan"]);
+    expect(actors.find((actor) => actor.ref === "mira")?.items.map((entry) => entry.id)).toContain("mira-protected");
+    expect(actors.find((actor) => actor.ref === "mira")?.items.length).toBeGreaterThan(0);
+    expect(actors.find((actor) => actor.ref === "aster")?.items.length).toBeGreaterThan(0);
+    expect(projected.telemetry.itemsOmitted).toBeGreaterThan(0);
+  });
+
+  it("prioritizes the generation target while retaining headings for every present actor", async () => {
+    const timeline = createTimeline("projection-chat");
+    timeline.active = true;
+    const target = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const relevant = upsertActor(timeline, { kind: "npc", name: "Aster" });
+    const other = upsertActor(timeline, { kind: "npc", name: "Rowan" });
+    const headingOnly = upsertActor(timeline, { kind: "npc", name: "Selene" });
+    for (const actor of [target, relevant, other]) {
+      const seed = makeEmptySeed();
+      seed.startingGoals = Array.from(
+        { length: actor.id === target.id ? 24 : 8 },
+        (_, index) => `${actor.canonicalName} private objective ${index} with extended nuance`,
+      );
+      timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seed);
+    }
+    timeline.baseMinds[headingOnly.id] = makeBaseMind(headingOnly.id, makeEmptySeed());
+    rebuildTimeline(timeline, []);
+    for (const actor of [target, relevant, other, headingOnly]) timeline.actors[actor.id].present = true;
+    const base = await buildProjectedMindInjection(
+      timeline,
+      target.id,
+      { ...DEFAULT_SETTINGS, injectionTokenBudget: 1 },
+      [{ content: "Mira confides in Aster." }],
+      countByCharacters,
+    );
+    const projection = await buildProjectedMindInjection(
+      timeline,
+      target.id,
+      { ...DEFAULT_SETTINGS, injectionTokenBudget: base.telemetry.totalTokens + 100 },
+      [{ content: "Mira confides in Aster." }],
+      countByCharacters,
+    );
+    expect(projection.content).toContain("Mira (npc, present)");
+    expect(projection.content).toContain("Aster (npc, present)");
+    expect(projection.content).toContain("Rowan (npc, present)");
+    expect(projection.content).toContain("Selene (npc, present)");
+    expect(projection.content).toContain("Mira private objective");
+    expect(projection.telemetry.itemsIncluded).toBeGreaterThan(0);
+    expect(projection.telemetry.itemsOmitted).toBeGreaterThan(0);
+
+    const defaults = await buildProjectedMindInjection(
+      timeline,
+      target.id,
+      DEFAULT_SETTINGS,
+      [],
+      countByCharacters,
+    );
+    expect(defaults.telemetry).toMatchObject({ tokenBudget: 8_000, itemsAvailable: 40, itemsIncluded: 40, itemsOmitted: 0 });
+    expect(defaults.content).toContain("Mira private objective 23 with extended nuance");
+
+    const unlimited = await buildProjectedMindInjection(
+      timeline,
+      target.id,
+      { ...DEFAULT_SETTINGS, injectionTokenBudget: 0 },
+      [],
+      countByCharacters,
+    );
+    expect(unlimited.telemetry).toMatchObject({ itemsAvailable: 40, itemsIncluded: 40, itemsOmitted: 0 });
+    expect(unlimited.content).toContain("Mira private objective 23 with extended nuance");
   });
 
   it("routes unmanaged user turns to checkpoints and keeps them out of controller batches", () => {

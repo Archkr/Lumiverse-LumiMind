@@ -188,6 +188,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
   }>();
+  const activationPreviewRequests = new Map<string, {
+    resolve: (messageCount: number) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
 
   let seedTab: ReturnType<SpindleFrontendContext["ui"]["registerCharacterEditorTab"]> | null = null;
   let seedRoot: HTMLElement | null = null;
@@ -319,13 +324,16 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         })),
         temperature: state.settings.controllerTemperature,
         maxOutputTokens: state.settings.controllerMaxTokens,
+        stateTokenBudget: state.settings.analysisStateTokenBudget,
         contextMessageLimit: state.settings.analysisContextMessageLimit,
       } : null,
       injection: state ? {
         presentActorsOnly: true,
         unresolvedStateOnly: true,
+        tokenBudget: state.settings.injectionTokenBudget,
         chatHistoryMessageLimit: state.settings.chatHistoryMessageLimit,
         interceptorAvailable: state.permissions.interceptor,
+        lastProjection: state.lastInjectionProjection ?? null,
       } : null,
       features: state ? {
         spoilerSafe: state.settings.spoilerSafe,
@@ -411,6 +419,62 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       }, 15_000);
       developerReportRequests.set(requestId, { resolve, reject, timeout });
       send({ type: "developer_report", chatId: currentState?.activeChatId ?? null, requestId });
+    });
+  }
+
+  function requestActivationPreview(chatId: string): Promise<number> {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        activationPreviewRequests.delete(requestId);
+        reject(new Error("The history check timed out."));
+      }, 15_000);
+      activationPreviewRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "activation_preview", chatId, requestId });
+    });
+  }
+
+  function chooseActivationHistory(
+    messageCount: number,
+    recentMessageLimit: number,
+  ): Promise<"full" | "recent" | null> {
+    return new Promise((resolve) => {
+      const modal = ctx.ui.showModal({ title: "Choose history to analyze", width: 520, maxHeight: 560 });
+      const form = element("div", "lm-modal-form");
+      form.appendChild(element(
+        "p",
+        "lm-activation-text",
+        `This chat already has ${messageCount.toLocaleString()} committed messages. Full history may require many background controller calls.`,
+      ));
+      const canUseRecent = recentMessageLimit > 0 && recentMessageLimit < messageCount;
+      form.appendChild(element(
+        "p",
+        "lm-seed-hint",
+        canUseRecent
+          ? `Analyze everything, or start with only the most recent ${recentMessageLimit.toLocaleString()} messages from your Chat history setting. Older messages will be intentionally checkpointed as skipped.`
+          : "Your Chat history setting is unlimited (or already covers this chat), so there is no smaller configured range. Change that setting first if you want a recent-history option.",
+      ));
+      const actions = element("div", "lm-modal-actions");
+      let settled = false;
+      const finish = (choice: "full" | "recent" | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(choice);
+        modal.dismiss();
+      };
+      actions.appendChild(textButton("Cancel", () => finish(null), "secondary"));
+      if (canUseRecent) {
+        actions.appendChild(textButton(`Recent ${recentMessageLimit.toLocaleString()}`, () => finish("recent"), "secondary"));
+      }
+      actions.appendChild(textButton("Full history", () => finish("full"), "primary"));
+      form.appendChild(actions);
+      modal.root.appendChild(form);
+      modal.onDismiss(() => {
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      });
     });
   }
 
@@ -656,8 +720,30 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       element("span", "lm-activation-point", "Spoilers collapsed"),
     );
     copy.append(points);
-    const button = textButton("Activate Mind Lens", () => {
-      if (timeline) send({ type: "activate", chatId: timeline.chatId });
+    const button = textButton("Activate Mind Lens", async () => {
+      if (!timeline || button.disabled) return;
+      button.disabled = true;
+      const originalLabel = button.textContent;
+      button.textContent = "Checking history…";
+      try {
+        const messageCount = await requestActivationPreview(timeline.chatId);
+        const recentMessageLimit = Math.max(0, Math.floor(currentState?.settings.chatHistoryMessageLimit ?? 0));
+        const historyMode = messageCount >= 50
+          ? await chooseActivationHistory(messageCount, recentMessageLimit)
+          : "full";
+        if (!historyMode) return;
+        send({
+          type: "activate",
+          chatId: timeline.chatId,
+          historyMode,
+          recentMessageLimit: historyMode === "recent" ? recentMessageLimit : undefined,
+        });
+      } catch (error) {
+        showNotice("error", error instanceof Error ? error.message : "LumiMind could not inspect this chat's history.");
+      } finally {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
     }, "primary");
     button.classList.add("lm-activation-button");
     copy.appendChild(button);
@@ -1266,7 +1352,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
-      key: "controllerTemperature" | "controllerMaxTokens" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
+      key: "controllerTemperature" | "controllerMaxTokens" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
       max: number | null,
       step: number,
@@ -1301,10 +1387,26 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         "Maximum output requested for each analysis call. LumiMind does not impose an upper limit; the selected model or provider may still enforce one.",
       ),
       numberSetting(
+        "Analysis state tokens",
+        "analysisStateTokenBudget",
+        0,
+        null,
+        500,
+        "Target token budget for unresolved mind state sent to the controller. Actor identities remain available. Set to 0 for unlimited.",
+      ),
+      numberSetting(
+        "Private injection tokens",
+        "injectionTokenBudget",
+        0,
+        null,
+        500,
+        "Target token budget for LumiMind state added to the roleplay prompt. Stored state is never deleted. Set to 0 for unlimited.",
+      ),
+      numberSetting(
         "Analysis context messages",
         "analysisContextMessageLimit",
         0,
-        50,
+        null,
         1,
         "Maximum earlier transcript messages included as context for each analysis batch. Set to 0 for none.",
       ),
@@ -1312,9 +1414,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         "Chat history messages",
         "chatHistoryMessageLimit",
         0,
-        1000,
+        null,
         1,
-        "Maximum stored chat messages retained in the main generation prompt. Set to 0 for unlimited.",
+        "Maximum stored chat messages retained in the main generation prompt and the optional recent range offered on first activation. Set to 0 for unlimited.",
       ),
     );
     controller.appendChild(numberGrid);
@@ -1647,6 +1749,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       developerReportRequests.delete(message.requestId);
       if (message.type === "developer_report") pending.resolve(message.report);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "activation_preview" || message.type === "activation_preview_error") {
+      const pending = activationPreviewRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      activationPreviewRequests.delete(message.requestId);
+      if (message.type === "activation_preview") pending.resolve(message.messageCount);
+      else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -1690,6 +1799,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       pending.reject(new Error("LumiMind closed before the developer report completed."));
     }
     developerReportRequests.clear();
+    for (const pending of activationPreviewRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the history check completed."));
+    }
+    activationPreviewRequests.clear();
     destroySeedTab();
     while (cleanups.length) {
       try { cleanups.pop()?.(); } catch { /* Best-effort teardown. */ }

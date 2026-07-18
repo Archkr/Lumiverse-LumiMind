@@ -8,6 +8,8 @@ var DEFAULT_SETTINGS = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
+  analysisStateTokenBudget: 24e3,
+  injectionTokenBudget: 8e3,
   analysisContextMessageLimit: 4,
   chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
@@ -65,12 +67,18 @@ function normalizeSettings(value) {
   const raw = asObject(value);
   const characterCardDirectorMode = raw.characterCardDirectorMode === true;
   const controllerMaxTokens = typeof raw.controllerMaxTokens === "number" ? raw.controllerMaxTokens : Number(raw.controllerMaxTokens);
+  const analysisStateTokenBudget = typeof raw.analysisStateTokenBudget === "number" ? raw.analysisStateTokenBudget : Number(raw.analysisStateTokenBudget);
+  const injectionTokenBudget = typeof raw.injectionTokenBudget === "number" ? raw.injectionTokenBudget : Number(raw.injectionTokenBudget);
+  const analysisContextMessageLimit = typeof raw.analysisContextMessageLimit === "number" ? raw.analysisContextMessageLimit : Number(raw.analysisContextMessageLimit);
+  const chatHistoryMessageLimit = typeof raw.chatHistoryMessageLimit === "number" ? raw.chatHistoryMessageLimit : Number(raw.chatHistoryMessageLimit);
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens) ? Math.max(300, controllerMaxTokens) : DEFAULT_SETTINGS.controllerMaxTokens),
-    analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
-    chatHistoryMessageLimit: Math.round(clamp(raw.chatHistoryMessageLimit, 0, 1e3, DEFAULT_SETTINGS.chatHistoryMessageLimit)),
+    analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget) ? Math.max(0, analysisStateTokenBudget) : DEFAULT_SETTINGS.analysisStateTokenBudget),
+    injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget) ? Math.max(0, injectionTokenBudget) : DEFAULT_SETTINGS.injectionTokenBudget),
+    analysisContextMessageLimit: Math.round(Number.isFinite(analysisContextMessageLimit) ? Math.max(0, analysisContextMessageLimit) : DEFAULT_SETTINGS.analysisContextMessageLimit),
+    chatHistoryMessageLimit: Math.round(Number.isFinite(chatHistoryMessageLimit) ? Math.max(0, chatHistoryMessageLimit) : DEFAULT_SETTINGS.chatHistoryMessageLimit),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -815,11 +823,11 @@ function itemScore(item, relevantActorIds) {
 function actorLabel(actors, id) {
   return actors[id]?.canonicalName ?? id;
 }
-function formatMind(mind, actors) {
+function formatMind(mind, actors, includedItemIds, includeEmpty = false) {
   const actor = actors[mind.actorId];
   if (!actor) return "";
   const relevant = new Set(mind.presentActorIds);
-  const items = [...mind.items].filter((item) => item.status === "active" || item.status === "uncertain").sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
+  const items = [...mind.items].filter((item) => item.status === "active" || item.status === "uncertain").filter((item) => !includedItemIds || includedItemIds.has(item.id)).sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
   const details = [];
   if (mind.core.values.length) details.push(`Values: ${mind.core.values.join("; ")}`);
   if (mind.core.desires.length) details.push(`Desires: ${mind.core.desires.join("; ")}`);
@@ -832,15 +840,17 @@ function formatMind(mind, actors) {
     const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
     details.push(line);
   }
-  if (!details.length) return "";
+  if (!details.length && !includeEmpty) return "";
   return [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`, ...details].join("\n");
 }
-function buildMindInjection(timeline, targetActorId, settings = DEFAULT_SETTINGS) {
-  if (!timeline.active || timeline.paused) return null;
-  const presentActors = Object.values(timeline.actors).filter((actor) => actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings)).sort(
+function presentManagedActors(timeline, settings, targetActorId) {
+  return Object.values(timeline.actors).filter((actor) => actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings)).sort(
     (left, right) => Number(right.id === targetActorId) - Number(left.id === targetActorId) || Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
   );
-  const minds = presentActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors)).filter(Boolean);
+}
+function renderMindInjection(timeline, targetActorId, settings, includedItemIds) {
+  const presentActors = presentManagedActors(timeline, settings, targetActorId);
+  const minds = presentActors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, includedItemIds, !!includedItemIds)).filter(Boolean);
   const body = minds.join("\n\n");
   const unmanagedPersonaGuidance = !settings.personaMindEnabled ? "The user persona is unmanaged. Do not decide their thoughts, feelings, dialogue, or actions for them." : "";
   if (!body.trim() && !unmanagedPersonaGuidance) return null;
@@ -854,13 +864,10 @@ function buildMindInjection(timeline, targetActorId, settings = DEFAULT_SETTINGS
     "[/LumiMind]"
   ].join("\n");
 }
-function buildDirectorMindInjection(timeline, settings = DEFAULT_SETTINGS) {
-  if (!timeline.active || timeline.paused) return null;
-  const actors = Object.values(timeline.actors).filter((actor) => actor.present && actorMindEnabled(actor, settings) && timeline.minds[actor.id]).sort(
-    (left, right) => Number(right.confirmed) - Number(left.confirmed) || right.updatedAt - left.updatedAt
-  );
+function renderDirectorMindInjection(timeline, settings, includedItemIds) {
+  const actors = presentManagedActors(timeline, settings, null);
   if (!actors.length) return null;
-  const body = actors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors)).filter(Boolean).join("\n\n");
+  const body = actors.map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, includedItemIds, !!includedItemIds)).filter(Boolean).join("\n\n");
   if (!body.trim()) return null;
   return [
     "[LumiMind \u2014 private ensemble continuity]",
@@ -935,7 +942,7 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
     updatedAt: timeline.updatedAt
   };
 }
-function compactStateForController(timeline, settings = DEFAULT_SETTINGS, _maxItemsPerActor) {
+function compactStateForController(timeline, settings = DEFAULT_SETTINGS) {
   return Object.values(timeline.actors).map((actor) => {
     const managed = actorMindEnabled(actor, settings);
     return {
@@ -967,6 +974,222 @@ function compactStateForController(timeline, settings = DEFAULT_SETTINGS, _maxIt
       } : {}
     };
   });
+}
+function projectionTelemetry(budget, measurement, available, included, actorCount) {
+  return {
+    tokenBudget: budget,
+    totalTokens: measurement.totalTokens,
+    itemsAvailable: available,
+    itemsIncluded: included,
+    itemsOmitted: Math.max(0, available - included),
+    actorCount,
+    tokenModel: measurement.model,
+    tokenizerName: measurement.tokenizerName,
+    tokenCountApproximate: measurement.approximate,
+    tokenCountFallback: measurement.fallback
+  };
+}
+function referenceAppears(content, reference) {
+  const value = reference.trim();
+  if (value.length < 2) return false;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, "iu").test(content);
+}
+function textTokenSet(value) {
+  return new Set(canonicalMindText(value).split(" ").filter(Boolean));
+}
+function sharedTokenCount(value, tokens) {
+  if (!value || tokens.size === 0) return 0;
+  let shared = 0;
+  for (const token of textTokenSet(value)) if (tokens.has(token)) shared += 1;
+  return shared;
+}
+function roundRobinOrder(queues) {
+  const orderedQueues = queues.filter((queue) => queue.values.length > 0).sort((left, right) => right.score - left.score);
+  const result = [];
+  const consumed = new Map(orderedQueues.map((queue) => [queue, 0]));
+  const maxLead = Math.max(0, ...orderedQueues.map((queue) => queue.lead));
+  for (let depth = 0; depth < maxLead; depth += 1) {
+    for (const queue of orderedQueues) {
+      if (depth >= queue.lead) continue;
+      const value = queue.values[depth];
+      if (value !== void 0) {
+        result.push(value);
+        consumed.set(queue, depth + 1);
+      }
+    }
+  }
+  while (orderedQueues.some((queue) => (consumed.get(queue) ?? 0) < queue.values.length)) {
+    for (const queue of orderedQueues) {
+      const index = consumed.get(queue) ?? 0;
+      const value = queue.values[index];
+      if (value !== void 0) {
+        result.push(value);
+        consumed.set(queue, index + 1);
+      }
+    }
+  }
+  return result;
+}
+async function fitProjectionToBudget(fullText, baseText, orderedCandidates, tokenBudget, countTokens, render) {
+  const fullMeasurement = await countTokens(fullText);
+  if (tokenBudget === 0 || fullMeasurement.totalTokens <= tokenBudget) {
+    return {
+      text: fullText,
+      includedIds: new Set(orderedCandidates.map((candidate) => candidate.id)),
+      measurement: fullMeasurement
+    };
+  }
+  const baseMeasurement = await countTokens(baseText);
+  if (baseMeasurement.totalTokens >= tokenBudget || orderedCandidates.length === 0) {
+    return { text: baseText, includedIds: /* @__PURE__ */ new Set(), measurement: baseMeasurement };
+  }
+  const charsPerToken = Math.max(1, fullText.length / Math.max(1, fullMeasurement.totalTokens));
+  const estimatedAvailableChars = Math.max(0, (tokenBudget - baseMeasurement.totalTokens) * charsPerToken);
+  const selectedOrder = [];
+  let estimatedChars = 0;
+  for (const candidate of orderedCandidates) {
+    if (estimatedChars + candidate.estimatedChars > estimatedAvailableChars) continue;
+    selectedOrder.push(candidate.id);
+    estimatedChars += candidate.estimatedChars;
+  }
+  let includedIds = new Set(selectedOrder);
+  let text2 = render(includedIds);
+  let measurement = await countTokens(text2);
+  while (measurement.totalTokens > tokenBudget && selectedOrder.length > 0) {
+    const keepRatio = tokenBudget / Math.max(1, measurement.totalTokens);
+    const keepCount = Math.max(0, Math.min(selectedOrder.length - 1, Math.floor(selectedOrder.length * keepRatio) - 1));
+    selectedOrder.splice(keepCount);
+    includedIds = new Set(selectedOrder);
+    text2 = render(includedIds);
+    measurement = await countTokens(text2);
+  }
+  return { text: text2, includedIds, measurement };
+}
+function compactActors(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    const actor = asObject(entry);
+    const items = Array.isArray(actor.items) ? actor.items.flatMap((item) => {
+      const raw = asObject(item);
+      const id = stringValue(raw.id);
+      return id ? [{ ...raw, id }] : [];
+    }) : void 0;
+    return {
+      ...actor,
+      ref: stringValue(actor.ref),
+      name: stringValue(actor.name),
+      aliases: strings(actor.aliases),
+      ...items ? { items } : {}
+    };
+  });
+}
+function renderCompactStateProjection(actors, includedIds) {
+  return actors.map((actor) => {
+    if (!actor.items) return { ...actor };
+    const items = actor.items.filter((item) => includedIds.has(item.id));
+    return {
+      ...actor,
+      items,
+      availableItemCount: actor.items.length,
+      omittedItemCount: actor.items.length - items.length
+    };
+  });
+}
+function orderedCompactStateCandidates(actors, messages, recentContext) {
+  const currentText = messages.map((message) => `${message.name ?? ""}
+${message.content}`).join("\n");
+  const contextText = recentContext.map((message) => `${message.name ?? ""}
+${message.content}`).join("\n");
+  const currentTokens = textTokenSet(currentText);
+  const contextTokens = textTokenSet(contextText);
+  const relevantActorRefs = new Set(
+    actors.filter((actor) => [actor.name, ...actor.aliases].some((reference) => referenceAppears(currentText, reference))).map((actor) => actor.ref)
+  );
+  return roundRobinOrder(actors.map((actor) => {
+    const currentMention = [actor.name, ...actor.aliases].some((reference) => referenceAppears(currentText, reference));
+    const contextMention = [actor.name, ...actor.aliases].some((reference) => referenceAppears(contextText, reference));
+    const actorScore = Number(currentMention) * 1e3 + Number(actor.present) * 500 + Number(contextMention) * 250 + Number(actor.confirmed) * 25;
+    const values = (actor.items ?? []).map((item, index) => {
+      const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true || item.source && item.source !== "controller";
+      const targetRelevant = (item.targetActorIds ?? []).some((ref) => relevantActorRefs.has(ref));
+      const score = Number(protectedItem) * 2e3 + Number(targetRelevant) * 750 + sharedTokenCount(item.text ?? "", currentTokens) * 120 + sharedTokenCount(item.text ?? "", contextTokens) * 30 + (item.category ? CATEGORY_ORDER[item.category] ?? 0 : 0) * 5 - index;
+      return { item, score };
+    }).sort((left, right) => right.score - left.score).map(({ item }) => ({ id: item.id, estimatedChars: JSON.stringify(item).length + 2 }));
+    return { score: actorScore, lead: currentMention ? 3 : actor.present || contextMention ? 1 : 0, values };
+  }));
+}
+async function projectControllerState(compactState, messages, recentContext, tokenBudget, countTokens) {
+  const actors = compactActors(compactState);
+  const available = actors.reduce((sum, actor) => sum + (actor.items?.length ?? 0), 0);
+  const fullText = JSON.stringify(compactState);
+  const orderedCandidates = orderedCompactStateCandidates(actors, messages, recentContext);
+  const baseState = renderCompactStateProjection(actors, /* @__PURE__ */ new Set());
+  const render = (includedIds) => JSON.stringify(renderCompactStateProjection(actors, includedIds));
+  const fitted = await fitProjectionToBudget(
+    fullText,
+    JSON.stringify(baseState),
+    orderedCandidates,
+    tokenBudget,
+    countTokens,
+    render
+  );
+  const fullIncluded = tokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
+  const state = fullIncluded ? compactState : JSON.parse(fitted.text);
+  return {
+    state,
+    telemetry: projectionTelemetry(tokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length)
+  };
+}
+function orderedInjectionCandidates(timeline, actors, targetActorId, contextMessages) {
+  const contextText = contextMessages.map((message) => `${message.name ?? ""}
+${message.content}`).join("\n");
+  const contextTokens = textTokenSet(contextText);
+  const relevantActorIds = new Set(
+    actors.filter((actor) => actor.id === targetActorId || [actor.canonicalName, ...actor.aliases].some((reference) => referenceAppears(contextText, reference))).map((actor) => actor.id)
+  );
+  return roundRobinOrder(actors.map((actor) => {
+    const actorScore = Number(actor.id === targetActorId) * 2e3 + Number(relevantActorIds.has(actor.id)) * 1e3 + Number(actor.confirmed) * 25;
+    const values = (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").map((item) => ({
+      item,
+      score: Number(protectedMindItem(item)) * 2e3 + Number(item.targetActorIds.some((id) => relevantActorIds.has(id))) * 750 + sharedTokenCount(item.text, contextTokens) * 100 + itemScore(item, relevantActorIds)
+    })).sort((left, right) => right.score - left.score).map(({ item }) => ({ id: item.id, estimatedChars: item.text.length + item.id.length + 48 }));
+    return { score: actorScore, lead: actor.id === targetActorId ? 4 : relevantActorIds.has(actor.id) ? 2 : 0, values };
+  }));
+}
+async function projectMindInjection(timeline, targetActorId, settings, contextMessages, countTokens, director) {
+  const actors = presentManagedActors(timeline, settings, director ? null : targetActorId);
+  const allItems = actors.flatMap(
+    (actor) => (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain")
+  );
+  const allItemIds = new Set(allItems.map((item) => item.id));
+  const available = allItems.length;
+  const fullContent = director ? renderDirectorMindInjection(timeline, settings, allItemIds) : renderMindInjection(timeline, targetActorId, settings, allItemIds);
+  const emptyMeasurement = await countTokens(fullContent ?? "");
+  if (!fullContent) {
+    return { content: null, telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
+  }
+  const orderedCandidates = orderedInjectionCandidates(timeline, actors, targetActorId, contextMessages);
+  const render = (includedIds) => (director ? renderDirectorMindInjection(timeline, settings, includedIds) : renderMindInjection(timeline, targetActorId, settings, includedIds)) ?? "";
+  const fitted = await fitProjectionToBudget(
+    fullContent,
+    render(/* @__PURE__ */ new Set()),
+    orderedCandidates,
+    settings.injectionTokenBudget,
+    countTokens,
+    render
+  );
+  const fullIncluded = settings.injectionTokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
+  return {
+    content: fullIncluded ? fullContent : fitted.text,
+    telemetry: projectionTelemetry(settings.injectionTokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length)
+  };
+}
+function buildProjectedMindInjection(timeline, targetActorId, settings, contextMessages, countTokens) {
+  return projectMindInjection(timeline, targetActorId, settings, contextMessages, countTokens, false);
+}
+function buildProjectedDirectorMindInjection(timeline, settings, contextMessages, countTokens) {
+  return projectMindInjection(timeline, null, settings, contextMessages, countTokens, true);
 }
 
 // src/controller.ts
@@ -1243,11 +1466,12 @@ function isNontrivialAnalysisBatch(messages) {
   const total = lengths.reduce((sum, length) => sum + length, 0);
   return total >= 400 || lengths.some((length) => length >= 280) || messages.length >= 2 && total >= 240;
 }
-function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}) {
+function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}, outputMode = "json") {
   const object = asObject2(parsed);
   const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
   const duplicatesSuppressed = diagnostics.duplicatesSuppressed ?? 0;
   return {
+    outputMode,
     responseChars: raw.length,
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
@@ -1368,23 +1592,13 @@ var SEED_SCHEMA = {
   },
   required: ["schemaVersion", "core", "startingBeliefs", "startingSecrets", "startingGoals", "relationshipPriors", "updatedAt"]
 };
-function structuredParameters(provider, schemaName, schema) {
+function toolChoiceParameters(provider) {
   const normalized = provider?.trim().toLocaleLowerCase() ?? "";
   if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
-    return { responseMimeType: "application/json", responseSchema: schema };
+    return { toolConfig: { functionCallingConfig: { mode: "ANY" } } };
   }
-  if (normalized === "openai" || normalized === "openrouter") {
-    return { response_format: { type: "json_schema", json_schema: { name: schemaName, strict: true, schema } } };
-  }
-  return {};
-}
-function noReasoningParameters(provider) {
-  const normalized = provider?.trim().toLocaleLowerCase() ?? "";
-  if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
-    return { thinkingConfig: { thinkingLevel: "minimal", includeThoughts: false } };
-  }
-  if (normalized === "nanogpt") return { reasoning_effort: "none" };
-  return { reasoning: { effort: "none" } };
+  if (normalized === "anthropic") return { tool_choice: { type: "any" } };
+  return { tool_choice: "required" };
 }
 async function resolveConnection(settings, userId, fallbackConnectionId) {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
@@ -1392,8 +1606,49 @@ async function resolveConnection(settings, userId, fallbackConnectionId) {
   const connection = await spindle.connections.get(id, userId).catch(() => null);
   return { id, provider: connection?.provider ?? null, model: connection?.model ?? null };
 }
-async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId) {
-  const connection = await resolveConnection(settings, userId, fallbackConnectionId);
+function fallbackTokenMeasurement(textValue, model) {
+  return {
+    totalTokens: Math.ceil(textValue.length / 4),
+    model,
+    tokenizerName: "Approximate chars / 4",
+    approximate: true,
+    fallback: true
+  };
+}
+async function countTextTokens(textValue, connection, userId) {
+  try {
+    const result = await spindle.tokens.countText(textValue, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId });
+    return {
+      totalTokens: result.total_tokens,
+      model: result.model || connection.model,
+      tokenizerName: result.tokenizer_name,
+      approximate: result.approximate,
+      fallback: false
+    };
+  } catch {
+    return fallbackTokenMeasurement(textValue, connection.model);
+  }
+}
+async function countMessageTokens(messages, connection, userId) {
+  try {
+    const result = await spindle.tokens.countMessages(messages, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId });
+    return {
+      totalTokens: result.total_tokens,
+      model: result.model || connection.model,
+      tokenizerName: result.tokenizer_name,
+      approximate: result.approximate,
+      fallback: false
+    };
+  } catch {
+    return fallbackTokenMeasurement(messages.map((message) => `${message.role}
+${message.content}`).join("\n"), connection.model);
+  }
+}
+function controllerTokenCounter(connection, userId) {
+  return (value) => countTextTokens(value, connection, userId);
+}
+async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection) {
+  const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
   const result = await spindle.generate.quiet({
     type: "quiet",
     messages: [
@@ -1403,20 +1658,32 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
     parameters: {
       temperature: settings.controllerTemperature,
       max_tokens: settings.controllerMaxTokens,
-      ...noReasoningParameters(connection.provider),
-      ...structuredParameters(connection.provider, schemaName, schema)
+      ...toolChoiceParameters(connection.provider)
     },
+    tools: [{
+      name: schemaName,
+      description: "Submit the complete structured LumiMind result exactly once.",
+      parameters: schema
+    }],
+    reasoning: { source: "off" },
     ...connection.id ? { connection_id: connection.id } : {},
     userId
   });
   const object = asObject2(result);
   const content = sanitizeControllerText(text(object.content));
   const reasoning = sanitizeControllerText(text(object.reasoning));
-  const raw = content || reasoning;
+  const toolCall = (Array.isArray(object.tool_calls) ? object.tool_calls : []).map(asObject2).find((call) => text(call.name) === schemaName && Object.keys(asObject2(call.args)).length > 0);
+  const toolArgs = toolCall ? asObject2(toolCall.args) : null;
+  const outputMode = toolArgs ? "tool" : "json";
+  const raw = toolArgs ? JSON.stringify(toolArgs) : content || reasoning;
+  const usage = asObject2(object.usage);
+  const providerInputTokens = typeof usage.prompt_tokens === "number" && Number.isFinite(usage.prompt_tokens) ? Math.max(0, Math.round(usage.prompt_tokens)) : null;
   return {
-    parsed: parseJsonValue(raw),
+    parsed: toolArgs ?? parseJsonValue(raw),
     raw,
-    meta: { connectionId: connection.id, provider: connection.provider, model: connection.model }
+    meta: { connectionId: connection.id, provider: connection.provider, model: connection.model },
+    outputMode,
+    providerInputTokens
   };
 }
 function renderMessages(messages) {
@@ -1429,7 +1696,7 @@ ${message.content}
 }
 var ANALYSIS_SYSTEM_PROMPT = [
   "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
-  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
+  "Call the required LumiMind result tool exactly once. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
@@ -1450,6 +1717,8 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
   "A substantive scene may correctly return an empty changes array when mind_state already covers its supported state. An empty result is suspicious only for a true bootstrap actor with clear subjective evidence and no unresolved entries.",
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
+  "For an actor already in mind_state, copy its exact ref into actorMentions and subjectRef. For a newly discovered actor, use one stable ref consistently in both its actorMention and every change.",
+  "A positive omittedItemCount means lower-ranked state remains stored outside this request. Do not treat omission as proof that the actor has no other state.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
 ].join("\n");
 function correctiveBootstrapNeeded(compactState, mentions) {
@@ -1490,21 +1759,35 @@ ${renderMessages(input.recentContext)}
 ${renderMessages(input.messages)}
 </analysis_batch>`,
     "Reconcile; do not summarize. If every supported candidate is COVERED or PROTECTED by mind_state, return actorMentions as appropriate with an empty changes array.",
-    'Return {"actorMentions": [...], "changes": [...]} now.'
+    'Call the required result tool with {"actorMentions": [...], "changes": [...]} now.'
   ].join("\n\n");
 }
 async function analyzeMessages(input) {
-  const prompt = buildAnalysisPrompt(input);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
+  const stateProjection = await projectControllerState(
+    input.compactState,
+    input.messages,
+    input.recentContext,
+    input.settings.analysisStateTokenBudget,
+    controllerTokenCounter(connection, input.userId)
+  );
+  const prompt = buildAnalysisPrompt({ ...input, compactState: stateProjection.state });
+  const systemPrompt = analysisSystemPrompt(input.settings);
+  const inputMeasurement = await countMessageTokens([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt }
+  ], connection, input.userId);
   const result = await quietJson(
     prompt,
-    analysisSystemPrompt(input.settings),
+    systemPrompt,
     "lumi_mind_analysis_v1",
     ANALYSIS_SCHEMA,
     input.settings,
     input.userId,
-    input.fallbackConnectionId
+    input.fallbackConnectionId,
+    connection
   );
-  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
+  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
   const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
@@ -1513,7 +1796,7 @@ async function analyzeMessages(input) {
     duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
     invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
     invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons)
-  });
+  }, result.outputMode);
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   const bootstrapNeeded = correctiveBootstrapNeeded(input.compactState, firstAnalysis.actorMentions);
   let finalAnalysis = firstAnalysis;
@@ -1533,7 +1816,8 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         ANALYSIS_SCHEMA,
         input.settings,
         input.userId,
-        input.fallbackConnectionId
+        input.fallbackConnectionId,
+        connection
       );
       retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
@@ -1544,8 +1828,8 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
         invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
         invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons)
-      });
-      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
+      }, corrective.outputMode);
+      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
       retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
@@ -1566,6 +1850,17 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
       batchId: crypto.randomUUID(),
       messageCount: input.messages.length,
       inputChars: input.messages.reduce((sum, message) => sum + message.content.length, 0),
+      inputTokens: result.providerInputTokens ?? inputMeasurement.totalTokens,
+      stateTokens: stateProjection.telemetry.totalTokens,
+      stateTokenBudget: stateProjection.telemetry.tokenBudget,
+      stateItemsAvailable: stateProjection.telemetry.itemsAvailable,
+      stateItemsIncluded: stateProjection.telemetry.itemsIncluded,
+      stateItemsOmitted: stateProjection.telemetry.itemsOmitted,
+      stateActorCount: stateProjection.telemetry.actorCount,
+      tokenModel: result.meta.model ?? stateProjection.telemetry.tokenModel ?? inputMeasurement.model,
+      tokenizerName: stateProjection.telemetry.tokenizerName ?? inputMeasurement.tokenizerName,
+      tokenCountApproximate: stateProjection.telemetry.tokenCountApproximate || result.providerInputTokens === null && inputMeasurement.approximate,
+      tokenCountFallback: stateProjection.telemetry.tokenCountFallback || result.providerInputTokens === null && inputMeasurement.fallback,
       nontrivial,
       attempts,
       retryReason: attempts === 2 ? "empty_nontrivial_batch" : null,
@@ -1580,7 +1875,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
 }
 var SEED_SYSTEM_PROMPT = [
   "You draft reusable LumiMind character-card seeds.",
-  "Return JSON only. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
+  "Call the required LumiMind result tool exactly once. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
   "The seed must be concise, portable across new chats, and written as private subjective state rather than visible roleplay prose."
 ].join("\n");
 async function generateSeedDraft(input) {
@@ -1688,7 +1983,6 @@ function redactDiagnosticCredentials(value) {
 // src/backend.ts
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
-var MAX_RECORDS = 5e3;
 var RECONCILE_DEBOUNCE_MS = 650;
 var EXTENSION_VERSION = "0.1.1";
 var timelines = /* @__PURE__ */ new Map();
@@ -1701,6 +1995,7 @@ var generationContexts = /* @__PURE__ */ new Map();
 var latestGenerationByChat = /* @__PURE__ */ new Map();
 var connectionByChat = /* @__PURE__ */ new Map();
 var controllerDebugResponses = /* @__PURE__ */ new Map();
+var lastInjectionProjections = /* @__PURE__ */ new Map();
 var lastFrontendUserId = null;
 function cacheKey(userId, chatId) {
   return `${userId}:${chatId}`;
@@ -1743,6 +2038,32 @@ async function getSettings(userId) {
   const loaded = await loadSettings(userId);
   settingsCache.set(userId, loaded);
   return loaded;
+}
+function approximateTokenMeasurement(value, model) {
+  return {
+    totalTokens: Math.ceil(value.length / 4),
+    model,
+    tokenizerName: "Approximate chars / 4",
+    approximate: true,
+    fallback: true
+  };
+}
+async function tokenCounterForConnection(userId, connectionId) {
+  const connection = connectionId ? await spindle.connections.get(connectionId, userId).catch(() => null) : null;
+  return async (value) => {
+    try {
+      const result = await spindle.tokens.countText(value, connection?.model ? { model: connection.model, userId } : { modelSource: "main", userId });
+      return {
+        totalTokens: result.total_tokens,
+        model: result.model || connection?.model || null,
+        tokenizerName: result.tokenizer_name,
+        approximate: result.approximate,
+        fallback: false
+      };
+    } catch {
+      return approximateTokenMeasurement(value, connection?.model ?? null);
+    }
+  };
 }
 async function getTimeline(chatId, userId) {
   const key = storageTimelineKey(userId, chatId);
@@ -1805,7 +2126,8 @@ async function buildFrontendState(userId, requestedChatId, characterId) {
     connections,
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
-    timeline: timeline ? toTimelineView(timeline, settings) : null
+    timeline: timeline ? toTimelineView(timeline, settings) : null,
+    lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null
   };
 }
 async function sendState(userId, chatId, characterId) {
@@ -1834,6 +2156,7 @@ async function buildDeveloperDiagnostics(userId, requestedChatId) {
     activeCharacter: character,
     activePersona: persona,
     controllerRawResponses: chatId ? controllerDebugResponses.get(cacheKey(userId, chatId)) ?? [] : [],
+    lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"]
   });
 }
@@ -1984,7 +2307,7 @@ async function reconcileChat(userId, chatId, force = false) {
     return;
   }
   if (policyChanged) {
-    timeline.records = [];
+    timeline.records = timeline.records.filter((record) => record.skipReason === "pre_activation_history");
     timeline.analysisPolicyHash = policyHash;
     timeline.lastAnalyzedAt = null;
     timeline.error = null;
@@ -2006,7 +2329,6 @@ async function reconcileChat(userId, chatId, force = false) {
       derivation.nextPrefix,
       batch.skipReason
     ));
-    if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
     derivation = rebuildTimeline(timeline, messages);
     return true;
   };
@@ -2074,7 +2396,6 @@ async function reconcileChat(userId, chatId, force = false) {
           `LumiMind analysis quality warning for ${chatId} batch ${result.telemetry.batchId}: ${result.telemetry.warningCodes.join(", ")} (attempts=${result.telemetry.attempts}, acceptedMentions=${result.telemetry.finalActorMentions}, acceptedChanges=${result.telemetry.finalChanges}).`
         );
       }
-      if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);
       timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
@@ -2097,15 +2418,23 @@ function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS) {
     void enqueue(userId, chatId, () => reconcileChat(userId, chatId));
   }, delay));
 }
-async function activateChat(userId, chatId) {
+async function activateChat(userId, chatId, historyMode = "full", recentMessageLimit = 0) {
   const timeline = await getTimeline(chatId, userId);
   timeline.active = true;
   timeline.paused = false;
   timeline.health = "initializing";
   timeline.error = null;
   await initializeHostActors(timeline, userId);
+  if (historyMode === "recent" && recentMessageLimit > 0 && timeline.records.length === 0) {
+    const messages = await getChatMessages(chatId, userId);
+    const skipped = messages.slice(0, Math.max(0, messages.length - Math.floor(recentMessageLimit)));
+    if (skipped.length > 0) {
+      timeline.records.push(...materializeSkippedAnalysisRecords(timeline, skipped, "root", "pre_activation_history"));
+      rebuildTimeline(timeline, messages);
+    }
+  }
   await persistAndPublish(timeline, userId);
-  notice(userId, "info", "LumiMind is building this timeline in the background.");
+  notice(userId, "info", historyMode === "recent" ? `LumiMind is analyzing the most recent ${Math.max(1, Math.floor(recentMessageLimit))} messages in the background.` : "LumiMind is building this timeline from the full committed history in the background.");
   await reconcileChat(userId, chatId);
 }
 async function writeActorToCortex(userId, timeline, actor) {
@@ -2217,22 +2546,28 @@ spindle.registerInterceptor(async (messages, context) => {
     rememberChatUser(chatId, userId);
     const connectionId = readString(context, ["connectionId", "connection_id"]);
     if (connectionId) connectionByChat.set(cacheKey(userId, chatId), connectionId);
+    const generationConnectionId = connectionId ?? connectionByChat.get(cacheKey(userId, chatId)) ?? null;
     const timeline = await getTimeline(chatId, userId);
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
     const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
+    const injectionContext = promptMessages.flatMap((message) => typeof message.content === "string" ? [{ content: message.content, name: typeof message.name === "string" ? message.name : void 0 }] : []);
+    const countTokens = await tokenCounterForConnection(userId, generationConnectionId);
     let targetActorId = null;
     let injection = null;
+    let projection = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
       if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings);
+        projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
+        injection = projection.content;
       }
     } else if (settings.characterCardDirectorMode) {
-      injection = buildDirectorMindInjection(timeline, settings);
+      projection = await buildProjectedDirectorMindInjection(timeline, settings, injectionContext, countTokens);
+      injection = projection.content;
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -2241,8 +2576,10 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      injection = buildMindInjection(timeline, targetActorId, settings);
+      projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
+      injection = projection.content;
     }
+    if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
     if (!injection) return promptMessages;
     const injected = { role: "system", content: injection };
     return {
@@ -2304,6 +2641,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   if (!chatId || !userId) return;
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
+  lastInjectionProjections.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 spindle.permissions.onChanged(() => {
@@ -2332,8 +2670,27 @@ spindle.onFrontendMessage(async (payload, userId) => {
       send({ type: "developer_report", requestId: message.requestId, report }, userId);
       return;
     }
+    if (message.type === "activation_preview") {
+      try {
+        const messages = await getChatMessages(message.chatId, userId);
+        send({ type: "activation_preview", requestId: message.requestId, chatId: message.chatId, messageCount: messages.length }, userId);
+      } catch (error) {
+        send({
+          type: "activation_preview_error",
+          requestId: message.requestId,
+          chatId: message.chatId,
+          message: error instanceof Error ? error.message : "LumiMind could not inspect this chat's history."
+        }, userId);
+      }
+      return;
+    }
     if (message.type === "activate") {
-      await enqueue(userId, message.chatId, () => activateChat(userId, message.chatId));
+      await enqueue(userId, message.chatId, () => activateChat(
+        userId,
+        message.chatId,
+        message.historyMode ?? "full",
+        message.recentMessageLimit ?? 0
+      ));
       return;
     }
     if (message.type === "pause") {

@@ -1,6 +1,16 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
-import { canonicalMindText, makeEmptySeed, mindTextsNearDuplicate, normalizeSeed, stableHash, uniqueStrings } from "./engine";
+import {
+  canonicalMindText,
+  makeEmptySeed,
+  mindTextsNearDuplicate,
+  normalizeSeed,
+  projectControllerState,
+  stableHash,
+  uniqueStrings,
+  type TokenCounter,
+  type TokenMeasurement,
+} from "./engine";
 import type {
   ChatMessageLike,
   ControllerBatchTelemetry,
@@ -32,6 +42,12 @@ export interface AnalysisControllerResult {
   rawResponses: { first: string; retry: string | null };
   telemetry: ControllerBatchTelemetry;
 }
+
+type ResolvedConnection = {
+  id: string | null;
+  provider: string | null;
+  model: string | null;
+};
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -387,11 +403,13 @@ export function makeControllerResponseTelemetry(
   parsed: unknown,
   accepted: ControllerAnalysis,
   diagnostics: Partial<Pick<ControllerResponseTelemetry, "duplicatesSuppressed" | "invalidChangesRejected" | "invalidChangeReasons">> = {},
+  outputMode: ControllerResponseTelemetry["outputMode"] = "json",
 ): ControllerResponseTelemetry {
   const object = asObject(parsed);
   const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
   const duplicatesSuppressed = diagnostics.duplicatesSuppressed ?? 0;
   return {
+    outputMode,
     responseChars: raw.length,
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
@@ -505,35 +523,72 @@ const SEED_SCHEMA: Record<string, unknown> = {
   required: ["schemaVersion", "core", "startingBeliefs", "startingSecrets", "startingGoals", "relationshipPriors", "updatedAt"],
 };
 
-function structuredParameters(provider: string | null, schemaName: string, schema: Record<string, unknown>): Record<string, unknown> {
+function toolChoiceParameters(provider: string | null): Record<string, unknown> {
   const normalized = provider?.trim().toLocaleLowerCase() ?? "";
   if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
-    return { responseMimeType: "application/json", responseSchema: schema };
+    return { toolConfig: { functionCallingConfig: { mode: "ANY" } } };
   }
-  if (normalized === "openai" || normalized === "openrouter") {
-    return { response_format: { type: "json_schema", json_schema: { name: schemaName, strict: true, schema } } };
-  }
-  return {};
+  if (normalized === "anthropic") return { tool_choice: { type: "any" } };
+  return { tool_choice: "required" };
 }
 
-function noReasoningParameters(provider: string | null): Record<string, unknown> {
-  const normalized = provider?.trim().toLocaleLowerCase() ?? "";
-  if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
-    return { thinkingConfig: { thinkingLevel: "minimal", includeThoughts: false } };
-  }
-  if (normalized === "nanogpt") return { reasoning_effort: "none" };
-  return { reasoning: { effort: "none" } };
-}
-
-async function resolveConnection(settings: LumiMindSettings, userId: string, fallbackConnectionId?: string | null): Promise<{
-  id: string | null;
-  provider: string | null;
-  model: string | null;
-}> {
+async function resolveConnection(settings: LumiMindSettings, userId: string, fallbackConnectionId?: string | null): Promise<ResolvedConnection> {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
   if (!id) return { id: null, provider: null, model: null };
   const connection = await spindle.connections.get(id, userId).catch(() => null);
   return { id, provider: connection?.provider ?? null, model: connection?.model ?? null };
+}
+
+function fallbackTokenMeasurement(textValue: string, model: string | null): TokenMeasurement {
+  return {
+    totalTokens: Math.ceil(textValue.length / 4),
+    model,
+    tokenizerName: "Approximate chars / 4",
+    approximate: true,
+    fallback: true,
+  };
+}
+
+async function countTextTokens(textValue: string, connection: ResolvedConnection, userId: string): Promise<TokenMeasurement> {
+  try {
+    const result = await spindle.tokens.countText(textValue, connection.model
+      ? { model: connection.model, userId }
+      : { modelSource: "main", userId });
+    return {
+      totalTokens: result.total_tokens,
+      model: result.model || connection.model,
+      tokenizerName: result.tokenizer_name,
+      approximate: result.approximate,
+      fallback: false,
+    };
+  } catch {
+    return fallbackTokenMeasurement(textValue, connection.model);
+  }
+}
+
+async function countMessageTokens(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  connection: ResolvedConnection,
+  userId: string,
+): Promise<TokenMeasurement> {
+  try {
+    const result = await spindle.tokens.countMessages(messages, connection.model
+      ? { model: connection.model, userId }
+      : { modelSource: "main", userId });
+    return {
+      totalTokens: result.total_tokens,
+      model: result.model || connection.model,
+      tokenizerName: result.tokenizer_name,
+      approximate: result.approximate,
+      fallback: false,
+    };
+  } catch {
+    return fallbackTokenMeasurement(messages.map((message) => `${message.role}\n${message.content}`).join("\n"), connection.model);
+  }
+}
+
+function controllerTokenCounter(connection: ResolvedConnection, userId: string): TokenCounter {
+  return (value) => countTextTokens(value, connection, userId);
 }
 
 async function quietJson(
@@ -544,8 +599,15 @@ async function quietJson(
   settings: LumiMindSettings,
   userId: string,
   fallbackConnectionId?: string | null,
-): Promise<{ parsed: unknown; raw: string; meta: ControllerMeta }> {
-  const connection = await resolveConnection(settings, userId, fallbackConnectionId);
+  resolvedConnection?: ResolvedConnection,
+): Promise<{
+  parsed: unknown;
+  raw: string;
+  meta: ControllerMeta;
+  outputMode: ControllerResponseTelemetry["outputMode"];
+  providerInputTokens: number | null;
+}> {
+  const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
   const result = await spindle.generate.quiet({
     type: "quiet",
     messages: [
@@ -555,20 +617,36 @@ async function quietJson(
     parameters: {
       temperature: settings.controllerTemperature,
       max_tokens: settings.controllerMaxTokens,
-      ...noReasoningParameters(connection.provider),
-      ...structuredParameters(connection.provider, schemaName, schema),
+      ...toolChoiceParameters(connection.provider),
     },
+    tools: [{
+      name: schemaName,
+      description: "Submit the complete structured LumiMind result exactly once.",
+      parameters: schema,
+    }],
+    reasoning: { source: "off" },
     ...(connection.id ? { connection_id: connection.id } : {}),
     userId,
   } as unknown as Parameters<typeof spindle.generate.quiet>[0]);
   const object = asObject(result);
   const content = sanitizeControllerText(text(object.content));
   const reasoning = sanitizeControllerText(text(object.reasoning));
-  const raw = content || reasoning;
+  const toolCall = (Array.isArray(object.tool_calls) ? object.tool_calls : [])
+    .map(asObject)
+    .find((call) => text(call.name) === schemaName && Object.keys(asObject(call.args)).length > 0);
+  const toolArgs = toolCall ? asObject(toolCall.args) : null;
+  const outputMode: ControllerResponseTelemetry["outputMode"] = toolArgs ? "tool" : "json";
+  const raw = toolArgs ? JSON.stringify(toolArgs) : content || reasoning;
+  const usage = asObject(object.usage);
+  const providerInputTokens = typeof usage.prompt_tokens === "number" && Number.isFinite(usage.prompt_tokens)
+    ? Math.max(0, Math.round(usage.prompt_tokens))
+    : null;
   return {
-    parsed: parseJsonValue(raw),
+    parsed: toolArgs ?? parseJsonValue(raw),
     raw,
     meta: { connectionId: connection.id, provider: connection.provider, model: connection.model },
+    outputMode,
+    providerInputTokens,
   };
 }
 
@@ -581,7 +659,7 @@ function renderMessages(messages: ChatMessageLike[]): string {
 
 const ANALYSIS_SYSTEM_PROMPT = [
   "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
-  "Return JSON only. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
+  "Call the required LumiMind result tool exactly once. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
   "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
@@ -602,6 +680,8 @@ const ANALYSIS_SYSTEM_PROMPT = [
   "An entry is an add relative to mind_state even when the evidence describes a state already underway at the beginning of the transcript.",
   "A substantive scene may correctly return an empty changes array when mind_state already covers its supported state. An empty result is suspicious only for a true bootstrap actor with clear subjective evidence and no unresolved entries.",
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
+  "For an actor already in mind_state, copy its exact ref into actorMentions and subjectRef. For a newly discovered actor, use one stable ref consistently in both its actorMention and every change.",
+  "A positive omittedItemCount means lower-ranked state remains stored outside this request. Do not treat omission as proof that the actor has no other state.",
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt.",
 ].join("\n");
 
@@ -650,7 +730,7 @@ export function buildAnalysisPrompt(input: Pick<Parameters<typeof analyzeMessage
     "Messages to analyze:",
     `<analysis_batch>\n${renderMessages(input.messages)}\n</analysis_batch>`,
     "Reconcile; do not summarize. If every supported candidate is COVERED or PROTECTED by mind_state, return actorMentions as appropriate with an empty changes array.",
-    "Return {\"actorMentions\": [...], \"changes\": [...]} now.",
+    "Call the required result tool with {\"actorMentions\": [...], \"changes\": [...]} now.",
   ].join("\n\n");
 }
 
@@ -662,17 +742,31 @@ export async function analyzeMessages(input: {
   userId: string;
   fallbackConnectionId?: string | null;
 }): Promise<AnalysisControllerResult> {
-  const prompt = buildAnalysisPrompt(input);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
+  const stateProjection = await projectControllerState(
+    input.compactState,
+    input.messages,
+    input.recentContext,
+    input.settings.analysisStateTokenBudget,
+    controllerTokenCounter(connection, input.userId),
+  );
+  const prompt = buildAnalysisPrompt({ ...input, compactState: stateProjection.state });
+  const systemPrompt = analysisSystemPrompt(input.settings);
+  const inputMeasurement = await countMessageTokens([
+    { role: "system", content: systemPrompt },
+    { role: "user", content: prompt },
+  ], connection, input.userId);
   const result = await quietJson(
     prompt,
-    analysisSystemPrompt(input.settings),
+    systemPrompt,
     "lumi_mind_analysis_v1",
     ANALYSIS_SCHEMA,
     input.settings,
     input.userId,
     input.fallbackConnectionId,
+    connection,
   );
-  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable JSON.");
+  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
   const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
@@ -681,7 +775,7 @@ export async function analyzeMessages(input: {
     duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
     invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
     invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons),
-  });
+  }, result.outputMode);
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   const bootstrapNeeded = correctiveBootstrapNeeded(input.compactState, firstAnalysis.actorMentions);
   let finalAnalysis = firstAnalysis;
@@ -701,6 +795,7 @@ export async function analyzeMessages(input: {
         input.settings,
         input.userId,
         input.fallbackConnectionId,
+        connection,
       );
       retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
@@ -711,8 +806,8 @@ export async function analyzeMessages(input: {
         duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
         invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
         invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons),
-      });
-      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable JSON.");
+      }, corrective.outputMode);
+      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
       retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
@@ -739,6 +834,17 @@ export async function analyzeMessages(input: {
       batchId: crypto.randomUUID(),
       messageCount: input.messages.length,
       inputChars: input.messages.reduce((sum, message) => sum + message.content.length, 0),
+      inputTokens: result.providerInputTokens ?? inputMeasurement.totalTokens,
+      stateTokens: stateProjection.telemetry.totalTokens,
+      stateTokenBudget: stateProjection.telemetry.tokenBudget,
+      stateItemsAvailable: stateProjection.telemetry.itemsAvailable,
+      stateItemsIncluded: stateProjection.telemetry.itemsIncluded,
+      stateItemsOmitted: stateProjection.telemetry.itemsOmitted,
+      stateActorCount: stateProjection.telemetry.actorCount,
+      tokenModel: result.meta.model ?? stateProjection.telemetry.tokenModel ?? inputMeasurement.model,
+      tokenizerName: stateProjection.telemetry.tokenizerName ?? inputMeasurement.tokenizerName,
+      tokenCountApproximate: stateProjection.telemetry.tokenCountApproximate || (result.providerInputTokens === null && inputMeasurement.approximate),
+      tokenCountFallback: stateProjection.telemetry.tokenCountFallback || (result.providerInputTokens === null && inputMeasurement.fallback),
       nontrivial,
       attempts,
       retryReason: attempts === 2 ? "empty_nontrivial_batch" : null,
@@ -754,7 +860,7 @@ export async function analyzeMessages(input: {
 
 const SEED_SYSTEM_PROMPT = [
   "You draft reusable LumiMind character-card seeds.",
-  "Return JSON only. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
+  "Call the required LumiMind result tool exactly once. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
   "The seed must be concise, portable across new chats, and written as private subjective state rather than visible roleplay prose.",
 ].join("\n");
 

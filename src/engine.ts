@@ -29,6 +29,8 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
   controllerMaxTokens: 1800,
+  analysisStateTokenBudget: 24_000,
+  injectionTokenBudget: 8_000,
   analysisContextMessageLimit: 4,
   chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
@@ -96,14 +98,36 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
   const controllerMaxTokens = typeof raw.controllerMaxTokens === "number"
     ? raw.controllerMaxTokens
     : Number(raw.controllerMaxTokens);
+  const analysisStateTokenBudget = typeof raw.analysisStateTokenBudget === "number"
+    ? raw.analysisStateTokenBudget
+    : Number(raw.analysisStateTokenBudget);
+  const injectionTokenBudget = typeof raw.injectionTokenBudget === "number"
+    ? raw.injectionTokenBudget
+    : Number(raw.injectionTokenBudget);
+  const analysisContextMessageLimit = typeof raw.analysisContextMessageLimit === "number"
+    ? raw.analysisContextMessageLimit
+    : Number(raw.analysisContextMessageLimit);
+  const chatHistoryMessageLimit = typeof raw.chatHistoryMessageLimit === "number"
+    ? raw.chatHistoryMessageLimit
+    : Number(raw.chatHistoryMessageLimit);
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
     controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens)
       ? Math.max(300, controllerMaxTokens)
       : DEFAULT_SETTINGS.controllerMaxTokens),
-    analysisContextMessageLimit: Math.round(clamp(raw.analysisContextMessageLimit, 0, 50, DEFAULT_SETTINGS.analysisContextMessageLimit)),
-    chatHistoryMessageLimit: Math.round(clamp(raw.chatHistoryMessageLimit, 0, 1000, DEFAULT_SETTINGS.chatHistoryMessageLimit)),
+    analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget)
+      ? Math.max(0, analysisStateTokenBudget)
+      : DEFAULT_SETTINGS.analysisStateTokenBudget),
+    injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget)
+      ? Math.max(0, injectionTokenBudget)
+      : DEFAULT_SETTINGS.injectionTokenBudget),
+    analysisContextMessageLimit: Math.round(Number.isFinite(analysisContextMessageLimit)
+      ? Math.max(0, analysisContextMessageLimit)
+      : DEFAULT_SETTINGS.analysisContextMessageLimit),
+    chatHistoryMessageLimit: Math.round(Number.isFinite(chatHistoryMessageLimit)
+      ? Math.max(0, chatHistoryMessageLimit)
+      : DEFAULT_SETTINGS.chatHistoryMessageLimit),
     personaMindEnabled: raw.personaMindEnabled !== false,
     characterCardDirectorMode,
     cortexImportEnabled: raw.cortexImportEnabled !== false,
@@ -993,12 +1017,15 @@ function actorLabel(actors: Record<string, ActorRecord>, id: string): string {
 function formatMind(
   mind: ActorMind,
   actors: Record<string, ActorRecord>,
+  includedItemIds?: Set<string>,
+  includeEmpty = false,
 ): string {
   const actor = actors[mind.actorId];
   if (!actor) return "";
   const relevant = new Set(mind.presentActorIds);
   const items = [...mind.items]
     .filter((item) => item.status === "active" || item.status === "uncertain")
+    .filter((item) => !includedItemIds || includedItemIds.has(item.id))
     .sort((left, right) => itemScore(right, relevant) - itemScore(left, relevant));
   const details: string[] = [];
   if (mind.core.values.length) details.push(`Values: ${mind.core.values.join("; ")}`);
@@ -1012,25 +1039,33 @@ function formatMind(
     const line = `- ${item.category}: ${item.text}${targets}${confidence}`;
     details.push(line);
   }
-  if (!details.length) return "";
+  if (!details.length && !includeEmpty) return "";
   return [`${actor.canonicalName} (${actor.kind}${actor.present ? ", present" : ""})`, ...details].join("\n");
 }
 
-export function buildMindInjection(
+function presentManagedActors(
   timeline: ChatTimelineV1,
+  settings: LumiMindSettings,
   targetActorId: string | null,
-  settings: LumiMindSettings = DEFAULT_SETTINGS,
-): string | null {
-  if (!timeline.active || timeline.paused) return null;
-  const presentActors = Object.values(timeline.actors)
+): ActorRecord[] {
+  return Object.values(timeline.actors)
     .filter((actor) => actor.present && timeline.minds[actor.id] && actorMindEnabled(actor, settings))
     .sort((left, right) =>
       Number(right.id === targetActorId) - Number(left.id === targetActorId) ||
       Number(right.confirmed) - Number(left.confirmed) ||
       right.updatedAt - left.updatedAt,
     );
+}
+
+function renderMindInjection(
+  timeline: ChatTimelineV1,
+  targetActorId: string | null,
+  settings: LumiMindSettings,
+  includedItemIds?: Set<string>,
+): string | null {
+  const presentActors = presentManagedActors(timeline, settings, targetActorId);
   const minds = presentActors
-    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors))
+    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, includedItemIds, !!includedItemIds))
     .filter(Boolean);
   const body = minds.join("\n\n");
   const unmanagedPersonaGuidance = !settings.personaMindEnabled
@@ -1048,20 +1083,24 @@ export function buildMindInjection(
   ].join("\n");
 }
 
-export function buildDirectorMindInjection(
+export function buildMindInjection(
   timeline: ChatTimelineV1,
+  targetActorId: string | null,
   settings: LumiMindSettings = DEFAULT_SETTINGS,
 ): string | null {
   if (!timeline.active || timeline.paused) return null;
-  const actors = Object.values(timeline.actors)
-    .filter((actor) => actor.present && actorMindEnabled(actor, settings) && timeline.minds[actor.id])
-    .sort((left, right) =>
-      Number(right.confirmed) - Number(left.confirmed) ||
-      right.updatedAt - left.updatedAt,
-    );
+  return renderMindInjection(timeline, targetActorId, settings);
+}
+
+function renderDirectorMindInjection(
+  timeline: ChatTimelineV1,
+  settings: LumiMindSettings,
+  includedItemIds?: Set<string>,
+): string | null {
+  const actors = presentManagedActors(timeline, settings, null);
   if (!actors.length) return null;
   const body = actors
-    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors))
+    .map((actor) => formatMind(timeline.minds[actor.id], timeline.actors, includedItemIds, !!includedItemIds))
     .filter(Boolean)
     .join("\n\n");
   if (!body.trim()) return null;
@@ -1074,6 +1113,14 @@ export function buildDirectorMindInjection(
     body,
     "[/LumiMind]",
   ].join("\n");
+}
+
+export function buildDirectorMindInjection(
+  timeline: ChatTimelineV1,
+  settings: LumiMindSettings = DEFAULT_SETTINGS,
+): string | null {
+  if (!timeline.active || timeline.paused) return null;
+  return renderDirectorMindInjection(timeline, settings);
 }
 
 function publicStance(mind: ActorMind | undefined): string {
@@ -1158,7 +1205,6 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
 export function compactStateForController(
   timeline: ChatTimelineV1,
   settings: LumiMindSettings = DEFAULT_SETTINGS,
-  _maxItemsPerActor?: number,
 ): unknown {
   return Object.values(timeline.actors).map((actor) => {
     const managed = actorMindEnabled(actor, settings);
@@ -1194,4 +1240,363 @@ export function compactStateForController(
       } : {}),
     };
   });
+}
+
+export interface TokenMeasurement {
+  totalTokens: number;
+  model: string | null;
+  tokenizerName: string | null;
+  approximate: boolean;
+  fallback: boolean;
+}
+
+export type TokenCounter = (text: string) => Promise<TokenMeasurement>;
+
+export interface ProjectionTelemetry {
+  tokenBudget: number;
+  totalTokens: number;
+  itemsAvailable: number;
+  itemsIncluded: number;
+  itemsOmitted: number;
+  actorCount: number;
+  tokenModel: string | null;
+  tokenizerName: string | null;
+  tokenCountApproximate: boolean;
+  tokenCountFallback: boolean;
+}
+
+export interface ControllerStateProjection {
+  state: unknown;
+  telemetry: ProjectionTelemetry;
+}
+
+export interface MindInjectionProjection {
+  content: string | null;
+  telemetry: ProjectionTelemetry;
+}
+
+type CompactStateItem = {
+  id: string;
+  category?: MindCategory;
+  text?: string;
+  targetActorIds?: string[];
+  concealedFromActorIds?: string[];
+  locked?: boolean;
+  pinned?: boolean;
+  source?: string;
+  controllerWritable?: boolean;
+  [key: string]: unknown;
+};
+
+type CompactStateActor = {
+  ref: string;
+  name: string;
+  aliases: string[];
+  managed?: boolean;
+  present?: boolean;
+  confirmed?: boolean;
+  items?: CompactStateItem[];
+  [key: string]: unknown;
+};
+
+function projectionTelemetry(
+  budget: number,
+  measurement: TokenMeasurement,
+  available: number,
+  included: number,
+  actorCount: number,
+): ProjectionTelemetry {
+  return {
+    tokenBudget: budget,
+    totalTokens: measurement.totalTokens,
+    itemsAvailable: available,
+    itemsIncluded: included,
+    itemsOmitted: Math.max(0, available - included),
+    actorCount,
+    tokenModel: measurement.model,
+    tokenizerName: measurement.tokenizerName,
+    tokenCountApproximate: measurement.approximate,
+    tokenCountFallback: measurement.fallback,
+  };
+}
+
+function referenceAppears(content: string, reference: string): boolean {
+  const value = reference.trim();
+  if (value.length < 2) return false;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, "iu").test(content);
+}
+
+function textTokenSet(value: string): Set<string> {
+  return new Set(canonicalMindText(value).split(" ").filter(Boolean));
+}
+
+function sharedTokenCount(value: string, tokens: Set<string>): number {
+  if (!value || tokens.size === 0) return 0;
+  let shared = 0;
+  for (const token of textTokenSet(value)) if (tokens.has(token)) shared += 1;
+  return shared;
+}
+
+function roundRobinOrder<T>(queues: Array<{ score: number; lead: number; values: T[] }>): T[] {
+  const orderedQueues = queues
+    .filter((queue) => queue.values.length > 0)
+    .sort((left, right) => right.score - left.score);
+  const result: T[] = [];
+  const consumed = new Map(orderedQueues.map((queue) => [queue, 0]));
+  const maxLead = Math.max(0, ...orderedQueues.map((queue) => queue.lead));
+  for (let depth = 0; depth < maxLead; depth += 1) {
+    for (const queue of orderedQueues) {
+      if (depth >= queue.lead) continue;
+      const value = queue.values[depth];
+      if (value !== undefined) {
+        result.push(value);
+        consumed.set(queue, depth + 1);
+      }
+    }
+  }
+  while (orderedQueues.some((queue) => (consumed.get(queue) ?? 0) < queue.values.length)) {
+    for (const queue of orderedQueues) {
+      const index = consumed.get(queue) ?? 0;
+      const value = queue.values[index];
+      if (value !== undefined) {
+        result.push(value);
+        consumed.set(queue, index + 1);
+      }
+    }
+  }
+  return result;
+}
+
+async function fitProjectionToBudget(
+  fullText: string,
+  baseText: string,
+  orderedCandidates: Array<{ id: string; estimatedChars: number }>,
+  tokenBudget: number,
+  countTokens: TokenCounter,
+  render: (includedIds: Set<string>) => string,
+): Promise<{ text: string; includedIds: Set<string>; measurement: TokenMeasurement }> {
+  const fullMeasurement = await countTokens(fullText);
+  if (tokenBudget === 0 || fullMeasurement.totalTokens <= tokenBudget) {
+    return {
+      text: fullText,
+      includedIds: new Set(orderedCandidates.map((candidate) => candidate.id)),
+      measurement: fullMeasurement,
+    };
+  }
+
+  const baseMeasurement = await countTokens(baseText);
+  if (baseMeasurement.totalTokens >= tokenBudget || orderedCandidates.length === 0) {
+    return { text: baseText, includedIds: new Set(), measurement: baseMeasurement };
+  }
+
+  const charsPerToken = Math.max(1, fullText.length / Math.max(1, fullMeasurement.totalTokens));
+  const estimatedAvailableChars = Math.max(0, (tokenBudget - baseMeasurement.totalTokens) * charsPerToken);
+  const selectedOrder: string[] = [];
+  let estimatedChars = 0;
+  for (const candidate of orderedCandidates) {
+    if (estimatedChars + candidate.estimatedChars > estimatedAvailableChars) continue;
+    selectedOrder.push(candidate.id);
+    estimatedChars += candidate.estimatedChars;
+  }
+
+  let includedIds = new Set(selectedOrder);
+  let text = render(includedIds);
+  let measurement = await countTokens(text);
+  while (measurement.totalTokens > tokenBudget && selectedOrder.length > 0) {
+    const keepRatio = tokenBudget / Math.max(1, measurement.totalTokens);
+    const keepCount = Math.max(0, Math.min(selectedOrder.length - 1, Math.floor(selectedOrder.length * keepRatio) - 1));
+    selectedOrder.splice(keepCount);
+    includedIds = new Set(selectedOrder);
+    text = render(includedIds);
+    measurement = await countTokens(text);
+  }
+  return { text, includedIds, measurement };
+}
+
+function compactActors(value: unknown): CompactStateActor[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    const actor = asObject(entry);
+    const items = Array.isArray(actor.items)
+      ? actor.items.flatMap((item) => {
+          const raw = asObject(item);
+          const id = stringValue(raw.id);
+          return id ? [{ ...raw, id } as CompactStateItem] : [];
+        })
+      : undefined;
+    return {
+      ...actor,
+      ref: stringValue(actor.ref),
+      name: stringValue(actor.name),
+      aliases: strings(actor.aliases),
+      ...(items ? { items } : {}),
+    } as CompactStateActor;
+  });
+}
+
+function renderCompactStateProjection(actors: CompactStateActor[], includedIds: Set<string>): CompactStateActor[] {
+  return actors.map((actor) => {
+    if (!actor.items) return { ...actor };
+    const items = actor.items.filter((item) => includedIds.has(item.id));
+    return {
+      ...actor,
+      items,
+      availableItemCount: actor.items.length,
+      omittedItemCount: actor.items.length - items.length,
+    };
+  });
+}
+
+function orderedCompactStateCandidates(
+  actors: CompactStateActor[],
+  messages: ChatMessageLike[],
+  recentContext: ChatMessageLike[],
+): Array<{ id: string; estimatedChars: number }> {
+  const currentText = messages.map((message) => `${message.name ?? ""}\n${message.content}`).join("\n");
+  const contextText = recentContext.map((message) => `${message.name ?? ""}\n${message.content}`).join("\n");
+  const currentTokens = textTokenSet(currentText);
+  const contextTokens = textTokenSet(contextText);
+  const relevantActorRefs = new Set(
+    actors
+      .filter((actor) => [actor.name, ...actor.aliases].some((reference) => referenceAppears(currentText, reference)))
+      .map((actor) => actor.ref),
+  );
+
+  return roundRobinOrder(actors.map((actor) => {
+    const currentMention = [actor.name, ...actor.aliases].some((reference) => referenceAppears(currentText, reference));
+    const contextMention = [actor.name, ...actor.aliases].some((reference) => referenceAppears(contextText, reference));
+    const actorScore = Number(currentMention) * 1_000 + Number(actor.present) * 500 + Number(contextMention) * 250 + Number(actor.confirmed) * 25;
+    const values = (actor.items ?? [])
+      .map((item, index) => {
+        const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true || (item.source && item.source !== "controller");
+        const targetRelevant = (item.targetActorIds ?? []).some((ref) => relevantActorRefs.has(ref));
+        const score = Number(protectedItem) * 2_000 + Number(targetRelevant) * 750 +
+          sharedTokenCount(item.text ?? "", currentTokens) * 120 + sharedTokenCount(item.text ?? "", contextTokens) * 30 +
+          (item.category ? CATEGORY_ORDER[item.category] ?? 0 : 0) * 5 - index;
+        return { item, score };
+      })
+      .sort((left, right) => right.score - left.score)
+      .map(({ item }) => ({ id: item.id, estimatedChars: JSON.stringify(item).length + 2 }));
+    return { score: actorScore, lead: currentMention ? 3 : actor.present || contextMention ? 1 : 0, values };
+  }));
+}
+
+export async function projectControllerState(
+  compactState: unknown,
+  messages: ChatMessageLike[],
+  recentContext: ChatMessageLike[],
+  tokenBudget: number,
+  countTokens: TokenCounter,
+): Promise<ControllerStateProjection> {
+  const actors = compactActors(compactState);
+  const available = actors.reduce((sum, actor) => sum + (actor.items?.length ?? 0), 0);
+  const fullText = JSON.stringify(compactState);
+  const orderedCandidates = orderedCompactStateCandidates(actors, messages, recentContext);
+  const baseState = renderCompactStateProjection(actors, new Set());
+  const render = (includedIds: Set<string>) => JSON.stringify(renderCompactStateProjection(actors, includedIds));
+  const fitted = await fitProjectionToBudget(
+    fullText,
+    JSON.stringify(baseState),
+    orderedCandidates,
+    tokenBudget,
+    countTokens,
+    render,
+  );
+  const fullIncluded = tokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
+  const state = fullIncluded ? compactState : JSON.parse(fitted.text) as unknown;
+  return {
+    state,
+    telemetry: projectionTelemetry(tokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length),
+  };
+}
+
+function orderedInjectionCandidates(
+  timeline: ChatTimelineV1,
+  actors: ActorRecord[],
+  targetActorId: string | null,
+  contextMessages: Array<{ content: string; name?: string }>,
+): Array<{ id: string; estimatedChars: number }> {
+  const contextText = contextMessages.map((message) => `${message.name ?? ""}\n${message.content}`).join("\n");
+  const contextTokens = textTokenSet(contextText);
+  const relevantActorIds = new Set(
+    actors
+      .filter((actor) => actor.id === targetActorId || [actor.canonicalName, ...actor.aliases].some((reference) => referenceAppears(contextText, reference)))
+      .map((actor) => actor.id),
+  );
+  return roundRobinOrder(actors.map((actor) => {
+    const actorScore = Number(actor.id === targetActorId) * 2_000 + Number(relevantActorIds.has(actor.id)) * 1_000 + Number(actor.confirmed) * 25;
+    const values = (timeline.minds[actor.id]?.items ?? [])
+      .filter((item) => item.status === "active" || item.status === "uncertain")
+      .map((item) => ({
+        item,
+        score: Number(protectedMindItem(item)) * 2_000 +
+          Number(item.targetActorIds.some((id) => relevantActorIds.has(id))) * 750 +
+          sharedTokenCount(item.text, contextTokens) * 100 + itemScore(item, relevantActorIds),
+      }))
+      .sort((left, right) => right.score - left.score)
+      .map(({ item }) => ({ id: item.id, estimatedChars: item.text.length + item.id.length + 48 }));
+    return { score: actorScore, lead: actor.id === targetActorId ? 4 : relevantActorIds.has(actor.id) ? 2 : 0, values };
+  }));
+}
+
+async function projectMindInjection(
+  timeline: ChatTimelineV1,
+  targetActorId: string | null,
+  settings: LumiMindSettings,
+  contextMessages: Array<{ content: string; name?: string }>,
+  countTokens: TokenCounter,
+  director: boolean,
+): Promise<MindInjectionProjection> {
+  const actors = presentManagedActors(timeline, settings, director ? null : targetActorId);
+  const allItems = actors.flatMap((actor) => (timeline.minds[actor.id]?.items ?? [])
+    .filter((item) => item.status === "active" || item.status === "uncertain")
+  );
+  const allItemIds = new Set(allItems.map((item) => item.id));
+  const available = allItems.length;
+  const fullContent = director
+    ? renderDirectorMindInjection(timeline, settings, allItemIds)
+    : renderMindInjection(timeline, targetActorId, settings, allItemIds);
+  const emptyMeasurement = await countTokens(fullContent ?? "");
+  if (!fullContent) {
+    return { content: null, telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
+  }
+  const orderedCandidates = orderedInjectionCandidates(timeline, actors, targetActorId, contextMessages);
+  const render = (includedIds: Set<string>) => (
+    director
+      ? renderDirectorMindInjection(timeline, settings, includedIds)
+      : renderMindInjection(timeline, targetActorId, settings, includedIds)
+  ) ?? "";
+  const fitted = await fitProjectionToBudget(
+    fullContent,
+    render(new Set()),
+    orderedCandidates,
+    settings.injectionTokenBudget,
+    countTokens,
+    render,
+  );
+  const fullIncluded = settings.injectionTokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
+  return {
+    content: fullIncluded ? fullContent : fitted.text,
+    telemetry: projectionTelemetry(settings.injectionTokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length),
+  };
+}
+
+export function buildProjectedMindInjection(
+  timeline: ChatTimelineV1,
+  targetActorId: string | null,
+  settings: LumiMindSettings,
+  contextMessages: Array<{ content: string; name?: string }>,
+  countTokens: TokenCounter,
+): Promise<MindInjectionProjection> {
+  return projectMindInjection(timeline, targetActorId, settings, contextMessages, countTokens, false);
+}
+
+export function buildProjectedDirectorMindInjection(
+  timeline: ChatTimelineV1,
+  settings: LumiMindSettings,
+  contextMessages: Array<{ content: string; name?: string }>,
+  countTokens: TokenCounter,
+): Promise<MindInjectionProjection> {
+  return projectMindInjection(timeline, null, settings, contextMessages, countTokens, true);
 }

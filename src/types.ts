@@ -138,7 +138,7 @@ export interface AnalysisRecord {
   actorMentions: ActorMentionDelta[];
   deltas: MindDelta[];
   reduction?: MindReductionTelemetry;
-  skipReason?: "unmanaged_user_message";
+  skipReason?: "unmanaged_user_message" | "pre_activation_history";
   controller: {
     connectionId: string | null;
     provider: string | null;
@@ -151,6 +151,7 @@ export interface AnalysisRecord {
 export type ControllerWarningCode = "empty_nontrivial_batch" | "normalization_drop" | "retry_failed";
 
 export interface ControllerResponseTelemetry {
+  outputMode: "tool" | "json";
   responseChars: number;
   responseHash: string;
   rawActorMentions: number;
@@ -167,6 +168,17 @@ export interface ControllerBatchTelemetry {
   batchId: string;
   messageCount: number;
   inputChars: number;
+  inputTokens: number;
+  stateTokens: number;
+  stateTokenBudget: number;
+  stateItemsAvailable: number;
+  stateItemsIncluded: number;
+  stateItemsOmitted: number;
+  stateActorCount: number;
+  tokenModel: string | null;
+  tokenizerName: string | null;
+  tokenCountApproximate: boolean;
+  tokenCountFallback: boolean;
   nontrivial: boolean;
   attempts: number;
   retryReason: "empty_nontrivial_batch" | null;
@@ -212,6 +224,8 @@ export interface LumiMindSettings {
   controllerConnectionId: string | null;
   controllerTemperature: number;
   controllerMaxTokens: number;
+  analysisStateTokenBudget: number;
+  injectionTokenBudget: number;
   analysisContextMessageLimit: number;
   chatHistoryMessageLimit: number;
   personaMindEnabled: boolean;
@@ -220,6 +234,19 @@ export interface LumiMindSettings {
   cortexWritebackEnabled: boolean;
   privateInteropEnabled: boolean;
   spoilerSafe: boolean;
+}
+
+export interface InjectionProjectionTelemetry {
+  tokenBudget: number;
+  totalTokens: number;
+  itemsAvailable: number;
+  itemsIncluded: number;
+  itemsOmitted: number;
+  actorCount: number;
+  tokenModel: string | null;
+  tokenizerName: string | null;
+  tokenCountApproximate: boolean;
+  tokenCountFallback: boolean;
 }
 
 export interface PermissionState {
@@ -296,13 +323,15 @@ export interface FrontendState {
   activeChatId: string | null;
   activeCharacterId: string | null;
   timeline: TimelineView | null;
+  lastInjectionProjection?: InjectionProjectionTelemetry | null;
 }
 
 export type FrontendToBackend =
   | { type: "ready"; chatId?: string | null; characterId?: string | null }
   | { type: "refresh"; chatId?: string | null; characterId?: string | null }
   | { type: "developer_report"; chatId?: string | null; requestId: string }
-  | { type: "activate"; chatId: string }
+  | { type: "activation_preview"; chatId: string; requestId: string }
+  | { type: "activate"; chatId: string; historyMode?: "full" | "recent"; recentMessageLimit?: number }
   | { type: "pause"; chatId: string; paused: boolean }
   | { type: "rebuild"; chatId: string }
   | { type: "retry"; chatId: string }
@@ -326,6 +355,8 @@ export type BackendToFrontend =
   | { type: "state"; state: FrontendState }
   | { type: "developer_report"; requestId: string; report: unknown }
   | { type: "developer_report_error"; requestId: string; message: string }
+  | { type: "activation_preview"; requestId: string; chatId: string; messageCount: number }
+  | { type: "activation_preview_error"; requestId: string; chatId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }
   | { type: "notice"; tone: "info" | "success" | "warning" | "error"; message: string }
   | { type: "error"; message: string };

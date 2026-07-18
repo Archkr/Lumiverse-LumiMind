@@ -105,14 +105,14 @@ Background controller analysis
 Branch-aware timeline checkpoint
       │
       ▼
-Next generation receives every present managed mind's unresolved state
+Next generation receives a token-budgeted projection of present managed minds
 ```
 
 1. **You activate a chat.** New chats remain off until you explicitly enable them.
-2. **LumiMind reads committed history.** Existing messages are initialized in bounded background batches.
+2. **LumiMind reads committed history.** Existing messages are initialized in bounded background batches. For chats with 50 or more messages, activation asks whether to analyze the full history or only the most recent range configured by **Chat history messages**.
 3. **The controller returns evidence-linked changes.** Each accepted entry records its source message, swipe, confidence, and provenance.
 4. **The timeline is folded deterministically.** Current minds are rebuilt from the compatible records on the active branch.
-5. **The next reply gets a cached checkpoint.** LumiMind injects every present managed actor and all of their active or uncertain state.
+5. **The next reply gets a cached checkpoint.** LumiMind keeps a heading for every present managed actor and injects the highest-value active or uncertain state that fits the configured token budget. The complete state remains stored.
 6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them.
 
 If a substantive batch leaves a genuinely uninitialized actor without usable mental state, LumiMind performs at most one focused corrective pass. An empty change set is healthy when the existing ledger already covers the scene.
@@ -161,7 +161,7 @@ Use the update action on LumiMind’s entry in Lumiverse’s Extensions panel, t
 |---|---|---|
 | 1 | Open a character or group chat | Lumiverse |
 | 2 | Open **Mind Lens** | Drawer or `Ctrl+K` |
-| 3 | Choose **Activate Mind Lens** | Mind Lens |
+| 3 | Choose **Activate Mind Lens**; on chats with 50+ messages, choose full or configured-recent history | Mind Lens |
 | 4 | Select a controller connection, or keep the active-connection fallback | Settings |
 | 5 | Choose whether LumiMind may manage your persona | Settings → Roleplay behavior |
 | 6 | Enable Director mode if the card portrays a cast instead of itself | Settings → Roleplay behavior |
@@ -183,7 +183,7 @@ Use this when the active character card represents one in-world character.
 - The card receives its own mind.
 - Solo and group generations target the exact selected character.
 - Every present managed actor is included in the private injection.
-- Active and uncertain state is included without an extension-level injection cap.
+- Active and uncertain state is ranked into the configurable private-injection token budget; `0` includes it all.
 - Self-concept remains available to analysis and Mind Lens but is omitted from generation injection because the host already supplies the character card.
 
 ### Director card
@@ -279,7 +279,11 @@ Open **Mind Lens → Settings → Diagnostics** to inspect:
 - accepted mentions and mental-state changes;
 - privacy-safe rejection reasons for malformed, stale, unknown, missing-target, or protected changes;
 - corrective attempts and retry failures;
-- privacy-safe response lengths and hashes.
+- privacy-safe response lengths and hashes;
+- actual controller input/state token counts and configured state budgets;
+- included and omitted state-entry counts, model/tokenizer metadata, and approximate/fallback status;
+- tool-call versus plain-JSON response mode;
+- the most recent generation-injection token and projection counts.
 
 **Copy report** produces formatted JSON suitable for a bug report. It excludes story text, beliefs, secrets, raw controller output, evidence excerpts, actor names, aliases, credentials, and full entity IDs.
 
@@ -311,6 +315,7 @@ LumiMind is designed for conversations that do not stay perfectly linear.
 | Event | What LumiMind does |
 |---|---|
 | New committed turn | Analyzes the new suffix in the background. |
+| First activation with 50+ messages | Asks whether to analyze the full transcript or checkpoint the older prefix and start at the configured recent-history range. |
 | Regeneration or swipe | Restores a compatible cached checkpoint when possible and replays the affected suffix when needed. |
 | Message edit | Invalidates analysis from the earliest changed message forward. |
 | Message deletion | Rebuilds from the earliest affected point. |
@@ -341,8 +346,12 @@ LumiMind settings are user-scoped and apply across chats.
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
 | Analysis output tokens | `1,800` | Maximum output requested per analysis call, with no LumiMind-imposed upper bound. The selected model or provider may enforce its own limit. |
+| Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |
+| Private injection tokens | `8,000` | Target token budget for state added to a roleplay prompt. All stored state remains in the timeline and Mind Lens; `0` injects all eligible state. |
 | Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
-| Chat history messages | Unlimited | Maximum number of stored chat messages retained in the main generation prompt while LumiMind is active; `0` keeps the full history. |
+| Chat history messages | Unlimited | Maximum number of stored chat messages retained in the main generation prompt and the optional recent range offered on first activation; `0` keeps the full history. |
+
+LumiMind does not impose maximum values on the output-token, state-token, injection-token, analysis-context, or chat-history fields. Model and provider context windows still apply to the final requests they receive.
 
 ### Privacy and interoperability
 
@@ -369,9 +378,11 @@ Additional calls can occur when:
 - running one corrective pass after a substantive empty bootstrap result;
 - generating a Mind Seed draft.
 
-Initial history is analyzed in bounded batches. You can pause a timeline whenever you do not want background analysis costs.
+Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
 
-The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint and injects every present managed actor's active or uncertain state in one system message. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
+The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
+
+Controller analysis uses the selected controller model's tokenizer and always keeps actor identity stubs available. Ranking favors actors named in the current batch, current presence, lexical relevance, protected or pinned state, relationships to relevant actors, and recency, with fair allocation across relevant actors. LumiMind uses Spindle's provider mapping to force one schema-backed tool call and disables inherited reasoning with `reasoning: { source: "off" }`; plain JSON remains a compatibility fallback. If tokenization fails, diagnostics mark the `characters / 4` estimate used for that request.
 
 LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to the active connection for the chat. It uses Lumiverse connection profiles and does not read or store API credentials.
 
@@ -409,7 +420,7 @@ LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to 
 
 ### Controller data
 
-The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, and the compact state needed to update the timeline. Treat that connection with the same privacy expectations as any model connection used for chat.
+The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, all actor registry stubs, and the highest-ranked unresolved state that fits the analysis-state token budget. A budget of `0` sends all unresolved state. Treat that connection with the same privacy expectations as any model connection used for chat.
 
 Diagnostics store counts, lengths, hashes, provider metadata, warning codes, and sanitized rejection reason codes—not raw controller responses or private story content.
 
@@ -505,6 +516,15 @@ Mind Lens treats a technically compatible but suspiciously empty bootstrap resul
 3. Check whether the corrective pass ran or failed.
 4. Choose **Rebuild analysis** from the warning or Changes view.
 5. If it remains empty, try a controller with stronger structured-output support and copy the sanitized report for a bug report.
+
+</details>
+
+<details>
+<summary><b>A long existing chat will take too many controller calls</b></summary>
+
+When activating a chat with at least 50 committed messages, choose the recent-history option. It uses the current **Chat history messages** value and checkpoints the older prefix as intentionally skipped. If that setting is `0` (unlimited), change it to the recent range you want before activation; the dialog otherwise offers full history or cancel.
+
+This choice affects first-time background analysis only. It does not delete messages or stored LumiMind state, and it does not cap future turns. Choosing **Rebuild** later deliberately clears the activation cutoff and analyzes the full committed history.
 
 </details>
 

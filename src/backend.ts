@@ -6,8 +6,8 @@ import {
   DEFAULT_SETTINGS,
   addManualItem,
   analysisPolicyHash,
-  buildDirectorMindInjection,
-  buildMindInjection,
+  buildProjectedDirectorMindInjection,
+  buildProjectedMindInjection,
   compactStateForController,
   createTimeline,
   limitChatHistoryMessages,
@@ -31,6 +31,8 @@ import {
   toTimelineView,
   uniqueStrings,
   upsertActor,
+  type TokenCounter,
+  type TokenMeasurement,
 } from "./engine";
 import { deleteTimeline, loadSettings, loadTimeline, saveSettings, saveTimeline } from "./storage";
 import { makeMindLumiStateSnapshot } from "./lumi-state";
@@ -51,7 +53,6 @@ import {
 
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
-const MAX_RECORDS = 5000;
 const RECONCILE_DEBOUNCE_MS = 650;
 const EXTENSION_VERSION = "0.1.1";
 
@@ -79,6 +80,7 @@ const controllerDebugResponses = new Map<string, Array<{
   first: string;
   retry: string | null;
 }>>();
+const lastInjectionProjections = new Map<string, import("./types").InjectionProjectionTelemetry>();
 let lastFrontendUserId: string | null = null;
 
 function cacheKey(userId: string, chatId: string): string {
@@ -132,6 +134,36 @@ async function getSettings(userId: string): Promise<LumiMindSettings> {
   const loaded = await loadSettings(userId);
   settingsCache.set(userId, loaded);
   return loaded;
+}
+
+function approximateTokenMeasurement(value: string, model: string | null): TokenMeasurement {
+  return {
+    totalTokens: Math.ceil(value.length / 4),
+    model,
+    tokenizerName: "Approximate chars / 4",
+    approximate: true,
+    fallback: true,
+  };
+}
+
+async function tokenCounterForConnection(userId: string, connectionId?: string | null): Promise<TokenCounter> {
+  const connection = connectionId ? await spindle.connections.get(connectionId, userId).catch(() => null) : null;
+  return async (value) => {
+    try {
+      const result = await spindle.tokens.countText(value, connection?.model
+        ? { model: connection.model, userId }
+        : { modelSource: "main", userId });
+      return {
+        totalTokens: result.total_tokens,
+        model: result.model || connection?.model || null,
+        tokenizerName: result.tokenizer_name,
+        approximate: result.approximate,
+        fallback: false,
+      };
+    } catch {
+      return approximateTokenMeasurement(value, connection?.model ?? null);
+    }
+  };
 }
 
 async function getTimeline(chatId: string, userId: string): Promise<ChatTimelineV1> {
@@ -202,6 +234,7 @@ async function buildFrontendState(userId: string, requestedChatId?: string | nul
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
     timeline: timeline ? toTimelineView(timeline, settings) : null,
+    lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
   };
 }
 
@@ -234,6 +267,7 @@ async function buildDeveloperDiagnostics(userId: string, requestedChatId?: strin
     activeCharacter: character,
     activePersona: persona,
     controllerRawResponses: chatId ? (controllerDebugResponses.get(cacheKey(userId, chatId)) ?? []) : [],
+    lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"],
   });
 }
@@ -399,11 +433,13 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
     return;
   }
   if (policyChanged) {
-    timeline.records = [];
+    timeline.records = timeline.records.filter((record) => record.skipReason === "pre_activation_history");
     timeline.analysisPolicyHash = policyHash;
     timeline.lastAnalyzedAt = null;
     timeline.error = null;
   }
+  // A policy refresh preserves the user's first-activation cutoff. The explicit
+  // Rebuild action is the deliberate way to replace it with a full-history replay.
   if (force) timeline.records = [];
   const messages = await getChatMessages(chatId, userId);
   let derivation = rebuildTimeline(timeline, messages);
@@ -421,7 +457,6 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
       derivation.nextPrefix,
       batch.skipReason,
     ));
-    if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
     derivation = rebuildTimeline(timeline, messages);
     return true;
   };
@@ -492,7 +527,6 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
           `(attempts=${result.telemetry.attempts}, acceptedMentions=${result.telemetry.finalActorMentions}, acceptedChanges=${result.telemetry.finalChanges}).`,
         );
       }
-      if (timeline.records.length > MAX_RECORDS) timeline.records.splice(0, timeline.records.length - MAX_RECORDS);
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);
       timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
@@ -517,15 +551,30 @@ function scheduleReconcile(userId: string, chatId: string, delay = RECONCILE_DEB
   }, delay));
 }
 
-async function activateChat(userId: string, chatId: string): Promise<void> {
+async function activateChat(
+  userId: string,
+  chatId: string,
+  historyMode: "full" | "recent" = "full",
+  recentMessageLimit = 0,
+): Promise<void> {
   const timeline = await getTimeline(chatId, userId);
   timeline.active = true;
   timeline.paused = false;
   timeline.health = "initializing";
   timeline.error = null;
   await initializeHostActors(timeline, userId);
+  if (historyMode === "recent" && recentMessageLimit > 0 && timeline.records.length === 0) {
+    const messages = await getChatMessages(chatId, userId);
+    const skipped = messages.slice(0, Math.max(0, messages.length - Math.floor(recentMessageLimit)));
+    if (skipped.length > 0) {
+      timeline.records.push(...materializeSkippedAnalysisRecords(timeline, skipped, "root", "pre_activation_history"));
+      rebuildTimeline(timeline, messages);
+    }
+  }
   await persistAndPublish(timeline, userId);
-  notice(userId, "info", "LumiMind is building this timeline in the background.");
+  notice(userId, "info", historyMode === "recent"
+    ? `LumiMind is analyzing the most recent ${Math.max(1, Math.floor(recentMessageLimit))} messages in the background.`
+    : "LumiMind is building this timeline from the full committed history in the background.");
   await reconcileChat(userId, chatId);
 }
 
@@ -647,22 +696,30 @@ spindle.registerInterceptor(async (messages, context) => {
     rememberChatUser(chatId, userId);
     const connectionId = readString(context, ["connectionId", "connection_id"]);
     if (connectionId) connectionByChat.set(cacheKey(userId, chatId), connectionId);
+    const generationConnectionId = connectionId ?? connectionByChat.get(cacheKey(userId, chatId)) ?? null;
     const timeline = await getTimeline(chatId, userId);
     if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
     const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
+    const injectionContext = promptMessages.flatMap((message) => typeof message.content === "string"
+      ? [{ content: message.content, name: typeof message.name === "string" ? message.name : undefined }]
+      : []);
+    const countTokens = await tokenCounterForConnection(userId, generationConnectionId);
     let targetActorId: string | null = null;
     let injection: string | null = null;
+    let projection: Awaited<ReturnType<typeof buildProjectedMindInjection>> | null = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
       if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
       if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
       if (targetActorId && timeline.actors[targetActorId]) {
-        injection = buildMindInjection(timeline, targetActorId, settings);
+        projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
+        injection = projection.content;
       }
     } else if (settings.characterCardDirectorMode) {
-      injection = buildDirectorMindInjection(timeline, settings);
+      projection = await buildProjectedDirectorMindInjection(timeline, settings, injectionContext, countTokens);
+      injection = projection.content;
     } else {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
@@ -671,8 +728,10 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      injection = buildMindInjection(timeline, targetActorId, settings);
+      projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
+      injection = projection.content;
     }
+    if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
     if (!injection) return promptMessages;
     const injected = { role: "system" as const, content: injection };
     return {
@@ -740,6 +799,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   if (!chatId || !userId) return;
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
+  lastInjectionProjections.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 
@@ -770,8 +830,27 @@ spindle.onFrontendMessage(async (payload, userId) => {
       send({ type: "developer_report", requestId: message.requestId, report }, userId);
       return;
     }
+    if (message.type === "activation_preview") {
+      try {
+        const messages = await getChatMessages(message.chatId, userId);
+        send({ type: "activation_preview", requestId: message.requestId, chatId: message.chatId, messageCount: messages.length }, userId);
+      } catch (error) {
+        send({
+          type: "activation_preview_error",
+          requestId: message.requestId,
+          chatId: message.chatId,
+          message: error instanceof Error ? error.message : "LumiMind could not inspect this chat's history.",
+        }, userId);
+      }
+      return;
+    }
     if (message.type === "activate") {
-      await enqueue(userId, message.chatId, () => activateChat(userId, message.chatId));
+      await enqueue(userId, message.chatId, () => activateChat(
+        userId,
+        message.chatId,
+        message.historyMode ?? "full",
+        message.recentMessageLimit ?? 0,
+      ));
       return;
     }
     if (message.type === "pause") {

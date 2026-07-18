@@ -139,6 +139,131 @@ describe("controller response parsing", () => {
       invalidChangesRejected: 2,
       invalidChangeReasons: { invalid_category: 1, protected_target: 1 },
     });
+    expect(result.telemetry).toMatchObject({
+      stateTokenBudget: 24_000,
+      stateItemsAvailable: 1,
+      stateItemsIncluded: 1,
+      stateItemsOmitted: 0,
+      tokenCountApproximate: true,
+      tokenCountFallback: true,
+    });
+  });
+
+  it.each([
+    ["deepseek", { tool_choice: "required" }],
+    ["google", { toolConfig: { functionCallingConfig: { mode: "ANY" } } }],
+  ] as const)("forces one structured tool call for direct %s connections", async (provider, expectedChoice) => {
+    const toolArgs = {
+      actorMentions: [{
+        ref: "npc:mira-exact",
+        name: "Mira",
+        aliases: [],
+        kind: "npc",
+        confidence: 0.95,
+        present: true,
+        messageId: "m1",
+      }],
+      changes: [{
+        subjectRef: "npc:mira-exact",
+        category: "emotion",
+        operation: "add",
+        targetItemId: null,
+        text: "Wary of the visitor",
+        status: "active",
+        confidence: 0.88,
+        targetRefs: [],
+        concealedFromRefs: [],
+        intensity: 0.6,
+        dimensions: {},
+        messageId: "m1",
+        evidenceExcerpt: "Mira watches the visitor closely.",
+      }],
+    };
+    const quiet = vi.fn().mockResolvedValue({
+      content: "",
+      tool_calls: [{ name: "lumi_mind_analysis_v1", args: toolArgs, call_id: "call-1" }],
+      usage: { prompt_tokens: 321, completion_tokens: 40, total_tokens: 361 },
+    });
+    const countText = vi.fn(async (value: string) => ({
+      total_tokens: Math.ceil(value.length / 5),
+      model: "provider-model",
+      tokenizer_name: "provider-tokenizer",
+      approximate: provider === "google",
+    }));
+    const countMessages = vi.fn(async (messages: Array<{ content: string }>) => ({
+      total_tokens: Math.ceil(messages.reduce((sum, entry) => sum + entry.content.length, 0) / 5),
+      model: "provider-model",
+      tokenizer_name: "provider-tokenizer",
+      approximate: provider === "google",
+    }));
+    (globalThis as Record<string, unknown>).spindle = {
+      generate: { quiet },
+      connections: { get: vi.fn().mockResolvedValue({ provider, model: "provider-model" }) },
+      tokens: { countText, countMessages },
+    };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "Mira watches the visitor closely.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "npc:mira-exact",
+        name: "Mira",
+        aliases: [],
+        managed: true,
+        items: [{ id: "seed:belief", category: "belief", text: "The room was safe", controllerWritable: false }],
+      }],
+      settings: { ...DEFAULT_SETTINGS, controllerConnectionId: "connection-1" },
+      userId: "user",
+    });
+
+    expect(result.analysis.changes).toEqual([expect.objectContaining({
+      subjectRef: "npc:mira-exact",
+      text: "Wary of the visitor",
+    })]);
+    expect(result.telemetry.first.outputMode).toBe("tool");
+    expect(result.telemetry).toMatchObject({
+      tokenModel: "provider-model",
+      tokenizerName: "provider-tokenizer",
+      tokenCountApproximate: provider === "google",
+      tokenCountFallback: false,
+      inputTokens: 321,
+    });
+    const request = quiet.mock.calls[0][0] as {
+      parameters: Record<string, unknown>;
+      reasoning: unknown;
+      tools: Array<{ name: string; parameters: Record<string, unknown> }>;
+    };
+    expect(request.parameters).toMatchObject(expectedChoice);
+    expect(request.reasoning).toEqual({ source: "off" });
+    expect(request.tools).toHaveLength(1);
+    expect(request.tools[0]).toMatchObject({ name: "lumi_mind_analysis_v1" });
+    expect(request.tools[0].parameters.required).toEqual(["actorMentions", "changes"]);
+  });
+
+  it("falls back to plain JSON when a provider does not return tool arguments", async () => {
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
+    (globalThis as Record<string, unknown>).spindle = {
+      generate: { quiet },
+      connections: { get: vi.fn().mockResolvedValue({ provider: "deepseek", model: "deepseek-chat" }) },
+      tokens: {
+        countText: vi.fn(async (value: string) => ({ total_tokens: Math.ceil(value.length / 4), model: "deepseek-chat", tokenizer_name: "test", approximate: false })),
+        countMessages: vi.fn(async () => ({ total_tokens: 100, model: "deepseek-chat", tokenizer_name: "test", approximate: false })),
+      },
+    };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "A short covered scene.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        managed: true,
+        items: [{ id: "seed:belief", category: "belief", text: "The room is safe", controllerWritable: false }],
+      }],
+      settings: { ...DEFAULT_SETTINGS, controllerConnectionId: "connection-1" },
+      userId: "user",
+    });
+    expect(result.telemetry.first.outputMode).toBe("json");
+    expect(result.analysis).toEqual({ actorMentions: [], changes: [] });
   });
 
   it("merges corrective mentions while taking corrective state changes", () => {
