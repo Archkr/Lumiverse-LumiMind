@@ -39,6 +39,7 @@ export interface ActorRecord {
   kind: ActorKind;
   canonicalName: string;
   aliases: string[];
+  suppressedAliases: string[];
   characterId: string | null;
   personaId: string | null;
   cortexEntityId: string | null;
@@ -220,12 +221,23 @@ export interface ChatTimelineV1 {
   updatedAt: number;
 }
 
+export type TimelineImportMode = "checkpoint" | "full";
+
+export interface TimelineDatabaseArchiveV1 {
+  format: "lumi_mind.timeline_database.v1";
+  schemaVersion: 1;
+  exportedAt: number;
+  sourceChatId: string;
+  timeline: ChatTimelineV1;
+}
+
 export interface LumiMindSettings {
   controllerConnectionId: string | null;
   controllerTemperature: number;
   controllerMaxTokens: number;
   analysisStateTokenBudget: number;
   injectionTokenBudget: number;
+  injectionPosition: "prompt_start" | "before_last_user" | "prompt_end";
   analysisContextMessageLimit: number;
   chatHistoryMessageLimit: number;
   personaMindEnabled: boolean;
@@ -330,6 +342,8 @@ export type FrontendToBackend =
   | { type: "ready"; chatId?: string | null; characterId?: string | null }
   | { type: "refresh"; chatId?: string | null; characterId?: string | null }
   | { type: "developer_report"; chatId?: string | null; requestId: string }
+  | { type: "export_database"; chatId: string; requestId: string }
+  | { type: "import_database"; chatId: string; archive: TimelineDatabaseArchiveV1; mode: TimelineImportMode }
   | { type: "activation_preview"; chatId: string; requestId: string }
   | { type: "activate"; chatId: string; historyMode?: "full" | "recent"; recentMessageLimit?: number }
   | { type: "pause"; chatId: string; paused: boolean }
@@ -355,6 +369,7 @@ export type BackendToFrontend =
   | { type: "state"; state: FrontendState }
   | { type: "developer_report"; requestId: string; report: unknown }
   | { type: "developer_report_error"; requestId: string; message: string }
+  | { type: "database_export"; requestId: string; archive: TimelineDatabaseArchiveV1 }
   | { type: "activation_preview"; requestId: string; chatId: string; messageCount: number }
   | { type: "activation_preview_error"; requestId: string; chatId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }

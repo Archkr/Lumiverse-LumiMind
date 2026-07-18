@@ -9,16 +9,19 @@ import {
   buildProjectedDirectorMindInjection,
   buildProjectedMindInjection,
   compactStateForController,
+  createCheckpointTimeline,
   createTimeline,
   limitChatHistoryMessages,
   makeBaseMind,
   makeEmptySeed,
   makePrivateSnapshot,
   makePublicSnapshot,
+  mindInjectionIndex,
   materializeAnalysisRecords,
   materializeSkippedAnalysisRecords,
   mergeActors,
   normalizeSeed,
+  normalizeTimeline,
   overrideItem,
   rebuildTimeline,
   removeActor,
@@ -49,6 +52,7 @@ import {
   type LumiMindSettings,
   type MindSeedV1,
   type PermissionState,
+  type TimelineDatabaseArchiveV1,
 } from "./types";
 
 const INTERCEPTOR_PRIORITY = 125;
@@ -92,6 +96,62 @@ function cacheKey(userId: string, chatId: string): string {
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function makeDatabaseArchive(timeline: ChatTimelineV1): TimelineDatabaseArchiveV1 {
+  return {
+    format: "lumi_mind.timeline_database.v1",
+    schemaVersion: 1,
+    exportedAt: Date.now(),
+    sourceChatId: timeline.chatId,
+    timeline: cloneJson(timeline),
+  };
+}
+
+function timelineFromDatabaseArchive(value: unknown): ChatTimelineV1 {
+  const archive = asObject(value);
+  if (archive.format !== "lumi_mind.timeline_database.v1" || archive.schemaVersion !== 1) {
+    throw new Error("This is not a supported LumiMind timeline database export.");
+  }
+  const rawTimeline = asObject(archive.timeline);
+  const sourceChatId = typeof archive.sourceChatId === "string" ? archive.sourceChatId.trim() : "";
+  if (!sourceChatId || rawTimeline.schemaVersion !== 1 || rawTimeline.chatId !== sourceChatId || !("actors" in rawTimeline) || !("minds" in rawTimeline)) {
+    throw new Error("The LumiMind database export is incomplete or invalid.");
+  }
+  return normalizeTimeline(cloneJson(rawTimeline), sourceChatId);
+}
+
+function remapImportedTimeline(source: ChatTimelineV1, targetChatId: string, targetMessages: ChatMessageLike[]): ChatTimelineV1 {
+  const imported = cloneJson(source);
+  const targetByIndex = new Map(targetMessages.map((message) => [message.index_in_chat ?? 0, message]));
+  imported.chatId = targetChatId;
+  imported.records = imported.records.flatMap((record) => {
+    const target = targetByIndex.get(record.messageIndex);
+    if (!target) return [];
+    const next = cloneJson(record);
+    next.id = `analysis:${crypto.randomUUID()}`;
+    next.messageId = target.id;
+    next.messageIndex = target.index_in_chat ?? record.messageIndex;
+    next.actorMentions = next.actorMentions.map((mention) => ({
+      ...mention,
+      evidence: { ...mention.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? record.messageIndex },
+    }));
+    next.deltas = next.deltas.map((delta) => ({
+      ...delta,
+      evidence: { ...delta.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? record.messageIndex },
+    }));
+    return [next];
+  });
+  imported.revision = 0;
+  imported.updatedAt = Date.now();
+  imported.health = imported.paused ? "paused" : "ready";
+  imported.error = null;
+  rebuildTimeline(imported, targetMessages);
+  return imported;
 }
 
 function readString(value: unknown, keys: string[]): string | null {
@@ -760,9 +820,12 @@ spindle.registerInterceptor(async (messages, context) => {
     if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
     if (!injection) return promptMessages;
     const injected = { role: "system" as const, content: injection };
+    const injectionIndex = mindInjectionIndex(promptMessages, settings.injectionPosition);
+    const injectedMessages = [...promptMessages];
+    injectedMessages.splice(injectionIndex, 0, injected);
     return {
-      messages: [injected, ...promptMessages],
-      breakdown: [{ messageIndex: 0, name: "LumiMind — Private Mind" }],
+      messages: injectedMessages,
+      breakdown: [{ messageIndex: injectionIndex, name: "LumiMind — Private Mind" }],
     };
   } catch (error) {
     spindle.log.warn(`LumiMind interceptor degraded safely: ${error instanceof Error ? error.message : String(error)}`);
@@ -860,6 +923,32 @@ spindle.onFrontendMessage(async (payload, userId) => {
       send({ type: "developer_report", requestId: message.requestId, report }, userId);
       return;
     }
+    if (message.type === "export_database") {
+      const timeline = await getTimeline(message.chatId, userId);
+      send({ type: "database_export", requestId: message.requestId, archive: makeDatabaseArchive(timeline) }, userId);
+      return;
+    }
+    if (message.type === "import_database") {
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await enqueue(userId, message.chatId, async () => {
+        const source = timelineFromDatabaseArchive(message.archive);
+        const targetMessages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        const imported = message.mode === "full"
+          ? remapImportedTimeline(source, message.chatId, targetMessages)
+          : createCheckpointTimeline(source, message.chatId);
+        imported.analysisPolicyHash = analysisPolicyHash(await getSettings(userId));
+        pauseRequests.delete(cacheKey(userId, message.chatId));
+        rebuildRequests.delete(cacheKey(userId, message.chatId));
+        lastInjectionProjections.delete(cacheKey(userId, message.chatId));
+        timelines.set(storageTimelineKey(userId, message.chatId), imported);
+        await persistAndPublish(imported, userId);
+      });
+      notice(userId, "success", message.mode === "full"
+        ? "LumiMind database restored and matched to this chat's transcript."
+        : "LumiMind checkpoint imported. This chat will continue from the exported folded state.");
+      return;
+    }
     if (message.type === "activation_preview") {
       try {
         const messages = await getChatMessages(message.chatId, userId);
@@ -946,12 +1035,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
       } else if (message.type === "add_alias") {
         const actor = timeline.actors[message.actorId];
         if (!actor || !message.alias.trim()) throw new Error("Actor not found or alias is empty.");
+        actor.suppressedAliases = (actor.suppressedAliases ?? []).filter((alias) => alias.toLocaleLowerCase() !== message.alias.trim().toLocaleLowerCase());
         actor.aliases = uniqueStrings([...actor.aliases, message.alias]);
         actor.updatedAt = Date.now();
       } else if (message.type === "remove_alias") {
         const actor = timeline.actors[message.actorId];
         if (!actor) throw new Error("Actor not found.");
-        actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== message.alias.trim().toLocaleLowerCase());
+        const removed = message.alias.trim();
+        if (!removed) throw new Error("Alias is empty.");
+        actor.suppressedAliases = uniqueStrings([...(actor.suppressedAliases ?? []), removed]);
+        actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== removed.toLocaleLowerCase());
         actor.updatedAt = Date.now();
       } else if (message.type === "confirm_actor") {
         const actor = timeline.actors[message.actorId];

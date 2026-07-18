@@ -10,6 +10,7 @@ var DEFAULT_SETTINGS = {
   controllerMaxTokens: 1800,
   analysisStateTokenBudget: 24e3,
   injectionTokenBudget: 8e3,
+  injectionPosition: "prompt_start",
   analysisContextMessageLimit: 4,
   chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
@@ -77,6 +78,7 @@ function normalizeSettings(value) {
     controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens) ? Math.max(300, controllerMaxTokens) : DEFAULT_SETTINGS.controllerMaxTokens),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget) ? Math.max(0, analysisStateTokenBudget) : DEFAULT_SETTINGS.analysisStateTokenBudget),
     injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget) ? Math.max(0, injectionTokenBudget) : DEFAULT_SETTINGS.injectionTokenBudget),
+    injectionPosition: raw.injectionPosition === "before_last_user" || raw.injectionPosition === "prompt_end" ? raw.injectionPosition : DEFAULT_SETTINGS.injectionPosition,
     analysisContextMessageLimit: Math.round(Number.isFinite(analysisContextMessageLimit) ? Math.max(0, analysisContextMessageLimit) : DEFAULT_SETTINGS.analysisContextMessageLimit),
     chatHistoryMessageLimit: Math.round(Number.isFinite(chatHistoryMessageLimit) ? Math.max(0, chatHistoryMessageLimit) : DEFAULT_SETTINGS.chatHistoryMessageLimit),
     personaMindEnabled: raw.personaMindEnabled !== false,
@@ -212,6 +214,16 @@ function limitChatHistoryMessages(messages, messageLimit) {
   }
   return messages.filter((_, index) => keep[index]);
 }
+function mindInjectionIndex(messages, position) {
+  if (position === "prompt_end") return messages.length;
+  if (position === "before_last_user") {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") return index;
+    }
+    return messages.length;
+  }
+  return 0;
+}
 function createActor(input) {
   const now = Date.now();
   return {
@@ -219,6 +231,7 @@ function createActor(input) {
     kind: input.kind,
     canonicalName: input.name.trim() || "Unnamed actor",
     aliases: uniqueStrings(input.aliases ?? []),
+    suppressedAliases: [],
     characterId: input.characterId ?? null,
     personaId: input.personaId ?? null,
     cortexEntityId: input.cortexEntityId ?? null,
@@ -296,6 +309,9 @@ function normalizeTimeline(value, chatId) {
   const fallback = createTimeline(chatId);
   const actors = Object.fromEntries(Object.entries(asObject(raw.actors)).map(([id, value2]) => {
     const actor = { ...value2, id };
+    actor.suppressedAliases = uniqueStrings(Array.isArray(actor.suppressedAliases) ? actor.suppressedAliases : []);
+    const suppressed = new Set(actor.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
+    actor.aliases = uniqueStrings(Array.isArray(actor.aliases) ? actor.aliases : []).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     if (actor.kind === "character" && !actor.characterId) actor.kind = "npc";
     if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
     return [id, actor];
@@ -335,11 +351,13 @@ function upsertActor(timeline, input, evidence) {
   const byCortex = input.cortexEntityId ? Object.values(timeline.actors).find((actor2) => actor2.cortexEntityId === input.cortexEntityId) : null;
   const existing = byStable ?? byCortex ?? (byNameId ? timeline.actors[byNameId] : null);
   if (existing) {
+    existing.suppressedAliases ??= [];
+    const suppressed = new Set(existing.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
     existing.aliases = uniqueStrings([
       ...existing.aliases,
       ...input.aliases ?? [],
       ...existing.canonicalName.toLocaleLowerCase() !== input.name.trim().toLocaleLowerCase() ? [input.name] : []
-    ]);
+    ]).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     existing.confidence = Math.max(existing.confidence, clamp(input.confidence, 0, 1, existing.confidence));
     existing.confirmed = existing.confirmed || input.confirmed === true;
     existing.characterId = existing.characterId ?? input.characterId ?? null;
@@ -376,6 +394,31 @@ function cloneMind(mind) {
     presentActorIds: [...mind.presentActorIds]
   };
 }
+function createCheckpointTimeline(source, targetChatId) {
+  const checkpoint = createTimeline(targetChatId);
+  checkpoint.analysisPolicyHash = source.analysisPolicyHash;
+  checkpoint.active = true;
+  checkpoint.paused = false;
+  checkpoint.health = "ready";
+  checkpoint.actors = Object.fromEntries(Object.entries(source.actors).map(([actorId, actor]) => [actorId, {
+    ...actor,
+    aliases: [...actor.aliases],
+    suppressedAliases: [...actor.suppressedAliases ?? []]
+  }]));
+  checkpoint.baseMinds = Object.fromEntries(Object.keys(checkpoint.actors).map((actorId) => {
+    const sourceMind = source.minds[actorId] ?? source.baseMinds[actorId] ?? makeBaseMind(actorId);
+    const cloned = cloneMind(sourceMind);
+    cloned.actorId = actorId;
+    return [actorId, cloned];
+  }));
+  checkpoint.minds = Object.fromEntries(Object.entries(checkpoint.baseMinds).map(([actorId, mind]) => [actorId, cloneMind(mind)]));
+  checkpoint.records = [];
+  checkpoint.manualOverrides = [];
+  checkpoint.lastValidMessageIndex = -1;
+  checkpoint.lastAnalyzedAt = source.lastAnalyzedAt;
+  checkpoint.updatedAt = Date.now();
+  return checkpoint;
+}
 function decayEmotions(minds) {
   for (const mind of Object.values(minds)) {
     mind.items = mind.items.flatMap((item) => {
@@ -391,7 +434,7 @@ function sameActorIds(left, right) {
   return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
 }
 function protectedMindItem(item) {
-  return item.locked || item.pinned || item.source !== "controller";
+  return item.locked;
 }
 function matchingMindItem(mind, delta) {
   if (delta.targetItemId) {
@@ -454,7 +497,8 @@ function applyRecord(record, actors, minds) {
       if (!actor) continue;
       actor.present = mention.present;
       actor.confidence = Math.max(actor.confidence, mention.confidence);
-      actor.aliases = uniqueStrings([...actor.aliases, ...mention.aliases]);
+      const suppressed = new Set((actor.suppressedAliases ?? []).map((alias) => alias.toLocaleLowerCase()));
+      actor.aliases = uniqueStrings([...actor.aliases, ...mention.aliases]).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
       actor.firstSeenMessageId ??= mention.evidence.messageId;
       actor.lastSeenMessageId = mention.evidence.messageId;
     }
@@ -574,10 +618,20 @@ function rebuildTimeline(timeline, rawMessages) {
       break;
     }
     matchedRecords.push(record);
-    record.reduction = applyRecord(record, timeline.actors, minds);
     prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
   }
-  applyManualOverrides(minds, timeline.manualOverrides);
+  const overrides = [...timeline.manualOverrides].sort((left, right) => left.createdAt - right.createdAt);
+  let overrideIndex = 0;
+  for (const record of matchedRecords) {
+    const beforeRecord = [];
+    while (overrideIndex < overrides.length && overrides[overrideIndex].createdAt <= record.createdAt) {
+      beforeRecord.push(overrides[overrideIndex]);
+      overrideIndex += 1;
+    }
+    applyManualOverrides(minds, beforeRecord);
+    record.reduction = applyRecord(record, timeline.actors, minds);
+  }
+  applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1;
   if (!timeline.active) timeline.health = "inactive";
@@ -640,10 +694,11 @@ function materializeAnalysisRecords(timeline, batchMessages, startingPrefix, ana
       id = actor2.id;
     }
     const actor = timeline.actors[id];
-    actor.aliases = uniqueStrings([...actor.aliases, ...raw.aliases ?? []]);
+    const suppressed = new Set((actor.suppressedAliases ?? []).map((alias) => alias.toLocaleLowerCase()));
+    actor.aliases = uniqueStrings([...actor.aliases, ...raw.aliases ?? []]).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     refs.set(stableReference.toLocaleLowerCase(), id);
     refs.set(raw.name.trim().toLocaleLowerCase(), id);
-    for (const alias of raw.aliases ?? []) refs.set(alias.trim().toLocaleLowerCase(), id);
+    for (const alias of actor.aliases) refs.set(alias.trim().toLocaleLowerCase(), id);
     const mention = {
       ref: id,
       name: actor.canonicalName,
@@ -763,7 +818,9 @@ function mergeActors(timeline, sourceActorId, targetActorId) {
   const source = timeline.actors[sourceActorId];
   const target = timeline.actors[targetActorId];
   if (!source || !target || sourceActorId === targetActorId) return false;
-  target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases]);
+  target.suppressedAliases = uniqueStrings([...target.suppressedAliases ?? [], ...source.suppressedAliases ?? []]);
+  const suppressed = new Set(target.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
+  target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases]).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
   target.confidence = Math.max(target.confidence, source.confidence);
   target.confirmed = target.confirmed || source.confirmed;
   target.cortexEntityId ??= source.cortexEntityId;
@@ -808,7 +865,11 @@ function splitActor(timeline, actorId, name) {
   if (!source || !name.trim()) return null;
   const actor = createActor({ kind: "npc", name, confidence: 1, confirmed: true });
   timeline.actors[actor.id] = actor;
-  timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  const sourceMind = timeline.minds[actorId] ?? timeline.baseMinds[actorId] ?? makeBaseMind(actorId);
+  const cloned = cloneMind(sourceMind);
+  cloned.actorId = actor.id;
+  cloned.items = cloned.items.map((item) => ({ ...item, id: `${item.id}:split:${crypto.randomUUID()}` }));
+  timeline.baseMinds[actor.id] = cloned;
   return actor;
 }
 function itemScore(item, relevantActorIds) {
@@ -1111,7 +1172,7 @@ ${message.content}`).join("\n");
     const contextMention = [actor.name, ...actor.aliases].some((reference) => referenceAppears(contextText, reference));
     const actorScore = Number(currentMention) * 1e3 + Number(actor.present) * 500 + Number(contextMention) * 250 + Number(actor.confirmed) * 25;
     const values = (actor.items ?? []).map((item, index) => {
-      const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true || item.source && item.source !== "controller";
+      const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true;
       const targetRelevant = (item.targetActorIds ?? []).some((ref) => relevantActorRefs.has(ref));
       const score = Number(protectedItem) * 2e3 + Number(targetRelevant) * 750 + sharedTokenCount(item.text ?? "", currentTokens) * 120 + sharedTokenCount(item.text ?? "", contextTokens) * 30 + (item.category ? CATEGORY_ORDER[item.category] ?? 0 : 0) * 5 - index;
       return { item, score };
@@ -1445,7 +1506,7 @@ function validateControllerAnalysisContext(analysis, messages, compactState) {
         incrementInvalidReason(invalidChangeReasons, "target_not_found");
         return [];
       }
-      const protectedTarget = target && (target.locked === true || target.pinned === true || text(target.source) !== "" && text(target.source) !== "controller");
+      const protectedTarget = target.locked === true;
       if (protectedTarget) {
         incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
@@ -2014,6 +2075,58 @@ function cacheKey(userId, chatId) {
 }
 function asObject3(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function makeDatabaseArchive(timeline) {
+  return {
+    format: "lumi_mind.timeline_database.v1",
+    schemaVersion: 1,
+    exportedAt: Date.now(),
+    sourceChatId: timeline.chatId,
+    timeline: cloneJson(timeline)
+  };
+}
+function timelineFromDatabaseArchive(value) {
+  const archive = asObject3(value);
+  if (archive.format !== "lumi_mind.timeline_database.v1" || archive.schemaVersion !== 1) {
+    throw new Error("This is not a supported LumiMind timeline database export.");
+  }
+  const rawTimeline = asObject3(archive.timeline);
+  const sourceChatId = typeof archive.sourceChatId === "string" ? archive.sourceChatId.trim() : "";
+  if (!sourceChatId || rawTimeline.schemaVersion !== 1 || rawTimeline.chatId !== sourceChatId || !("actors" in rawTimeline) || !("minds" in rawTimeline)) {
+    throw new Error("The LumiMind database export is incomplete or invalid.");
+  }
+  return normalizeTimeline(cloneJson(rawTimeline), sourceChatId);
+}
+function remapImportedTimeline(source, targetChatId, targetMessages) {
+  const imported = cloneJson(source);
+  const targetByIndex = new Map(targetMessages.map((message) => [message.index_in_chat ?? 0, message]));
+  imported.chatId = targetChatId;
+  imported.records = imported.records.flatMap((record) => {
+    const target = targetByIndex.get(record.messageIndex);
+    if (!target) return [];
+    const next = cloneJson(record);
+    next.id = `analysis:${crypto.randomUUID()}`;
+    next.messageId = target.id;
+    next.messageIndex = target.index_in_chat ?? record.messageIndex;
+    next.actorMentions = next.actorMentions.map((mention) => ({
+      ...mention,
+      evidence: { ...mention.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? record.messageIndex }
+    }));
+    next.deltas = next.deltas.map((delta) => ({
+      ...delta,
+      evidence: { ...delta.evidence, messageId: target.id, messageIndex: target.index_in_chat ?? record.messageIndex }
+    }));
+    return [next];
+  });
+  imported.revision = 0;
+  imported.updatedAt = Date.now();
+  imported.health = imported.paused ? "paused" : "ready";
+  imported.error = null;
+  rebuildTimeline(imported, targetMessages);
+  return imported;
 }
 function readString(value, keys) {
   const raw = asObject3(value);
@@ -2615,9 +2728,12 @@ spindle.registerInterceptor(async (messages, context) => {
     if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
     if (!injection) return promptMessages;
     const injected = { role: "system", content: injection };
+    const injectionIndex = mindInjectionIndex(promptMessages, settings.injectionPosition);
+    const injectedMessages = [...promptMessages];
+    injectedMessages.splice(injectionIndex, 0, injected);
     return {
-      messages: [injected, ...promptMessages],
-      breakdown: [{ messageIndex: 0, name: "LumiMind \u2014 Private Mind" }]
+      messages: injectedMessages,
+      breakdown: [{ messageIndex: injectionIndex, name: "LumiMind \u2014 Private Mind" }]
     };
   } catch (error) {
     spindle.log.warn(`LumiMind interceptor degraded safely: ${error instanceof Error ? error.message : String(error)}`);
@@ -2707,6 +2823,28 @@ spindle.onFrontendMessage(async (payload, userId) => {
       send({ type: "developer_report", requestId: message.requestId, report }, userId);
       return;
     }
+    if (message.type === "export_database") {
+      const timeline = await getTimeline(message.chatId, userId);
+      send({ type: "database_export", requestId: message.requestId, archive: makeDatabaseArchive(timeline) }, userId);
+      return;
+    }
+    if (message.type === "import_database") {
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await enqueue(userId, message.chatId, async () => {
+        const source = timelineFromDatabaseArchive(message.archive);
+        const targetMessages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        const imported = message.mode === "full" ? remapImportedTimeline(source, message.chatId, targetMessages) : createCheckpointTimeline(source, message.chatId);
+        imported.analysisPolicyHash = analysisPolicyHash(await getSettings(userId));
+        pauseRequests.delete(cacheKey(userId, message.chatId));
+        rebuildRequests.delete(cacheKey(userId, message.chatId));
+        lastInjectionProjections.delete(cacheKey(userId, message.chatId));
+        timelines.set(storageTimelineKey(userId, message.chatId), imported);
+        await persistAndPublish(imported, userId);
+      });
+      notice(userId, "success", message.mode === "full" ? "LumiMind database restored and matched to this chat's transcript." : "LumiMind checkpoint imported. This chat will continue from the exported folded state.");
+      return;
+    }
     if (message.type === "activation_preview") {
       try {
         const messages = await getChatMessages(message.chatId, userId);
@@ -2790,12 +2928,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
       } else if (message.type === "add_alias") {
         const actor = timeline.actors[message.actorId];
         if (!actor || !message.alias.trim()) throw new Error("Actor not found or alias is empty.");
+        actor.suppressedAliases = (actor.suppressedAliases ?? []).filter((alias) => alias.toLocaleLowerCase() !== message.alias.trim().toLocaleLowerCase());
         actor.aliases = uniqueStrings([...actor.aliases, message.alias]);
         actor.updatedAt = Date.now();
       } else if (message.type === "remove_alias") {
         const actor = timeline.actors[message.actorId];
         if (!actor) throw new Error("Actor not found.");
-        actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== message.alias.trim().toLocaleLowerCase());
+        const removed = message.alias.trim();
+        if (!removed) throw new Error("Alias is empty.");
+        actor.suppressedAliases = uniqueStrings([...actor.suppressedAliases ?? [], removed]);
+        actor.aliases = actor.aliases.filter((alias) => alias.toLocaleLowerCase() !== removed.toLocaleLowerCase());
         actor.updatedAt = Date.now();
       } else if (message.type === "confirm_actor") {
         const actor = timeline.actors[message.actorId];

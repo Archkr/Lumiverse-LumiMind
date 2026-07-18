@@ -31,6 +31,7 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerMaxTokens: 1800,
   analysisStateTokenBudget: 24_000,
   injectionTokenBudget: 8_000,
+  injectionPosition: "prompt_start",
   analysisContextMessageLimit: 4,
   chatHistoryMessageLimit: 0,
   personaMindEnabled: true,
@@ -122,6 +123,9 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
     injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget)
       ? Math.max(0, injectionTokenBudget)
       : DEFAULT_SETTINGS.injectionTokenBudget),
+    injectionPosition: raw.injectionPosition === "before_last_user" || raw.injectionPosition === "prompt_end"
+      ? raw.injectionPosition
+      : DEFAULT_SETTINGS.injectionPosition,
     analysisContextMessageLimit: Math.round(Number.isFinite(analysisContextMessageLimit)
       ? Math.max(0, analysisContextMessageLimit)
       : DEFAULT_SETTINGS.analysisContextMessageLimit),
@@ -293,6 +297,20 @@ export function limitChatHistoryMessages<T extends { __isChatHistory?: boolean }
   return messages.filter((_, index) => keep[index]);
 }
 
+export function mindInjectionIndex(
+  messages: Array<{ role?: unknown }>,
+  position: LumiMindSettings["injectionPosition"],
+): number {
+  if (position === "prompt_end") return messages.length;
+  if (position === "before_last_user") {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "user") return index;
+    }
+    return messages.length;
+  }
+  return 0;
+}
+
 export function createActor(input: {
   id?: string;
   kind: ActorKind;
@@ -310,6 +328,7 @@ export function createActor(input: {
     kind: input.kind,
     canonicalName: input.name.trim() || "Unnamed actor",
     aliases: uniqueStrings(input.aliases ?? []),
+    suppressedAliases: [],
     characterId: input.characterId ?? null,
     personaId: input.personaId ?? null,
     cortexEntityId: input.cortexEntityId ?? null,
@@ -391,6 +410,10 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
   const fallback = createTimeline(chatId);
   const actors = Object.fromEntries(Object.entries(asObject(raw.actors)).map(([id, value]) => {
     const actor = { ...(value as ActorRecord), id };
+    actor.suppressedAliases = uniqueStrings(Array.isArray(actor.suppressedAliases) ? actor.suppressedAliases : []);
+    const suppressed = new Set(actor.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
+    actor.aliases = uniqueStrings(Array.isArray(actor.aliases) ? actor.aliases : [])
+      .filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     if (actor.kind === "character" && !actor.characterId) actor.kind = "npc";
     if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
     return [id, actor];
@@ -443,11 +466,13 @@ export function upsertActor(
     : null;
   const existing = byStable ?? byCortex ?? (byNameId ? timeline.actors[byNameId] : null);
   if (existing) {
+    existing.suppressedAliases ??= [];
+    const suppressed = new Set(existing.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
     existing.aliases = uniqueStrings([
       ...existing.aliases,
       ...(input.aliases ?? []),
       ...(existing.canonicalName.toLocaleLowerCase() !== input.name.trim().toLocaleLowerCase() ? [input.name] : []),
-    ]);
+    ]).filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     existing.confidence = Math.max(existing.confidence, clamp(input.confidence, 0, 1, existing.confidence));
     existing.confirmed = existing.confirmed || input.confirmed === true;
     existing.characterId = existing.characterId ?? input.characterId ?? null;
@@ -486,6 +511,32 @@ function cloneMind(mind: ActorMind): ActorMind {
   };
 }
 
+export function createCheckpointTimeline(source: ChatTimelineV1, targetChatId: string): ChatTimelineV1 {
+  const checkpoint = createTimeline(targetChatId);
+  checkpoint.analysisPolicyHash = source.analysisPolicyHash;
+  checkpoint.active = true;
+  checkpoint.paused = false;
+  checkpoint.health = "ready";
+  checkpoint.actors = Object.fromEntries(Object.entries(source.actors).map(([actorId, actor]) => [actorId, {
+    ...actor,
+    aliases: [...actor.aliases],
+    suppressedAliases: [...(actor.suppressedAliases ?? [])],
+  }]));
+  checkpoint.baseMinds = Object.fromEntries(Object.keys(checkpoint.actors).map((actorId) => {
+    const sourceMind = source.minds[actorId] ?? source.baseMinds[actorId] ?? makeBaseMind(actorId);
+    const cloned = cloneMind(sourceMind);
+    cloned.actorId = actorId;
+    return [actorId, cloned];
+  }));
+  checkpoint.minds = Object.fromEntries(Object.entries(checkpoint.baseMinds).map(([actorId, mind]) => [actorId, cloneMind(mind)]));
+  checkpoint.records = [];
+  checkpoint.manualOverrides = [];
+  checkpoint.lastValidMessageIndex = -1;
+  checkpoint.lastAnalyzedAt = source.lastAnalyzedAt;
+  checkpoint.updatedAt = Date.now();
+  return checkpoint;
+}
+
 function decayEmotions(minds: Record<string, ActorMind>): void {
   for (const mind of Object.values(minds)) {
     mind.items = mind.items.flatMap((item) => {
@@ -503,7 +554,7 @@ function sameActorIds(left: string[], right: string[]): boolean {
 }
 
 function protectedMindItem(item: MindItem): boolean {
-  return item.locked || item.pinned || item.source !== "controller";
+  return item.locked;
 }
 
 type MindMatchKind = "target" | "exact" | "near" | "relationship";
@@ -585,7 +636,9 @@ export function applyRecord(
       if (!actor) continue;
       actor.present = mention.present;
       actor.confidence = Math.max(actor.confidence, mention.confidence);
-      actor.aliases = uniqueStrings([...actor.aliases, ...mention.aliases]);
+      const suppressed = new Set((actor.suppressedAliases ?? []).map((alias) => alias.toLocaleLowerCase()));
+      actor.aliases = uniqueStrings([...actor.aliases, ...mention.aliases])
+        .filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
       actor.firstSeenMessageId ??= mention.evidence.messageId;
       actor.lastSeenMessageId = mention.evidence.messageId;
     }
@@ -725,10 +778,20 @@ export function rebuildTimeline(timeline: ChatTimelineV1, rawMessages: ChatMessa
       break;
     }
     matchedRecords.push(record);
-    record.reduction = applyRecord(record, timeline.actors, minds);
     prefixHash = nextPrefixHash(prefixHash, contentHash, swipeId);
   }
-  applyManualOverrides(minds, timeline.manualOverrides);
+  const overrides = [...timeline.manualOverrides].sort((left, right) => left.createdAt - right.createdAt);
+  let overrideIndex = 0;
+  for (const record of matchedRecords) {
+    const beforeRecord: ManualOverride[] = [];
+    while (overrideIndex < overrides.length && overrides[overrideIndex].createdAt <= record.createdAt) {
+      beforeRecord.push(overrides[overrideIndex]);
+      overrideIndex += 1;
+    }
+    applyManualOverrides(minds, beforeRecord);
+    record.reduction = applyRecord(record, timeline.actors, minds);
+  }
+  applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : (messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1);
   if (!timeline.active) timeline.health = "inactive";
@@ -805,10 +868,12 @@ export function materializeAnalysisRecords(
       id = actor.id;
     }
     const actor = timeline.actors[id];
-    actor.aliases = uniqueStrings([...actor.aliases, ...(raw.aliases ?? [])]);
+    const suppressed = new Set((actor.suppressedAliases ?? []).map((alias) => alias.toLocaleLowerCase()));
+    actor.aliases = uniqueStrings([...actor.aliases, ...(raw.aliases ?? [])])
+      .filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
     refs.set(stableReference.toLocaleLowerCase(), id);
     refs.set(raw.name.trim().toLocaleLowerCase(), id);
-    for (const alias of raw.aliases ?? []) refs.set(alias.trim().toLocaleLowerCase(), id);
+    for (const alias of actor.aliases) refs.set(alias.trim().toLocaleLowerCase(), id);
     const mention: ActorMentionDelta = {
       ref: id,
       name: actor.canonicalName,
@@ -947,7 +1012,10 @@ export function mergeActors(timeline: ChatTimelineV1, sourceActorId: string, tar
   const source = timeline.actors[sourceActorId];
   const target = timeline.actors[targetActorId];
   if (!source || !target || sourceActorId === targetActorId) return false;
-  target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases]);
+  target.suppressedAliases = uniqueStrings([...(target.suppressedAliases ?? []), ...(source.suppressedAliases ?? [])]);
+  const suppressed = new Set(target.suppressedAliases.map((alias) => alias.toLocaleLowerCase()));
+  target.aliases = uniqueStrings([...target.aliases, source.canonicalName, ...source.aliases])
+    .filter((alias) => !suppressed.has(alias.toLocaleLowerCase()));
   target.confidence = Math.max(target.confidence, source.confidence);
   target.confirmed = target.confirmed || source.confirmed;
   target.cortexEntityId ??= source.cortexEntityId;
@@ -996,7 +1064,11 @@ export function splitActor(timeline: ChatTimelineV1, actorId: string, name: stri
   if (!source || !name.trim()) return null;
   const actor = createActor({ kind: "npc", name, confidence: 1, confirmed: true });
   timeline.actors[actor.id] = actor;
-  timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  const sourceMind = timeline.minds[actorId] ?? timeline.baseMinds[actorId] ?? makeBaseMind(actorId);
+  const cloned = cloneMind(sourceMind);
+  cloned.actorId = actor.id;
+  cloned.items = cloned.items.map((item) => ({ ...item, id: `${item.id}:split:${crypto.randomUUID()}` }));
+  timeline.baseMinds[actor.id] = cloned;
   return actor;
 }
 
@@ -1469,7 +1541,7 @@ function orderedCompactStateCandidates(
     const actorScore = Number(currentMention) * 1_000 + Number(actor.present) * 500 + Number(contextMention) * 250 + Number(actor.confirmed) * 25;
     const values = (actor.items ?? [])
       .map((item, index) => {
-        const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true || (item.source && item.source !== "controller");
+        const protectedItem = item.controllerWritable === false || item.locked === true || item.pinned === true;
         const targetRelevant = (item.targetActorIds ?? []).some((ref) => relevantActorRefs.has(ref));
         const score = Number(protectedItem) * 2_000 + Number(targetRelevant) * 750 +
           sharedTokenCount(item.text ?? "", currentTokens) * 120 + sharedTokenCount(item.text ?? "", contextTokens) * 30 +

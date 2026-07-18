@@ -760,6 +760,87 @@ function setup(ctx) {
       fallback.remove();
     }
   }
+  function downloadDatabaseArchive(archive) {
+    const blob = new Blob([JSON.stringify(archive, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = element("a");
+    const stamp = new Date(archive.exportedAt).toISOString().replace(/[:.]/g, "-");
+    link.href = url;
+    link.download = `lumimind-timeline-${stamp}.json`;
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+  function requestDatabaseExport() {
+    const chatId = currentState?.activeChatId;
+    if (!chatId) {
+      showNotice("warning", "Open a chat before exporting its LumiMind database.");
+      return;
+    }
+    send({ type: "export_database", chatId, requestId: crypto.randomUUID() });
+  }
+  async function importDatabaseArchive(archive) {
+    const chatId = currentState?.activeChatId;
+    if (!chatId) {
+      showNotice("warning", "Open the destination chat before importing a LumiMind database.");
+      return;
+    }
+    const modal = ctx.ui.showModal({ title: "Import LumiMind database", width: 560, maxHeight: 620 });
+    const form = element("form", "lm-modal-form");
+    const mode = element("select", "lm-select");
+    const choices = [
+      ["checkpoint", "Continue from exported checkpoint"],
+      ["full", "Restore full timeline against matching history"]
+    ];
+    for (const [value, label] of choices) {
+      const option = element("option", void 0, label);
+      option.value = value;
+      mode.appendChild(option);
+    }
+    form.append(
+      element("p", "lm-settings-description", "Importing replaces the LumiMind database for the current chat. The chat transcript itself is never changed."),
+      field(
+        "Import mode",
+        mode,
+        "Checkpoint is best for sequels and alternate scenarios. Full timeline is for backups or forks whose messages match the exported transcript positions."
+      )
+    );
+    const actions = element("div", "lm-modal-actions");
+    actions.append(textButton("Cancel", () => modal.dismiss(), "secondary"), element("button", "lm-button lm-button-primary", "Replace database"));
+    actions.lastElementChild.type = "submit";
+    form.appendChild(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      send({ type: "import_database", chatId, archive, mode: mode.value });
+      modal.dismiss();
+    });
+    modal.root.appendChild(form);
+  }
+  function chooseDatabaseImport() {
+    if (!currentState?.activeChatId) {
+      showNotice("warning", "Open the destination chat before importing a LumiMind database.");
+      return;
+    }
+    const picker = element("input");
+    picker.type = "file";
+    picker.accept = ".json,application/json";
+    picker.style.display = "none";
+    picker.addEventListener("change", () => {
+      const file = picker.files?.[0];
+      picker.remove();
+      if (!file) return;
+      void file.text().then((text) => {
+        const archive = JSON.parse(text);
+        return importDatabaseArchive(archive);
+      }).catch((error) => {
+        showNotice("error", error instanceof Error ? `Could not read LumiMind database: ${error.message}` : "Could not read that LumiMind database file.");
+      });
+    }, { once: true });
+    document.body.appendChild(picker);
+    picker.click();
+  }
   function buildDiagnosticReport() {
     const state = currentState;
     const timeline = state?.timeline ?? null;
@@ -1767,6 +1848,28 @@ function setup(ctx) {
         markSettingsDirty(save);
       }
     ));
+    const injectionPosition = element("select", "lm-select");
+    const injectionPositions = [
+      ["prompt_start", "Start of prompt"],
+      ["before_last_user", "Before latest user message"],
+      ["prompt_end", "End of prompt"]
+    ];
+    for (const [value, label] of injectionPositions) {
+      const option = element("option", void 0, label);
+      option.value = value;
+      option.selected = settingsDraft.injectionPosition === value;
+      injectionPosition.appendChild(option);
+    }
+    injectionPosition.addEventListener("change", () => {
+      if (!settingsDraft) return;
+      settingsDraft.injectionPosition = injectionPosition.value;
+      markSettingsDirty(save);
+    });
+    behavior.appendChild(field(
+      "Mind block position",
+      injectionPosition,
+      "Choose where the private LumiMind system block is inserted into the assembled roleplay prompt."
+    ));
     container.appendChild(behavior);
     const controller = element("section", "lm-settings-card");
     controller.appendChild(element("h3", "lm-settings-title", "Analysis controller"));
@@ -1866,6 +1969,21 @@ function setup(ctx) {
       }));
     }
     container.appendChild(privacy);
+    const database = element("section", "lm-settings-card");
+    database.appendChild(element("h3", "lm-settings-title", "Timeline database"));
+    database.appendChild(element(
+      "p",
+      "lm-settings-description",
+      "Export the current chat's complete LumiMind timeline, or import one into the current chat to continue a sequel, fork, or alternate scenario."
+    ));
+    const databaseActions = element("div", "lm-inline-actions");
+    const exportButton = textButton("Export current timeline", requestDatabaseExport, "secondary");
+    const importButton = textButton("Import into current chat", chooseDatabaseImport, "secondary");
+    exportButton.disabled = !currentState.activeChatId;
+    importButton.disabled = !currentState.activeChatId;
+    databaseActions.append(exportButton, importButton);
+    database.appendChild(databaseActions);
+    container.appendChild(database);
     const permissions = element("section", "lm-settings-card");
     const permissionHeading = element("div", "lm-settings-title-row");
     permissionHeading.appendChild(element("h3", "lm-settings-title", "Live capabilities"));
@@ -2176,6 +2294,9 @@ function setup(ctx) {
       developerReportRequests.delete(message.requestId);
       if (message.type === "developer_report") pending.resolve(message.report);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "database_export") {
+      downloadDatabaseArchive(message.archive);
+      showNotice("success", "LumiMind timeline database exported.");
     } else if (message.type === "activation_preview" || message.type === "activation_preview_error") {
       const pending = activationPreviewRequests.get(message.requestId);
       if (!pending) return;

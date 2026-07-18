@@ -313,6 +313,35 @@ describe("controller response parsing", () => {
     ]);
   });
 
+  it("allows controller changes to unlocked manual, seed, and pinned entries while still blocking locks", async () => {
+    const changes: ControllerAnalysis["changes"] = [
+      { subjectRef: "Mira", category: "goal", operation: "update", targetItemId: "manual", text: "Manual evolved", messageId: "m1" },
+      { subjectRef: "Mira", category: "belief", operation: "remove", targetItemId: "seed", messageId: "m1" },
+      { subjectRef: "Mira", category: "emotion", operation: "update", targetItemId: "locked", text: "Locked evolved", messageId: "m1" },
+    ];
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "Mira changes her mind.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        items: [
+          { id: "manual", locked: false, pinned: true, source: "manual" },
+          { id: "seed", locked: false, pinned: false, source: "seed" },
+          { id: "locked", locked: true, pinned: false, source: "controller" },
+        ],
+      }],
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    });
+
+    expect(result.analysis.changes.map((change) => change.targetItemId)).toEqual(["manual", "seed"]);
+    expect(result.telemetry.first.invalidChangeReasons).toMatchObject({ protected_target: 1 });
+  });
+
   it.each(["assistant", "character:card"])("preserves a portrayed NPC when its controller ref collides with %s", (collidingRef) => {
     const analysis: ControllerAnalysis = {
       actorMentions: [{

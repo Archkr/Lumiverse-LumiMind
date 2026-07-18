@@ -8,6 +8,7 @@ import {
   buildProjectedMindInjection,
   canonicalMindText,
   compactStateForController,
+  createCheckpointTimeline,
   createTimeline,
   limitChatHistoryMessages,
   makeBaseMind,
@@ -15,6 +16,7 @@ import {
   materializeAnalysisRecords,
   materializeSkippedAnalysisRecords,
   mergeActors,
+  mindInjectionIndex,
   mindTextsNearDuplicate,
   nextPrefixHash,
   normalizeSettings,
@@ -25,6 +27,7 @@ import {
   resolveActorId,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
+  splitActor,
   stableHash,
   toTimelineView,
   upsertActor,
@@ -98,6 +101,50 @@ describe("actor registry", () => {
     expect(timeline.actors[card.id].aliases).toEqual(expect.arrayContaining(["The Scholar", "Ash"]));
   });
 
+  it("keeps a deliberately removed alias suppressed across analysis replay", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira", aliases: ["Scout"] });
+    const first = message("m1", 0, "Scout enters the room.");
+    const firstRecord = record(first, "root", []);
+    firstRecord.actorMentions = [{
+      ref: actor.id,
+      name: "Mira",
+      aliases: ["Scout"],
+      kind: "npc",
+      confidence: 0.9,
+      present: true,
+      evidence: { messageId: first.id, swipeId: 0, excerpt: "Scout enters", messageIndex: 0 },
+    }];
+    timeline.records = [firstRecord];
+    actor.suppressedAliases = ["Scout"];
+    actor.aliases = [];
+
+    rebuildTimeline(timeline, [first]);
+
+    expect(actor.aliases).toEqual([]);
+  });
+
+  it("clones the folded source mind when splitting an NPC", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    const seed = makeEmptySeed({ selfConcept: "A cautious scout" });
+    seed.startingGoals = ["Protect the caravan"];
+    timeline.baseMinds[actor.id] = makeBaseMind(actor.id, seed);
+    rebuildTimeline(timeline, []);
+    addManualItem(timeline, actor.id, "belief", "The eastern road is unsafe");
+    rebuildTimeline(timeline, []);
+
+    const split = splitActor(timeline, actor.id, "Selene");
+    expect(split).not.toBeNull();
+    rebuildTimeline(timeline, []);
+
+    expect(timeline.minds[split!.id].core.selfConcept).toBe("A cautious scout");
+    expect(timeline.minds[split!.id].items.map((item) => item.text)).toEqual([
+      "Protect the caravan",
+      "The eastern road is unsafe",
+    ]);
+  });
+
   it("migrates controller-discovered character-shaped actors to timeline-local NPCs", () => {
     const timeline = createTimeline("chat");
     const legacy = upsertActor(timeline, { kind: "character", name: "Mira" });
@@ -166,6 +213,37 @@ describe("timeline reducer", () => {
     addManualItem(timeline, actor.id, "goal", "Find the missing key");
     rebuildTimeline(timeline, []);
     expect(timeline.minds[actor.id].items[0]).toMatchObject({ category: "goal", locked: true, pinned: true, source: "manual" });
+  });
+
+  it("lets later controller records update an unlocked pinned manual override", () => {
+    const timeline = createTimeline("chat");
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    addManualItem(timeline, actor.id, "goal", "Find the missing key");
+    rebuildTimeline(timeline, []);
+    const manual = timeline.minds[actor.id].items[0];
+    expect(overrideItem(timeline, actor.id, manual.id, (item) => ({ ...item, locked: false }))).toBe(true);
+    timeline.manualOverrides[0].createdAt = 10;
+    timeline.manualOverrides[1].createdAt = 20;
+
+    const first = message("m1", 0, "Mira decides the key is no longer worth finding.");
+    const update = record(first, "root", [delta(actor.id, first.id, 0, {
+      category: "goal",
+      operation: "update",
+      targetItemId: manual.id,
+      text: "Abandon the search for the missing key",
+    })]);
+    update.createdAt = 30;
+    timeline.records = [update];
+    rebuildTimeline(timeline, [first]);
+
+    expect(timeline.minds[actor.id].items[0]).toMatchObject({
+      text: "Abandon the search for the missing key",
+      locked: false,
+      pinned: true,
+      source: "manual",
+    });
+    const compact = compactStateForController(timeline) as Array<{ ref: string; items: Array<{ id: string; controllerWritable: boolean }> }>;
+    expect(compact.find((entry) => entry.ref === actor.id)?.items[0].controllerWritable).toBe(true);
   });
 
   it("rewrites exact and near-duplicate additions instead of appending them", () => {
@@ -364,10 +442,34 @@ describe("hashing, settings, and compaction", () => {
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
     expect(normalizeSettings({ controllerMaxTokens: 128000 }).controllerMaxTokens).toBe(128000);
+    expect(normalizeSettings({ injectionPosition: "before_last_user" }).injectionPosition).toBe("before_last_user");
+    expect(normalizeSettings({ injectionPosition: "unsupported" }).injectionPosition).toBe("prompt_start");
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("ledger-policy:1|persona:1|director:0"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true })).toBe(stableHash("ledger-policy:1|director-policy:3|persona:1|director:1"));
     expect(analysisPolicyHash({ ...DEFAULT_SETTINGS, personaMindEnabled: false })).toBe(stableHash("ledger-policy:1|persona-policy:2|persona:0|director:0"));
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).not.toBe(analysisPolicyHash({ ...DEFAULT_SETTINGS, characterCardDirectorMode: true }));
+  });
+
+  it("selects each supported private-mind insertion position", () => {
+    const messages = [{ role: "system" }, { role: "user" }, { role: "assistant" }, { role: "user" }];
+    expect(mindInjectionIndex(messages, "prompt_start")).toBe(0);
+    expect(mindInjectionIndex(messages, "before_last_user")).toBe(3);
+    expect(mindInjectionIndex(messages, "prompt_end")).toBe(4);
+    expect(mindInjectionIndex([{ role: "system" }], "before_last_user")).toBe(1);
+  });
+
+  it("creates a sequel checkpoint from the exported folded state", () => {
+    const source = createTimeline("source");
+    source.active = true;
+    const actor = upsertActor(source, { kind: "npc", name: "Mira" });
+    addManualItem(source, actor.id, "goal", "Reach the northern city");
+    rebuildTimeline(source, []);
+
+    const checkpoint = createCheckpointTimeline(source, "sequel");
+
+    expect(checkpoint).toMatchObject({ chatId: "sequel", active: true, records: [], manualOverrides: [] });
+    expect(checkpoint.baseMinds[actor.id].items[0].text).toBe("Reach the northern city");
+    expect(checkpoint.minds[actor.id].items[0].text).toBe("Reach the northern city");
   });
 
   it("replays 500+ messages for 12 actors deterministically and projects without deleting state", async () => {

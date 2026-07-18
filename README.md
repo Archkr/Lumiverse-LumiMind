@@ -63,9 +63,10 @@ It supports ordinary single-card roleplay, group chats, player personas, and dir
 | **Player control** | Persona minds are optional. Turn them off when the player alone controls the persona. |
 | **Timeline aware** | Reconciles edits, deletions, swipes, regenerations, and chat forks. |
 | **Spoiler-safe lens** | Beliefs and secrets stay collapsed until you deliberately reveal them. |
-| **Editable state** | Correct, pin, lock, merge, split, rename, or remove inferred information. |
+| **Editable state** | Correct, pin, lock, merge, split, rename, or remove inferred information. Split NPCs inherit the source checkpoint instead of starting blank. |
 | **Background analysis** | Uses a controller after committed turns without blocking normal generation. |
-| **Private injection** | Adds one cached system message containing the present cast's unresolved state; the interceptor makes no model call. |
+| **Private injection** | Adds one cached system message containing the present cast's unresolved state at the configured prompt position; the interceptor makes no model call. |
+| **Portable timelines** | Export a chat's LumiMind database and import it as a sequel checkpoint or matching-history restore. |
 | **Diagnostics** | Produces a privacy-safe report for controller and timeline troubleshooting. |
 
 ---
@@ -113,7 +114,7 @@ Next generation receives a token-budgeted projection of present managed minds
 3. **The controller returns evidence-linked changes.** Each accepted entry records its source message, swipe, confidence, and provenance.
 4. **The timeline is folded deterministically.** Current minds are rebuilt from the compatible records on the active branch.
 5. **The next reply gets a cached checkpoint.** LumiMind keeps a heading for every present managed actor and injects the highest-value active or uncertain state that fits the configured token budget. The complete state remains stored.
-6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them.
+6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them. Once unlocked, any entry may evolve regardless of whether it began as controller, manual, seed, or pinned state.
 
 If a substantive batch leaves a genuinely uninitialized actor without usable mental state, LumiMind performs at most one focused corrective pass. An empty change set is healthy when the existing ledger already covers the scene.
 
@@ -223,7 +224,7 @@ Mind Lens is LumiMind’s main drawer interface.
 - Inspect beliefs, secrets, goals, plans, emotions, relationships, and awareness.
 - See confidence, evidence, source message, and swipe provenance.
 - Add or edit state manually; user-authored entries are locked and pinned by default.
-- Rename actors, add aliases, confirm identities, merge duplicates, split mistakes, or remove actors from the timeline.
+- Rename actors, add or persistently remove aliases, confirm identities, merge duplicates, split mistakes, or remove actors from the timeline. A split NPC begins with a copy of the source actor's folded mind so you can separate the identities from a useful checkpoint.
 
 </details>
 
@@ -253,7 +254,9 @@ Mind Lens is LumiMind’s main drawer interface.
 
 - Choose the controller connection and analysis limits.
 - Toggle persona management and Director mode.
+- Choose whether the private LumiMind block is inserted at the prompt start, before the latest user message, or at the prompt end.
 - Configure spoiler safety and Memory Cortex behavior.
+- Export or import the current chat's LumiMind timeline database.
 - Enable private extension interoperability when desired.
 - Review live permission availability.
 - Open the privacy-safe Diagnostics window.
@@ -324,7 +327,7 @@ LumiMind is designed for conversations that do not stay perfectly linear.
 | Controller delay | Keeps normal generation available and uses the last valid checkpoint. |
 | Controller error | Exposes stale/error status and retains recoverable state. |
 
-Controller results are stored as evidence-linked deltas rather than one repeatedly rewritten state blob. Manual locked edits are folded on top and survive deterministic rebuilds.
+Controller results are stored as evidence-linked deltas rather than one repeatedly rewritten state blob. Manual overrides are replayed chronologically with controller records. The lock flag alone prevents controller updates and deletions; pinning controls priority, not write protection.
 
 ---
 
@@ -338,6 +341,7 @@ LumiMind settings are user-scoped and apply across chats.
 |---|---:|---|
 | Manage the active persona | On | Allows persona analysis, display, secondary state, and impersonation injection. |
 | Character card acts as director | Off | Excludes host card minds and manages the named cast portrayed by the card. |
+| Mind block position | Start of prompt | Inserts the private system block at the prompt start, before the latest user message, or at the prompt end. |
 
 ### Analysis and injection
 
@@ -362,6 +366,13 @@ LumiMind does not impose maximum values on the output-token, state-token, inject
 | Cortex identity writeback | Off | Publishes only confirmed identity and aliases—never private mind state. |
 | Private extension interop | Off | Registers the permission-gated private scene snapshot. |
 
+### Timeline database transfer
+
+Open **Mind Lens → Settings → Timeline database** to export or import the current chat's complete LumiMind timeline as JSON. Import replaces only the destination chat's LumiMind data; it never edits the chat transcript.
+
+- **Continue from exported checkpoint** copies the exported folded cast and mind state into the destination as a new baseline. Use this for sequels and alternate scenarios.
+- **Restore full timeline against matching history** remaps stored analysis records by transcript position. Use this for backups or forks whose messages match the exported history.
+
 ---
 
 ## Controller usage and cost
@@ -380,7 +391,7 @@ Additional calls can occur when:
 
 Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
 
-The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
+The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message at the configured prompt position. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
 Controller analysis uses the selected controller model's tokenizer and always keeps actor identity stubs available. Ranking favors actors named in the current batch, current presence, lexical relevance, protected or pinned state, relationships to relevant actors, and recency, with fair allocation across relevant actors. LumiMind uses Spindle's provider mapping to force one schema-backed tool call and disables inherited reasoning with `reasoning: { source: "off" }`; plain JSON remains a compatibility fallback. If tokenization fails, diagnostics mark the `characters / 4` estimate used for that request.
 
@@ -487,7 +498,7 @@ If LumiMind is missing, permission-gated, disabled, or stale, LumiState and futu
 
 > **Treat beliefs as beliefs.** Correct a mind when the character would not reasonably know something. Do not “fix” a false belief merely because you know the objective truth.
 
-> **Lock deliberate corrections.** Manual edits are locked automatically. Keep them locked when the controller should not reinterpret them.
+> **Lock deliberate corrections.** Manual edits are locked automatically. Keep them locked when the controller should not reinterpret them. Pinning prioritizes an entry but does not prevent the controller from updating or deleting an unlocked entry.
 
 > **Confirm identities before Cortex writeback.** Merge duplicates and review aliases first. Writeback is intentionally identity-only.
 

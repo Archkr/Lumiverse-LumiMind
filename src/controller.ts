@@ -374,9 +374,7 @@ function validateControllerAnalysisContext(
         incrementInvalidReason(invalidChangeReasons, "target_not_found");
         return [];
       }
-      const protectedTarget = target && (
-        target.locked === true || target.pinned === true || (text(target.source) !== "" && text(target.source) !== "controller")
-      );
+      const protectedTarget = target.locked === true;
       if (protectedTarget) {
         incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
