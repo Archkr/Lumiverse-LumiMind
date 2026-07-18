@@ -425,4 +425,30 @@ describe("controller response parsing", () => {
     expect(result.telemetry.warningCodes).toEqual(expect.arrayContaining(["retry_failed", "empty_nontrivial_batch"]));
     expect(result.telemetry.retryError).toBe("temporary provider failure");
   });
+
+  it("forwards an abort signal to every controller pass and propagates cancellation", async () => {
+    const abortController = new AbortController();
+    const abortError = Object.assign(new Error("The generation was cancelled."), { name: "AbortError" });
+    const quiet = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })
+      .mockImplementationOnce(async () => {
+        abortController.abort();
+        throw abortError;
+      });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "C".repeat(500), index_in_chat: 0 }];
+
+    await expect(analyzeMessages({
+      messages,
+      recentContext: [],
+      compactState: [],
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+      signal: abortController.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(quiet).toHaveBeenCalledTimes(2);
+    expect(quiet.mock.calls[0][0]).toMatchObject({ signal: abortController.signal });
+    expect(quiet.mock.calls[1][0]).toMatchObject({ signal: abortController.signal });
+  });
 });

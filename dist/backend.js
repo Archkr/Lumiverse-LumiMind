@@ -1194,6 +1194,9 @@ function buildProjectedDirectorMindInjection(timeline, settings, contextMessages
 
 // src/controller.ts
 var THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
+function isAbortError(error) {
+  return !!error && typeof error === "object" && "name" in error && error.name === "AbortError";
+}
 function asObject2(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
@@ -1647,7 +1650,7 @@ ${message.content}`).join("\n"), connection.model);
 function controllerTokenCounter(connection, userId) {
   return (value) => countTextTokens(value, connection, userId);
 }
-async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection) {
+async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal) {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
   const result = await spindle.generate.quiet({
     type: "quiet",
@@ -1667,7 +1670,8 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
     }],
     reasoning: { source: "off" },
     ...connection.id ? { connection_id: connection.id } : {},
-    userId
+    userId,
+    signal
   });
   const object = asObject2(result);
   const content = sanitizeControllerText(text(object.content));
@@ -1785,8 +1789,10 @@ async function analyzeMessages(input) {
     input.settings,
     input.userId,
     input.fallbackConnectionId,
-    connection
+    connection,
+    input.signal
   );
+  input.signal?.throwIfAborted();
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
@@ -1817,8 +1823,10 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         input.settings,
         input.userId,
         input.fallbackConnectionId,
-        connection
+        connection,
+        input.signal
       );
+      input.signal?.throwIfAborted();
       retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
       const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
@@ -1832,6 +1840,7 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
     }
   }
@@ -1991,6 +2000,9 @@ var activeChats = /* @__PURE__ */ new Map();
 var chatUsers = /* @__PURE__ */ new Map();
 var operations = /* @__PURE__ */ new Map();
 var reconcileTimers = /* @__PURE__ */ new Map();
+var analysisAbortControllers = /* @__PURE__ */ new Map();
+var pauseRequests = /* @__PURE__ */ new Set();
+var rebuildRequests = /* @__PURE__ */ new Set();
 var generationContexts = /* @__PURE__ */ new Map();
 var latestGenerationByChat = /* @__PURE__ */ new Map();
 var connectionByChat = /* @__PURE__ */ new Map();
@@ -2282,6 +2294,16 @@ function enqueue(userId, chatId, task) {
   });
   return next;
 }
+function cancelScheduledReconcile(userId, chatId) {
+  const key = cacheKey(userId, chatId);
+  const timer = reconcileTimers.get(key);
+  if (!timer) return;
+  clearTimeout(timer);
+  reconcileTimers.delete(key);
+}
+function cancelActiveAnalysis(userId, chatId) {
+  analysisAbortControllers.get(cacheKey(userId, chatId))?.abort();
+}
 async function persistAndPublish(timeline, userId, announce = true) {
   timeline.revision += 1;
   timeline.updatedAt = Date.now();
@@ -2290,6 +2312,9 @@ async function persistAndPublish(timeline, userId, announce = true) {
   if (announce && activeChats.get(userId)?.chatId === timeline.chatId) await sendState(userId, timeline.chatId);
 }
 async function reconcileChat(userId, chatId, force = false) {
+  const key = cacheKey(userId, chatId);
+  if (force) rebuildRequests.delete(key);
+  if (pauseRequests.has(key) || !force && rebuildRequests.has(key)) return;
   const timeline = await getTimeline(chatId, userId);
   const settings = await getSettings(userId);
   const policyHash = analysisPolicyHash(settings);
@@ -2350,6 +2375,9 @@ async function reconcileChat(userId, chatId, force = false) {
   timeline.health = timeline.records.length ? "pending" : "initializing";
   timeline.error = null;
   await persistAndPublish(timeline, userId);
+  if (pauseRequests.has(key) || !force && rebuildRequests.has(key)) return;
+  const abortController = new AbortController();
+  analysisAbortControllers.set(key, abortController);
   try {
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
@@ -2372,8 +2400,10 @@ async function reconcileChat(userId, chatId, force = false) {
         compactState: compactStateForController(timeline, settings),
         settings,
         userId,
-        fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null
+        fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+        signal: abortController.signal
       });
+      abortController.signal.throwIfAborted();
       const debugKey = cacheKey(userId, chatId);
       const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
       debugResponses.push({
@@ -2403,10 +2433,13 @@ async function reconcileChat(userId, chatId, force = false) {
       await persistAndPublish(timeline, userId);
     }
   } catch (error) {
+    if (isAbortError(error)) return;
     timeline.health = "error";
     timeline.error = error instanceof Error ? error.message : String(error);
     await persistAndPublish(timeline, userId);
     spindle.log.warn(`LumiMind analysis failed for ${chatId}: ${timeline.error}`);
+  } finally {
+    if (analysisAbortControllers.get(key) === abortController) analysisAbortControllers.delete(key);
   }
 }
 function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS) {
@@ -2639,6 +2672,10 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   const chatId = extractChatId(payload) ?? readString(payload, ["id"]);
   const userId = resolveUserId(chatId, eventUserId);
   if (!chatId || !userId) return;
+  cancelScheduledReconcile(userId, chatId);
+  cancelActiveAnalysis(userId, chatId);
+  pauseRequests.delete(cacheKey(userId, chatId));
+  rebuildRequests.delete(cacheKey(userId, chatId));
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
@@ -2694,6 +2731,14 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "pause") {
+      const key = cacheKey(userId, message.chatId);
+      if (message.paused) {
+        pauseRequests.add(key);
+        cancelScheduledReconcile(userId, message.chatId);
+        cancelActiveAnalysis(userId, message.chatId);
+      } else {
+        pauseRequests.delete(key);
+      }
       await mutateTimeline(userId, message.chatId, (timeline) => {
         timeline.paused = message.paused;
         timeline.health = message.paused ? "paused" : "pending";
@@ -2702,6 +2747,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "rebuild") {
+      rebuildRequests.add(cacheKey(userId, message.chatId));
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
       await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId, true));
       return;
     }

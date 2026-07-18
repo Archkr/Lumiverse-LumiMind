@@ -242,9 +242,9 @@ Mind Lens is LumiMind’s main drawer interface.
 
 - View committed analysis records by message and swipe.
 - See accepted actor mentions, state changes, and quality warnings.
-- Pause or resume automatic analysis.
+- Pause or resume automatic analysis. Pausing cancels any controller generation currently in flight.
 - Retry a failed or stale suffix.
-- Rebuild committed history under the current rules and roleplay mode.
+- Rebuild committed history under the current rules and roleplay mode. Rebuild cancels the current controller generation before starting over.
 
 </details>
 

@@ -43,6 +43,10 @@ export interface AnalysisControllerResult {
   telemetry: ControllerBatchTelemetry;
 }
 
+export function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === "object" && "name" in error && error.name === "AbortError";
+}
+
 type ResolvedConnection = {
   id: string | null;
   provider: string | null;
@@ -600,6 +604,7 @@ async function quietJson(
   userId: string,
   fallbackConnectionId?: string | null,
   resolvedConnection?: ResolvedConnection,
+  signal?: AbortSignal,
 ): Promise<{
   parsed: unknown;
   raw: string;
@@ -627,6 +632,7 @@ async function quietJson(
     reasoning: { source: "off" },
     ...(connection.id ? { connection_id: connection.id } : {}),
     userId,
+    signal,
   } as unknown as Parameters<typeof spindle.generate.quiet>[0]);
   const object = asObject(result);
   const content = sanitizeControllerText(text(object.content));
@@ -741,6 +747,7 @@ export async function analyzeMessages(input: {
   settings: LumiMindSettings;
   userId: string;
   fallbackConnectionId?: string | null;
+  signal?: AbortSignal;
 }): Promise<AnalysisControllerResult> {
   const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
   const stateProjection = await projectControllerState(
@@ -765,7 +772,9 @@ export async function analyzeMessages(input: {
     input.userId,
     input.fallbackConnectionId,
     connection,
+    input.signal,
   );
+  input.signal?.throwIfAborted();
   if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
@@ -796,7 +805,9 @@ export async function analyzeMessages(input: {
         input.userId,
         input.fallbackConnectionId,
         connection,
+        input.signal,
       );
+      input.signal?.throwIfAborted();
       retryRaw = corrective.raw;
       const normalizedCorrective = normalizeControllerAnalysisResult(corrective.parsed);
       const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
@@ -810,6 +821,7 @@ export async function analyzeMessages(input: {
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
+      if (isAbortError(error)) throw error;
       retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
     }
   }

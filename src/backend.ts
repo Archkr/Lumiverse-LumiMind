@@ -1,7 +1,7 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
 import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
-import { analyzeMessages, generateSeedDraft } from "./controller";
+import { analyzeMessages, generateSeedDraft, isAbortError } from "./controller";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
@@ -71,6 +71,9 @@ const activeChats = new Map<string, { chatId: string | null; characterId: string
 const chatUsers = new Map<string, string>();
 const operations = new Map<string, Promise<void>>();
 const reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const analysisAbortControllers = new Map<string, AbortController>();
+const pauseRequests = new Set<string>();
+const rebuildRequests = new Set<string>();
 const generationContexts = new Map<string, GenerationContext>();
 const latestGenerationByChat = new Map<string, GenerationContext>();
 const connectionByChat = new Map<string, string>();
@@ -407,6 +410,18 @@ function enqueue(userId: string, chatId: string, task: () => Promise<void>): Pro
   return next;
 }
 
+function cancelScheduledReconcile(userId: string, chatId: string): void {
+  const key = cacheKey(userId, chatId);
+  const timer = reconcileTimers.get(key);
+  if (!timer) return;
+  clearTimeout(timer);
+  reconcileTimers.delete(key);
+}
+
+function cancelActiveAnalysis(userId: string, chatId: string): void {
+  analysisAbortControllers.get(cacheKey(userId, chatId))?.abort();
+}
+
 async function persistAndPublish(timeline: ChatTimelineV1, userId: string, announce = true): Promise<void> {
   timeline.revision += 1;
   timeline.updatedAt = Date.now();
@@ -416,6 +431,9 @@ async function persistAndPublish(timeline: ChatTimelineV1, userId: string, annou
 }
 
 async function reconcileChat(userId: string, chatId: string, force = false): Promise<void> {
+  const key = cacheKey(userId, chatId);
+  if (force) rebuildRequests.delete(key);
+  if (pauseRequests.has(key) || (!force && rebuildRequests.has(key))) return;
   const timeline = await getTimeline(chatId, userId);
   const settings = await getSettings(userId);
   const policyHash = analysisPolicyHash(settings);
@@ -480,6 +498,9 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   timeline.health = timeline.records.length ? "pending" : "initializing";
   timeline.error = null;
   await persistAndPublish(timeline, userId);
+  if (pauseRequests.has(key) || (!force && rebuildRequests.has(key))) return;
+  const abortController = new AbortController();
+  analysisAbortControllers.set(key, abortController);
   try {
     while (derivation.firstMissingIndex < derivation.messages.length) {
       const start = derivation.firstMissingIndex;
@@ -503,7 +524,9 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
         settings,
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+        signal: abortController.signal,
       });
+      abortController.signal.throwIfAborted();
       const debugKey = cacheKey(userId, chatId);
       const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
       debugResponses.push({
@@ -534,10 +557,13 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
       await persistAndPublish(timeline, userId);
     }
   } catch (error) {
+    if (isAbortError(error)) return;
     timeline.health = "error";
     timeline.error = error instanceof Error ? error.message : String(error);
     await persistAndPublish(timeline, userId);
     spindle.log.warn(`LumiMind analysis failed for ${chatId}: ${timeline.error}`);
+  } finally {
+    if (analysisAbortControllers.get(key) === abortController) analysisAbortControllers.delete(key);
   }
 }
 
@@ -797,6 +823,10 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   const chatId = extractChatId(payload) ?? readString(payload, ["id"]);
   const userId = resolveUserId(chatId, eventUserId);
   if (!chatId || !userId) return;
+  cancelScheduledReconcile(userId, chatId);
+  cancelActiveAnalysis(userId, chatId);
+  pauseRequests.delete(cacheKey(userId, chatId));
+  rebuildRequests.delete(cacheKey(userId, chatId));
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
@@ -854,6 +884,14 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "pause") {
+      const key = cacheKey(userId, message.chatId);
+      if (message.paused) {
+        pauseRequests.add(key);
+        cancelScheduledReconcile(userId, message.chatId);
+        cancelActiveAnalysis(userId, message.chatId);
+      } else {
+        pauseRequests.delete(key);
+      }
       await mutateTimeline(userId, message.chatId, (timeline) => {
         timeline.paused = message.paused;
         timeline.health = message.paused ? "paused" : "pending";
@@ -862,6 +900,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       return;
     }
     if (message.type === "rebuild") {
+      rebuildRequests.add(cacheKey(userId, message.chatId));
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
       await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId, true));
       return;
     }
