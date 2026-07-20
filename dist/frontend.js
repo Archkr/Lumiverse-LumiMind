@@ -129,6 +129,11 @@ function cloneSeed(seed) {
 function cloneSettings(settings) {
   return { ...settings };
 }
+function availableRecentHistoryLimit(messageCount, configuredLimit) {
+  const count = Number.isFinite(messageCount) ? Math.max(0, Math.floor(messageCount)) : 0;
+  const limit = Number.isFinite(configuredLimit) ? Math.max(0, Math.floor(configuredLimit)) : 0;
+  return limit > 0 && limit < count ? limit : null;
+}
 function relationshipLines(seed) {
   return seed.relationshipPriors.map((entry) => `${entry.target} :: ${entry.stance}`).join("\n");
 }
@@ -705,6 +710,10 @@ function setup(ctx) {
   let diagnosticsRefresh = null;
   const developerReportRequests = /* @__PURE__ */ new Map();
   const activationPreviewRequests = /* @__PURE__ */ new Map();
+  const settingsSaveRequests = /* @__PURE__ */ new Map();
+  let settingsRevision = 0;
+  let settingsSaving = false;
+  let settingsSavePromise = null;
   let seedTab = null;
   let seedRoot = null;
   let seedEditorUnsub = null;
@@ -1017,6 +1026,41 @@ function setup(ctx) {
       send({ type: "activation_preview", chatId, requestId });
     });
   }
+  function requestSettingsSave(patch, chatId) {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        settingsSaveRequests.delete(requestId);
+        reject(new Error("Saving LumiMind settings timed out."));
+      }, 15e3);
+      settingsSaveRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "save_settings", requestId, patch, chatId });
+    });
+  }
+  function persistSettingsDraft() {
+    if (settingsSavePromise) return settingsSavePromise;
+    if (!settingsDraft) return Promise.reject(new Error("LumiMind settings are not available."));
+    const patch = cloneSettings(settingsDraft);
+    const revision = settingsRevision;
+    settingsSaving = true;
+    if (activeView === "settings") render();
+    settingsSavePromise = requestSettingsSave(patch, currentState?.activeChatId ?? null).then((settings) => {
+      if (currentState) currentState = { ...currentState, settings: cloneSettings(settings) };
+      if (settingsRevision === revision) {
+        settingsDraft = cloneSettings(settings);
+        settingsDirty = false;
+      }
+      return settings;
+    }).finally(() => {
+      settingsSaving = false;
+      settingsSavePromise = null;
+      if (activeView === "settings") render();
+    });
+    return settingsSavePromise;
+  }
+  async function flushSettingsBeforeActivation() {
+    while (settingsDirty || settingsSaving) await persistSettingsDraft();
+  }
   function chooseActivationHistory(messageCount, recentMessageLimit) {
     return new Promise((resolve) => {
       const modal = ctx.ui.showModal({ title: "Choose history to analyze", width: 520, maxHeight: 560 });
@@ -1026,11 +1070,12 @@ function setup(ctx) {
         "lm-activation-text",
         `This chat already has ${messageCount.toLocaleString()} committed messages. Full history may require many background controller calls.`
       ));
-      const canUseRecent = recentMessageLimit > 0 && recentMessageLimit < messageCount;
+      const availableRecentLimit = availableRecentHistoryLimit(messageCount, recentMessageLimit);
+      const canUseRecent = availableRecentLimit !== null;
       form.appendChild(element(
         "p",
         "lm-seed-hint",
-        canUseRecent ? `Analyze everything, or start with only the most recent ${recentMessageLimit.toLocaleString()} messages from your Chat history setting. Older messages will be intentionally checkpointed as skipped.` : "Your Chat history setting is unlimited (or already covers this chat), so there is no smaller configured range. Change that setting first if you want a recent-history option."
+        canUseRecent ? `Analyze everything, or start with only the most recent ${availableRecentLimit.toLocaleString()} messages from your Chat history setting. Older messages will be intentionally checkpointed as skipped.` : "Your Chat history setting is unlimited (or already covers this chat), so there is no smaller configured range. Change that setting first if you want a recent-history option."
       ));
       const actions = element("div", "lm-modal-actions");
       let settled = false;
@@ -1042,7 +1087,7 @@ function setup(ctx) {
       };
       actions.appendChild(textButton("Cancel", () => finish(null), "secondary"));
       if (canUseRecent) {
-        actions.appendChild(textButton(`Recent ${recentMessageLimit.toLocaleString()}`, () => finish("recent"), "secondary"));
+        actions.appendChild(textButton(`Recent ${availableRecentLimit.toLocaleString()}`, () => finish("recent"), "secondary"));
       }
       actions.appendChild(textButton("Full history", () => finish("full"), "primary"));
       form.appendChild(actions);
@@ -1288,8 +1333,12 @@ function setup(ctx) {
       const originalLabel = button.textContent;
       button.textContent = "Checking history\u2026";
       try {
-        const messageCount = await requestActivationPreview(timeline.chatId);
-        const recentMessageLimit = Math.max(0, Math.floor(currentState?.settings.chatHistoryMessageLimit ?? 0));
+        if (settingsDirty || settingsSaving) {
+          button.textContent = "Saving settings\u2026";
+          await flushSettingsBeforeActivation();
+          button.textContent = "Checking history\u2026";
+        }
+        const { messageCount, recentMessageLimit } = await requestActivationPreview(timeline.chatId);
         const historyMode = messageCount >= 50 ? await chooseActivationHistory(messageCount, recentMessageLimit) : "full";
         if (!historyMode) return;
         send({
@@ -1824,8 +1873,11 @@ function setup(ctx) {
   }
   function markSettingsDirty(saveButton) {
     settingsDirty = true;
-    saveButton.disabled = false;
-    saveButton.textContent = "Save settings";
+    settingsRevision += 1;
+    if (!settingsSaving) {
+      saveButton.disabled = false;
+      saveButton.textContent = "Save settings";
+    }
   }
   function renderToggle(label, description, checked, onChange) {
     const row = element("label", "lm-toggle-row");
@@ -1846,14 +1898,12 @@ function setup(ctx) {
     heading.append(element("div", "lm-kicker", "Roleplay, controller & privacy"), element("h2", "lm-view-title", "Mind Lens settings"));
     heading.appendChild(element("p", "lm-view-copy", "Settings are user-scoped. Roleplay-mode changes rebuild activated timelines when they are opened."));
     container.appendChild(heading);
-    const save = textButton(settingsDirty ? "Save settings" : "Saved", () => {
-      if (!settingsDraft) return;
-      send({ type: "save_settings", patch: { ...settingsDraft }, chatId: currentState?.activeChatId });
-      settingsDirty = false;
-      save.disabled = true;
-      save.textContent = "Saved";
+    const save = textButton(settingsSaving ? "Saving\u2026" : settingsDirty ? "Save settings" : "Saved", () => {
+      void persistSettingsDraft().catch((error) => {
+        showNotice("error", error instanceof Error ? error.message : "LumiMind settings could not be saved.");
+      });
     }, "primary");
-    save.disabled = !settingsDirty;
+    save.disabled = settingsSaving || !settingsDirty;
     const behavior = element("section", "lm-settings-card");
     behavior.appendChild(element("h3", "lm-settings-title", "Roleplay behavior"));
     behavior.appendChild(element("p", "lm-settings-description", "Choose who LumiMind is allowed to manage. Reviewed seeds and locked manual edits remain stored while disabled actors are excluded from analysis, display, and injection."));
@@ -1927,7 +1977,7 @@ function setup(ctx) {
       if (max !== null) control.max = String(max);
       control.step = String(step);
       control.value = String(settingsDraft?.[key] ?? 0);
-      control.addEventListener("change", () => {
+      control.addEventListener("input", () => {
         if (!settingsDraft) return;
         const parsed = Number(control.value);
         const value = Number.isFinite(parsed) ? max === null ? Math.max(min, parsed) : Math.min(max, Math.max(min, parsed)) : settingsDraft[key];
@@ -2331,7 +2381,17 @@ function setup(ctx) {
       if (!pending) return;
       clearTimeout(pending.timeout);
       activationPreviewRequests.delete(message.requestId);
-      if (message.type === "activation_preview") pending.resolve(message.messageCount);
+      if (message.type === "activation_preview") pending.resolve({
+        messageCount: message.messageCount,
+        recentMessageLimit: message.recentMessageLimit
+      });
+      else pending.reject(new Error(message.message));
+    } else if (message.type === "settings_saved" || message.type === "settings_save_error") {
+      const pending = settingsSaveRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      settingsSaveRequests.delete(message.requestId);
+      if (message.type === "settings_saved") pending.resolve(message.settings);
       else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
@@ -2378,6 +2438,11 @@ function setup(ctx) {
       pending.reject(new Error("LumiMind closed before the history check completed."));
     }
     activationPreviewRequests.clear();
+    for (const pending of settingsSaveRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before settings were saved."));
+    }
+    settingsSaveRequests.clear();
     destroySeedTab();
     while (cleanups.length) {
       try {

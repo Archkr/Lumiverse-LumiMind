@@ -165,6 +165,12 @@ export function cloneSettings(settings: LumiMindSettings): LumiMindSettings {
   return { ...settings };
 }
 
+export function availableRecentHistoryLimit(messageCount: number, configuredLimit: number): number | null {
+  const count = Number.isFinite(messageCount) ? Math.max(0, Math.floor(messageCount)) : 0;
+  const limit = Number.isFinite(configuredLimit) ? Math.max(0, Math.floor(configuredLimit)) : 0;
+  return limit > 0 && limit < count ? limit : null;
+}
+
 export function relationshipLines(seed: MindSeedV1): string {
   return seed.relationshipPriors.map((entry) => `${entry.target} :: ${entry.stance}`).join("\n");
 }

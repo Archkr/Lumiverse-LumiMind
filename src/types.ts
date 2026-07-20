@@ -351,7 +351,7 @@ export type FrontendToBackend =
   | { type: "pause"; chatId: string; paused: boolean }
   | { type: "rebuild"; chatId: string }
   | { type: "retry"; chatId: string }
-  | { type: "save_settings"; patch: Partial<LumiMindSettings>; chatId?: string | null }
+  | { type: "save_settings"; requestId: string; patch: Partial<LumiMindSettings>; chatId?: string | null }
   | { type: "rename_actor"; chatId: string; actorId: string; name: string }
   | { type: "add_alias"; chatId: string; actorId: string; alias: string }
   | { type: "remove_alias"; chatId: string; actorId: string; alias: string }
@@ -372,8 +372,10 @@ export type BackendToFrontend =
   | { type: "developer_report"; requestId: string; report: unknown }
   | { type: "developer_report_error"; requestId: string; message: string }
   | { type: "database_export"; requestId: string; archive: TimelineDatabaseArchiveV1 }
-  | { type: "activation_preview"; requestId: string; chatId: string; messageCount: number }
+  | { type: "activation_preview"; requestId: string; chatId: string; messageCount: number; recentMessageLimit: number }
   | { type: "activation_preview_error"; requestId: string; chatId: string; message: string }
+  | { type: "settings_saved"; requestId: string; settings: LumiMindSettings }
+  | { type: "settings_save_error"; requestId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }
   | { type: "notice"; tone: "info" | "success" | "warning" | "error"; message: string }
   | { type: "error"; message: string };

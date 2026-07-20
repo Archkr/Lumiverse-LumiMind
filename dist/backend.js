@@ -2998,8 +2998,17 @@ spindle.onFrontendMessage(async (payload, userId) => {
     }
     if (message.type === "activation_preview") {
       try {
-        const messages = await getChatMessages(message.chatId, userId);
-        send({ type: "activation_preview", requestId: message.requestId, chatId: message.chatId, messageCount: messages.length }, userId);
+        const [messages, settings] = await Promise.all([
+          getChatMessages(message.chatId, userId),
+          getSettings(userId)
+        ]);
+        send({
+          type: "activation_preview",
+          requestId: message.requestId,
+          chatId: message.chatId,
+          messageCount: messages.length,
+          recentMessageLimit: settings.chatHistoryMessageLimit
+        }, userId);
       } catch (error) {
         send({
           type: "activation_preview_error",
@@ -3054,6 +3063,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const cortexImportChanged = previous.cortexImportEnabled !== next.cortexImportEnabled;
       await publishScene(userId);
       await sendState(userId, message.chatId);
+      send({ type: "settings_saved", requestId: message.requestId, settings: next }, userId);
       if (roleplayModeChanged && message.chatId) {
         const timeline = await getTimeline(message.chatId, userId);
         if (timeline.active) scheduleReconcile(userId, message.chatId, 0);
@@ -3141,6 +3151,10 @@ spindle.onFrontendMessage(async (payload, userId) => {
     const detail = error instanceof Error ? error.message : String(error);
     if (message.type === "developer_report") {
       send({ type: "developer_report_error", requestId: message.requestId, message: detail }, userId);
+      return;
+    }
+    if (message.type === "save_settings") {
+      send({ type: "settings_save_error", requestId: message.requestId, message: detail }, userId);
       return;
     }
     send({ type: "error", message: detail }, userId);

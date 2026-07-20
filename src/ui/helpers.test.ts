@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { FrontendState, MindSeedV1 } from "../types";
 import {
   actorInitials,
+  availableRecentHistoryLimit,
   healthLabel,
   missingAnalysisPermissions,
   parseRelationshipLines,
@@ -59,6 +60,13 @@ describe("Mind Seed extension persistence", () => {
 });
 
 describe("UI normalization", () => {
+  it("offers a configured recent-history range only when it is smaller than the chat", () => {
+    expect(availableRecentHistoryLimit(89, 10)).toBe(10);
+    expect(availableRecentHistoryLimit(89, 0)).toBeNull();
+    expect(availableRecentHistoryLimit(89, 89)).toBeNull();
+    expect(availableRecentHistoryLimit(89, 100)).toBeNull();
+  });
+
   it("deduplicates case-insensitively and drops blank lines", () => {
     expect(uniqueLines(" Truth \ntruth\n\n Mercy ")).toEqual(["Truth", "Mercy"]);
   });
