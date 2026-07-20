@@ -1559,6 +1559,14 @@ function applyControllerMindPolicy(analysis, compactState, settings) {
   });
   return { actorMentions, changes };
 }
+function resolveControllerTarget(items, targetItemId) {
+  const exact = items.find((item) => text(item.id) === targetItemId);
+  if (exact) return exact;
+  const separatorIndex = targetItemId.lastIndexOf(":");
+  if (separatorIndex < 0 || targetItemId.length - separatorIndex - 1 < 8) return null;
+  const prefixMatches = items.filter((item) => text(item.id).startsWith(targetItemId));
+  return prefixMatches.length === 1 ? prefixMatches[0] : null;
+}
 function validateControllerAnalysisContext(analysis, messages, compactState) {
   const messageIds = new Set(messages.map((message) => message.id));
   const actorByReference = /* @__PURE__ */ new Map();
@@ -1595,7 +1603,10 @@ function validateControllerAnalysisContext(analysis, messages, compactState) {
         incrementInvalidReason(invalidChangeReasons, "missing_target_id");
         return [];
       }
-      const target = (Array.isArray(actor.items) ? actor.items : []).map(asObject2).find((item) => text(item.id) === targetItemId);
+      const target = resolveControllerTarget(
+        (Array.isArray(actor.items) ? actor.items : []).map(asObject2),
+        targetItemId
+      );
       if (!target) {
         incrementInvalidReason(invalidChangeReasons, "target_not_found");
         return [];
@@ -1605,6 +1616,7 @@ function validateControllerAnalysisContext(analysis, messages, compactState) {
         incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
       }
+      change = { ...change, targetItemId: text(target.id) };
     }
     const knownReferences = (values) => (values ?? []).filter((reference) => actorByReference.has(policyReference(reference)));
     return [{
@@ -1881,11 +1893,13 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
 ].join("\n");
 function correctiveBootstrapNeeded(compactState, mentions) {
-  const actors = (Array.isArray(compactState) ? compactState : []).map(asObject2).filter((actor) => actor.managed !== false).map((actor) => ({
+  const stateActors = (Array.isArray(compactState) ? compactState : []).map(asObject2).filter((actor) => policyReference(actor.ref) || policyReference(actor.name));
+  const actors = stateActors.filter((actor) => actor.managed !== false).map((actor) => ({
     references: [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []].map(policyReference).filter(Boolean),
     itemCount: Array.isArray(actor.items) ? actor.items.length : 0
   }));
-  if (actors.length === 0 || actors.every((actor) => actor.itemCount === 0)) return true;
+  if (actors.length === 0) return stateActors.length === 0 || mentions.length > 0;
+  if (actors.every((actor) => actor.itemCount === 0)) return true;
   return mentions.some((mention) => {
     const mentionReferences = [mention.ref, mention.name, ...mention.aliases ?? []].map(policyReference).filter(Boolean);
     const actor = actors.find((candidate) => candidate.references.some((reference) => mentionReferences.includes(reference)));

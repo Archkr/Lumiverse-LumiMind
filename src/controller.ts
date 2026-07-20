@@ -326,6 +326,21 @@ interface ControllerContextValidationResult {
   invalidChangeReasons: InvalidMindChangeReasonCounts;
 }
 
+function resolveControllerTarget(
+  items: Record<string, unknown>[],
+  targetItemId: string,
+): Record<string, unknown> | null {
+  const exact = items.find((item) => text(item.id) === targetItemId);
+  if (exact) return exact;
+
+  // Some structured-output models copy only the namespace plus the first UUID
+  // segment. Recover that form only when it is specific and unambiguous.
+  const separatorIndex = targetItemId.lastIndexOf(":");
+  if (separatorIndex < 0 || targetItemId.length - separatorIndex - 1 < 8) return null;
+  const prefixMatches = items.filter((item) => text(item.id).startsWith(targetItemId));
+  return prefixMatches.length === 1 ? prefixMatches[0] : null;
+}
+
 function validateControllerAnalysisContext(
   analysis: ControllerAnalysis,
   messages: ChatMessageLike[],
@@ -367,9 +382,10 @@ function validateControllerAnalysisContext(
         incrementInvalidReason(invalidChangeReasons, "missing_target_id");
         return [];
       }
-      const target = (Array.isArray(actor.items) ? actor.items : [])
-        .map(asObject)
-        .find((item) => text(item.id) === targetItemId);
+      const target = resolveControllerTarget(
+        (Array.isArray(actor.items) ? actor.items : []).map(asObject),
+        targetItemId,
+      );
       if (!target) {
         incrementInvalidReason(invalidChangeReasons, "target_not_found");
         return [];
@@ -379,6 +395,7 @@ function validateControllerAnalysisContext(
         incrementInvalidReason(invalidChangeReasons, "protected_target");
         return [];
       }
+      change = { ...change, targetItemId: text(target.id) };
     }
     const knownReferences = (values: string[] | undefined) => (values ?? []).filter((reference) => actorByReference.has(policyReference(reference)));
     return [{
@@ -690,8 +707,10 @@ const ANALYSIS_SYSTEM_PROMPT = [
 ].join("\n");
 
 function correctiveBootstrapNeeded(compactState: unknown, mentions: ControllerActorMention[]): boolean {
-  const actors = (Array.isArray(compactState) ? compactState : [])
+  const stateActors = (Array.isArray(compactState) ? compactState : [])
     .map(asObject)
+    .filter((actor) => policyReference(actor.ref) || policyReference(actor.name));
+  const actors = stateActors
     .filter((actor) => actor.managed !== false)
     .map((actor) => ({
       references: [actor.ref, actor.name, ...(Array.isArray(actor.aliases) ? actor.aliases : [])]
@@ -699,7 +718,8 @@ function correctiveBootstrapNeeded(compactState: unknown, mentions: ControllerAc
         .filter(Boolean),
       itemCount: Array.isArray(actor.items) ? actor.items.length : 0,
     }));
-  if (actors.length === 0 || actors.every((actor) => actor.itemCount === 0)) return true;
+  if (actors.length === 0) return stateActors.length === 0 || mentions.length > 0;
+  if (actors.every((actor) => actor.itemCount === 0)) return true;
   return mentions.some((mention) => {
     const mentionReferences = [mention.ref, mention.name, ...(mention.aliases ?? [])].map(policyReference).filter(Boolean);
     const actor = actors.find((candidate) => candidate.references.some((reference) => mentionReferences.includes(reference)));

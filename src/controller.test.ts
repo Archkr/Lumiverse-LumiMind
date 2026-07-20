@@ -342,6 +342,39 @@ describe("controller response parsing", () => {
     expect(result.telemetry.first.invalidChangeReasons).toMatchObject({ protected_target: 1 });
   });
 
+  it("expands a unique abbreviated item ID while rejecting an ambiguous prefix", async () => {
+    const exactId = "delta:3f4ec3c8-1111-4111-8111-111111111111";
+    const changes: ControllerAnalysis["changes"] = [
+      { subjectRef: "Mira", category: "belief", operation: "update", targetItemId: "delta:3f4ec3c8", text: "Unique target evolved", messageId: "m1" },
+      { subjectRef: "Mira", category: "goal", operation: "update", targetItemId: "delta:aaaaaaaa", text: "Ambiguous target evolved", messageId: "m1" },
+      { subjectRef: "Mira", category: "plan", operation: "update", targetItemId: "delta:bbbb", text: "Underspecified target evolved", messageId: "m1" },
+    ];
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "Mira changes her mind.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        items: [
+          { id: exactId, locked: false },
+          { id: "delta:aaaaaaaa-1111-4111-8111-111111111111", locked: false },
+          { id: "delta:aaaaaaaa-2222-4222-8222-222222222222", locked: false },
+          { id: "delta:bbbbbbbb-1111-4111-8111-111111111111", locked: false },
+        ],
+      }],
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    });
+
+    expect(result.analysis.changes).toEqual([
+      expect.objectContaining({ targetItemId: exactId, text: "Unique target evolved" }),
+    ]);
+    expect(result.telemetry.first.invalidChangeReasons).toMatchObject({ target_not_found: 2 });
+  });
+
   it.each(["assistant", "character:card"])("preserves a portrayed NPC when its controller ref collides with %s", (collidingRef) => {
     const analysis: ControllerAnalysis = {
       actorMentions: [{
@@ -404,6 +437,32 @@ describe("controller response parsing", () => {
     expect(systemPrompt).toContain("COVERED, EVOLVED, ENDED, PROTECTED, or NOVEL");
     expect(systemPrompt).toContain("When uncertain between COVERED and NOVEL, choose COVERED and emit nothing.");
     expect(systemPrompt).toContain("one concise composite emotion");
+  });
+
+  it("does not retry a substantive batch when the registry contains only unmanaged context actors", async () => {
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({
+      actorMentions: [
+        { ref: "character:card", name: "The Director", kind: "character", messageId: "m1" },
+        { ref: "persona:player", name: "Player", kind: "persona", messageId: "m1" },
+      ],
+      changes: [],
+    }) });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "A".repeat(500), index_in_chat: 0 }];
+    const result = await analyzeMessages({
+      messages,
+      recentContext: [],
+      compactState: [
+        { ref: "character:card", name: "The Director", aliases: [], kind: "character", managed: false },
+        { ref: "persona:player", name: "Player", aliases: [], kind: "persona", managed: false },
+      ],
+      settings: { ...DEFAULT_SETTINGS, personaMindEnabled: false, characterCardDirectorMode: true },
+      userId: "user",
+    });
+
+    expect(quiet).toHaveBeenCalledTimes(1);
+    expect(result.analysis).toEqual({ actorMentions: [], changes: [] });
+    expect(result.telemetry).toMatchObject({ attempts: 1, finalChanges: 0, warningCodes: [] });
   });
 
   it("runs exactly one corrective pass for an empty substantive bootstrap", async () => {
