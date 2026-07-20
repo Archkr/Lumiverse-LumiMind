@@ -134,6 +134,25 @@ function availableRecentHistoryLimit(messageCount, configuredLimit) {
   const limit = Number.isFinite(configuredLimit) ? Math.max(0, Math.floor(configuredLimit)) : 0;
   return limit > 0 && limit < count ? limit : null;
 }
+var fallbackRequestIdCounter = 0;
+function createRequestId(source = globalThis.crypto) {
+  if (typeof source?.randomUUID === "function") return source.randomUUID();
+  if (typeof source?.getRandomValues === "function") {
+    const bytes = source.getRandomValues(new Uint8Array(16));
+    bytes[6] = bytes[6] & 15 | 64;
+    bytes[8] = bytes[8] & 63 | 128;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+    return [
+      hex.slice(0, 4).join(""),
+      hex.slice(4, 6).join(""),
+      hex.slice(6, 8).join(""),
+      hex.slice(8, 10).join(""),
+      hex.slice(10).join("")
+    ].join("-");
+  }
+  fallbackRequestIdCounter += 1;
+  return `lm-${Date.now().toString(36)}-${fallbackRequestIdCounter.toString(36)}`;
+}
 function relationshipLines(seed) {
   return seed.relationshipPriors.map((entry) => `${entry.target} :: ${entry.stance}`).join("\n");
 }
@@ -788,7 +807,7 @@ function setup(ctx) {
       showNotice("warning", "Open a chat before exporting its LumiMind database.");
       return;
     }
-    send({ type: "export_database", chatId, requestId: crypto.randomUUID() });
+    send({ type: "export_database", chatId, requestId: createRequestId() });
   }
   async function importDatabaseArchive(archive) {
     const chatId = currentState?.activeChatId;
@@ -1005,7 +1024,7 @@ function setup(ctx) {
     };
   }
   function requestDeveloperReport() {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         developerReportRequests.delete(requestId);
@@ -1016,7 +1035,7 @@ function setup(ctx) {
     });
   }
   function requestActivationPreview(chatId) {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         activationPreviewRequests.delete(requestId);
@@ -1027,7 +1046,7 @@ function setup(ctx) {
     });
   }
   function requestSettingsSave(patch, chatId) {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         settingsSaveRequests.delete(requestId);

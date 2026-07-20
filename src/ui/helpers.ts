@@ -171,6 +171,34 @@ export function availableRecentHistoryLimit(messageCount: number, configuredLimi
   return limit > 0 && limit < count ? limit : null;
 }
 
+type RequestIdCrypto = {
+  randomUUID?: () => string;
+  getRandomValues?: (array: Uint8Array) => Uint8Array;
+};
+
+let fallbackRequestIdCounter = 0;
+
+export function createRequestId(source: RequestIdCrypto | undefined = globalThis.crypto): string {
+  if (typeof source?.randomUUID === "function") return source.randomUUID();
+
+  if (typeof source?.getRandomValues === "function") {
+    const bytes = source.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+    return [
+      hex.slice(0, 4).join(""),
+      hex.slice(4, 6).join(""),
+      hex.slice(6, 8).join(""),
+      hex.slice(8, 10).join(""),
+      hex.slice(10).join(""),
+    ].join("-");
+  }
+
+  fallbackRequestIdCounter += 1;
+  return `lm-${Date.now().toString(36)}-${fallbackRequestIdCounter.toString(36)}`;
+}
+
 export function relationshipLines(seed: MindSeedV1): string {
   return seed.relationshipPriors.map((entry) => `${entry.target} :: ${entry.stance}`).join("\n");
 }

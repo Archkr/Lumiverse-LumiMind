@@ -3,6 +3,7 @@ import type { FrontendState, MindSeedV1 } from "../types";
 import {
   actorInitials,
   availableRecentHistoryLimit,
+  createRequestId,
   healthLabel,
   missingAnalysisPermissions,
   parseRelationshipLines,
@@ -60,6 +61,20 @@ describe("Mind Seed extension persistence", () => {
 });
 
 describe("UI normalization", () => {
+  it("creates request IDs when randomUUID is unavailable in an insecure browser context", () => {
+    const source = {
+      getRandomValues(bytes: Uint8Array) {
+        bytes.set(Array.from({ length: 16 }, (_, index) => index));
+        return bytes;
+      },
+    };
+    expect(createRequestId(source)).toBe("00010203-0405-4607-8809-0a0b0c0d0e0f");
+  });
+
+  it("uses the native UUID implementation when it is available", () => {
+    expect(createRequestId({ randomUUID: () => "native-uuid" })).toBe("native-uuid");
+  });
+
   it("offers a configured recent-history range only when it is smaller than the chat", () => {
     expect(availableRecentHistoryLimit(89, 10)).toBe(10);
     expect(availableRecentHistoryLimit(89, 0)).toBeNull();

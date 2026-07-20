@@ -26,6 +26,7 @@ import {
   cloneSeed,
   cloneSettings,
   compactChatId,
+  createRequestId,
   findActor,
   formatRelativeTime,
   healthLabel,
@@ -286,7 +287,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       showNotice("warning", "Open a chat before exporting its LumiMind database.");
       return;
     }
-    send({ type: "export_database", chatId, requestId: crypto.randomUUID() });
+    send({ type: "export_database", chatId, requestId: createRequestId() });
   }
 
   async function importDatabaseArchive(archive: TimelineDatabaseArchiveV1): Promise<void> {
@@ -507,7 +508,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }
 
   function requestDeveloperReport(): Promise<unknown> {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         developerReportRequests.delete(requestId);
@@ -519,7 +520,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }
 
   function requestActivationPreview(chatId: string): Promise<{ messageCount: number; recentMessageLimit: number }> {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         activationPreviewRequests.delete(requestId);
@@ -531,7 +532,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }
 
   function requestSettingsSave(patch: LumiMindSettings, chatId: string | null): Promise<LumiMindSettings> {
-    const requestId = crypto.randomUUID();
+    const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         settingsSaveRequests.delete(requestId);
