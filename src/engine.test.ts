@@ -29,6 +29,7 @@ import {
   reconcileCortexIdentities,
   removeActor,
   resolveActorId,
+  selectCompletedAssistantTranscript,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
   splitActor,
@@ -285,6 +286,45 @@ describe("actor registry", () => {
 });
 
 describe("timeline reducer", () => {
+  it("holds a trailing user turn until an assistant response is committed", () => {
+    const messages = [
+      message("m1", 0, "First user turn"),
+      message("m2", 1, "First assistant response"),
+      message("m3", 2, "Second user turn"),
+    ];
+
+    expect(selectCompletedAssistantTranscript(messages).map((entry) => entry.id)).toEqual(["m1", "m2"]);
+  });
+
+  it("releases the complete turn once its assistant response exists", () => {
+    const messages = [
+      message("m1", 0, "First user turn"),
+      message("m2", 1, "First assistant response"),
+      message("m3", 2, "Second user turn"),
+      message("m4", 3, "Second assistant response"),
+    ];
+
+    expect(selectCompletedAssistantTranscript(messages).map((entry) => entry.id)).toEqual(["m1", "m2", "m3", "m4"]);
+  });
+
+  it("holds all messages when no assistant response has been committed", () => {
+    const messages: ChatMessageLike[] = [
+      { id: "m2", role: "user", content: "Follow-up", index_in_chat: 1, swipe_id: 0 },
+      { id: "m1", role: "user", content: "Opening", index_in_chat: 0, swipe_id: 0 },
+    ];
+
+    expect(selectCompletedAssistantTranscript(messages)).toEqual([]);
+  });
+
+  it("does not treat an empty staged assistant message as a completed response", () => {
+    const messages: ChatMessageLike[] = [
+      { id: "m1", role: "user", content: "Opening", index_in_chat: 0, swipe_id: 0 },
+      { id: "m2", role: "assistant", content: "", index_in_chat: 1, swipe_id: 0 },
+    ];
+
+    expect(selectCompletedAssistantTranscript(messages)).toEqual([]);
+  });
+
   it("invalidates incompatible content hashes", () => {
     const timeline = createTimeline("chat");
     const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });

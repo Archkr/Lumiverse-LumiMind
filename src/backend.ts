@@ -30,6 +30,7 @@ import {
   removeActor,
   removeManualItem,
   resolveActorId,
+  selectCompletedAssistantTranscript,
   splitActor,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
@@ -519,6 +520,30 @@ function cancelActiveAnalysis(userId: string, chatId: string): void {
   analysisAbortControllers.get(cacheKey(userId, chatId))?.abort();
 }
 
+function queueCompletedCheckpointRefresh(userId: string, chatId: string, expectedGenerationId: string | null): void {
+  const key = cacheKey(userId, chatId);
+  void enqueue(userId, chatId, async () => {
+    const matchesExpectedGeneration = () => expectedGenerationId
+      ? latestGenerationByChat.get(key)?.generationId === expectedGenerationId
+      : !latestGenerationByChat.has(key);
+    if (!matchesExpectedGeneration()) return;
+    const timeline = await getTimeline(chatId, userId);
+    if (!timeline.active || timeline.paused) return;
+    const messages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+    if (!matchesExpectedGeneration()) return;
+    rebuildTimeline(timeline, messages);
+    await persistAndPublish(timeline, userId);
+  }).catch((error) => {
+    spindle.log.warn(`LumiMind could not refresh the completed checkpoint for ${chatId}: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
+function suspendReconciliationForGeneration(context: GenerationContext): void {
+  cancelScheduledReconcile(context.userId, context.chatId);
+  cancelActiveAnalysis(context.userId, context.chatId);
+  queueCompletedCheckpointRefresh(context.userId, context.chatId, context.generationId);
+}
+
 async function persistAndPublish(timeline: ChatTimelineV1, userId: string, announce = true): Promise<void> {
   timeline.revision += 1;
   timeline.updatedAt = Date.now();
@@ -529,6 +554,7 @@ async function persistAndPublish(timeline: ChatTimelineV1, userId: string, annou
 
 async function reconcileChat(userId: string, chatId: string, force = false): Promise<void> {
   const key = cacheKey(userId, chatId);
+  if (latestGenerationByChat.has(key)) return;
   if (force) rebuildRequests.delete(key);
   if (pauseRequests.has(key) || (!force && rebuildRequests.has(key))) return;
   const timeline = await getTimeline(chatId, userId);
@@ -557,7 +583,8 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   // A policy refresh preserves the user's first-activation cutoff. The explicit
   // Rebuild action is the deliberate way to replace it with a full-history replay.
   if (force) timeline.records = [];
-  const messages = await getChatMessages(chatId, userId);
+  const messages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+  if (latestGenerationByChat.has(key)) return;
   let derivation = rebuildTimeline(timeline, messages);
   if (derivation.firstMissingIndex >= derivation.messages.length) {
     timeline.health = "ready";
@@ -601,6 +628,7 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   analysisAbortControllers.set(key, abortController);
   try {
     while (derivation.firstMissingIndex < derivation.messages.length) {
+      if (latestGenerationByChat.has(key)) return;
       const start = derivation.firstMissingIndex;
       const work = selectAnalysisWorkBatch(derivation.messages, start, ANALYSIS_BATCH_SIZE, settings);
       if (commitSkippedWork(work)) {
@@ -665,13 +693,13 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   }
 }
 
-function scheduleReconcile(userId: string, chatId: string, delay = RECONCILE_DEBOUNCE_MS): void {
+function scheduleReconcile(userId: string, chatId: string, delay = RECONCILE_DEBOUNCE_MS, force = false): void {
   const key = cacheKey(userId, chatId);
   const existing = reconcileTimers.get(key);
   if (existing) clearTimeout(existing);
   reconcileTimers.set(key, setTimeout(() => {
     reconcileTimers.delete(key);
-    void enqueue(userId, chatId, () => reconcileChat(userId, chatId));
+    void enqueue(userId, chatId, () => reconcileChat(userId, chatId, force));
   }, delay));
 }
 
@@ -892,6 +920,7 @@ onEvent("GENERATION_STARTED", (payload, eventUserId) => {
   };
   generationContexts.set(generationId, context);
   latestGenerationByChat.set(cacheKey(userId, chatId), context);
+  suspendReconciliationForGeneration(context);
 });
 
 onEvent("GENERATION_ENDED", (payload, eventUserId) => {
@@ -901,12 +930,29 @@ onEvent("GENERATION_ENDED", (payload, eventUserId) => {
   const userId = resolveUserId(chatId, eventUserId ?? remembered?.userId);
   if (generationId) generationContexts.delete(generationId);
   if (!chatId || !userId) return;
-  if (latestGenerationByChat.get(cacheKey(userId, chatId))?.generationId === generationId) {
-    latestGenerationByChat.delete(cacheKey(userId, chatId));
+  const key = cacheKey(userId, chatId);
+  if (latestGenerationByChat.get(key)?.generationId === generationId) {
+    latestGenerationByChat.delete(key);
   }
   const error = readString(payload, ["error"]);
   const messageId = readString(payload, ["messageId", "message_id"]);
-  if (!error && messageId) scheduleReconcile(userId, chatId, 100);
+  if (!error && messageId) scheduleReconcile(userId, chatId, 100, rebuildRequests.has(key));
+  else queueCompletedCheckpointRefresh(userId, chatId, null);
+});
+
+onEvent("GENERATION_STOPPED", (payload, eventUserId) => {
+  const generationId = readString(payload, ["generationId", "generation_id"]);
+  const remembered = generationId ? generationContexts.get(generationId) : null;
+  const chatId = extractChatId(payload) ?? remembered?.chatId ?? null;
+  const userId = resolveUserId(chatId, eventUserId ?? remembered?.userId);
+  if (generationId) generationContexts.delete(generationId);
+  if (!chatId || !userId) return;
+  const key = cacheKey(userId, chatId);
+  if (latestGenerationByChat.get(key)?.generationId === generationId) {
+    latestGenerationByChat.delete(key);
+  }
+  queueCompletedCheckpointRefresh(userId, chatId, null);
+  if (rebuildRequests.has(key)) scheduleReconcile(userId, chatId, 0, true);
 });
 
 // New messages are reconciled only after GENERATION_ENDED so the controller never

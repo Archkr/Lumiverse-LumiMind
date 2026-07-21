@@ -252,6 +252,24 @@ export function sortMessages(messages: ChatMessageLike[]): ChatMessageLike[] {
     .sort((left, right) => (left.index_in_chat ?? 0) - (right.index_in_chat ?? 0));
 }
 
+/**
+ * Returns only transcript messages that belong to completed assistant turns.
+ * A trailing user turn is intentionally held until its assistant response has
+ * been committed, and an empty staged assistant message does not advance the
+ * boundary, regardless of which host event requested reconciliation.
+ */
+export function selectCompletedAssistantTranscript(messages: ChatMessageLike[]): ChatMessageLike[] {
+  const sorted = sortMessages(messages);
+  let lastAssistantIndex = -1;
+  for (let index = sorted.length - 1; index >= 0; index -= 1) {
+    if (sorted[index].role === "assistant" && sorted[index].content.trim().length > 0) {
+      lastAssistantIndex = index;
+      break;
+    }
+  }
+  return lastAssistantIndex < 0 ? [] : sorted.slice(0, lastAssistantIndex + 1);
+}
+
 export function selectAnalysisWorkBatch(
   messages: ChatMessageLike[],
   start: number,
