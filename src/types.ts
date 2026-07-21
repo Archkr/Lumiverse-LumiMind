@@ -365,6 +365,7 @@ export type FrontendToBackend =
   | { type: "remove_item"; chatId: string; actorId: string; itemId: string }
   | { type: "toggle_item"; chatId: string; actorId: string; itemId: string; field: "locked" | "pinned" }
   | { type: "generate_seed"; characterId: string }
+  | { type: "generate_npc_core"; chatId: string; actorId: string; lore: string; requestId: string }
   | { type: "writeback_actor"; chatId: string; actorId: string };
 
 export type BackendToFrontend =
@@ -377,6 +378,8 @@ export type BackendToFrontend =
   | { type: "settings_saved"; requestId: string; settings: LumiMindSettings }
   | { type: "settings_save_error"; requestId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }
+  | { type: "npc_core_draft"; requestId: string; chatId: string; actorId: string; core: MindCore }
+  | { type: "npc_core_draft_error"; requestId: string; chatId: string; actorId: string; message: string }
   | { type: "notice"; tone: "info" | "success" | "warning" | "error"; message: string }
   | { type: "error"; message: string };
 

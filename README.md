@@ -221,6 +221,7 @@ Mind Lens is LumiMind’s main drawer interface.
 
 - Browse every managed card, persona, and discovered NPC.
 - Review core self-concept, values, desires, fears, and boundaries.
+- For timeline NPCs, generate an editable enduring-frame draft from lore you provide. The controller draft opens in the existing Core editor and is never saved automatically.
 - Inspect beliefs, secrets, goals, plans, emotions, relationships, and awareness.
 - See confidence, evidence, source message, and swipe provenance.
 - Add or edit state manually; user-authored entries are locked and pinned by default.

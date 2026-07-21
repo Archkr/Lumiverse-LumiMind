@@ -202,6 +202,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
   }>();
+  const npcCoreDraftRequests = new Map<string, {
+    resolve: (core: MindCore) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
+  const npcCoreGenerating = new Set<string>();
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise: Promise<LumiMindSettings> | null = null;
@@ -540,6 +546,18 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       }, 15_000);
       settingsSaveRequests.set(requestId, { resolve, reject, timeout });
       send({ type: "save_settings", requestId, patch, chatId });
+    });
+  }
+
+  function requestNpcCoreDraft(chatId: string, actorId: string, lore: string): Promise<MindCore> {
+    const requestId = createRequestId();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        npcCoreDraftRequests.delete(requestId);
+        reject(new Error("The NPC core draft request timed out."));
+      }, 120_000);
+      npcCoreDraftRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "generate_npc_core", chatId, actorId, lore, requestId });
     });
   }
 
@@ -987,6 +1005,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     label: string;
     value?: string;
     placeholder?: string;
+    hint?: string;
     multiline?: boolean;
     confirmLabel?: string;
   }): Promise<string | null> {
@@ -996,7 +1015,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const control = options.multiline
         ? textarea(options.value ?? "", 7, options.placeholder)
         : input(options.value ?? "", options.placeholder);
-      form.appendChild(field(options.label, control));
+      form.appendChild(field(options.label, control, options.hint));
       const actions = element("div", "lm-modal-actions");
       const cancel = textButton("Cancel", () => modal.dismiss(), "secondary");
       const confirm = element("button", "lm-button lm-button-primary", options.confirmLabel ?? "Save");
@@ -1026,15 +1045,17 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     });
   }
 
-  async function editCore(actor: ActorRecord, mind: ActorMind): Promise<void> {
-    const modal = ctx.ui.showModal({ title: `${actor.canonicalName} — Core`, width: 620, maxHeight: 760 });
+  async function editCore(actor: ActorRecord, mind: ActorMind, draft?: MindCore): Promise<void> {
+    const initial = draft ?? mind.core;
+    const modal = ctx.ui.showModal({ title: draft ? `${actor.canonicalName} — Review core draft` : `${actor.canonicalName} — Core`, width: 620, maxHeight: 760 });
     const form = element("form", "lm-modal-form lm-core-form");
-    const selfConcept = textarea(mind.core.selfConcept, 5, "How this person understands themself…");
-    const values = textarea(mind.core.values.join("\n"), 4, "One value per line");
-    const desires = textarea(mind.core.desires.join("\n"), 4, "One desire per line");
-    const fears = textarea(mind.core.fears.join("\n"), 4, "One fear per line");
-    const boundaries = textarea(mind.core.boundaries.join("\n"), 4, "One boundary per line");
-    const notes = textarea(mind.core.notes.join("\n"), 4, "One enduring note per line");
+    if (draft) form.appendChild(element("div", "lm-seed-hint", "Generated from the lore you provided. Review every field; nothing changes until you save this core."));
+    const selfConcept = textarea(initial.selfConcept, 5, "How this person understands themself…");
+    const values = textarea(initial.values.join("\n"), 4, "One value per line");
+    const desires = textarea(initial.desires.join("\n"), 4, "One desire per line");
+    const fears = textarea(initial.fears.join("\n"), 4, "One fear per line");
+    const boundaries = textarea(initial.boundaries.join("\n"), 4, "One boundary per line");
+    const notes = textarea(initial.notes.join("\n"), 4, "One enduring note per line");
     form.append(
       field("Self-concept", selfConcept),
       field("Values", values),
@@ -1044,7 +1065,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       field("Notes", notes),
     );
     const actions = element("div", "lm-modal-actions");
-    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", "Save core"));
+    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core"));
     (actions.lastElementChild as HTMLButtonElement).type = "submit";
     form.appendChild(actions);
     form.addEventListener("submit", (event) => {
@@ -1062,6 +1083,42 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       modal.dismiss();
     });
     modal.root.appendChild(form);
+  }
+
+  async function generateNpcCore(actor: ActorRecord): Promise<void> {
+    if (actor.kind !== "npc" || npcCoreGenerating.has(actor.id)) return;
+    const lore = await promptText({
+      title: `${actor.canonicalName} — Generate core draft`,
+      label: "NPC lore",
+      placeholder: "Describe their background, personality, motivations, fears, values, and boundaries…",
+      hint: "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
+      multiline: true,
+      confirmLabel: "Generate draft",
+    });
+    const sourceTimeline = currentState?.timeline;
+    if (!lore || !sourceTimeline) return;
+
+    npcCoreGenerating.add(actor.id);
+    showNotice("info", `Generating an enduring-frame draft for ${actor.canonicalName}…`, 120_000);
+    try {
+      const core = await requestNpcCoreDraft(sourceTimeline.chatId, actor.id, lore);
+      const timeline = currentState?.timeline;
+      const currentActor = timeline?.chatId === sourceTimeline.chatId
+        ? timeline.actors.find((candidate) => candidate.id === actor.id)
+        : null;
+      const currentMind = currentActor && timeline ? timeline.minds[currentActor.id] : null;
+      if (!currentActor || !currentMind) {
+        showNotice("warning", "The NPC draft finished after the active timeline changed. No core was modified.");
+        return;
+      }
+      showNotice("success", "NPC core draft ready for review. Nothing has been saved yet.");
+      await editCore(currentActor, currentMind, core);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "LumiMind could not generate the NPC core draft.");
+    } finally {
+      npcCoreGenerating.delete(actor.id);
+      render();
+    }
   }
 
   async function editMindItem(actor: ActorRecord, item: MindItem): Promise<void> {
@@ -1133,7 +1190,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const heading = element("div", "lm-card-heading");
     const title = element("div");
     title.append(element("div", "lm-kicker", "Enduring frame"), element("h3", "lm-card-title", "Core self"));
-    heading.append(title, iconButton("edit", "Edit core self", () => void editCore(actor, mind)));
+    const actions = element("div", "lm-inline-actions");
+    if (actor.kind === "npc") {
+      const generate = iconButton("spark", npcCoreGenerating.has(actor.id) ? "Generating core draft" : "Generate core draft from NPC lore", () => void generateNpcCore(actor));
+      generate.disabled = npcCoreGenerating.has(actor.id) || !currentState?.permissions.generation;
+      actions.appendChild(generate);
+    }
+    actions.appendChild(iconButton("edit", "Edit core self", () => void editCore(actor, mind)));
+    heading.append(title, actions);
     card.appendChild(heading);
     if (mind.core.selfConcept) card.appendChild(element("p", "lm-self-concept", mind.core.selfConcept));
     else card.appendChild(element("p", "lm-empty-inline", "No reviewed self-concept yet."));
@@ -1983,6 +2047,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       settingsSaveRequests.delete(message.requestId);
       if (message.type === "settings_saved") pending.resolve(message.settings);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "npc_core_draft" || message.type === "npc_core_draft_error") {
+      const pending = npcCoreDraftRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      npcCoreDraftRequests.delete(message.requestId);
+      if (message.type === "npc_core_draft") pending.resolve(message.core);
+      else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -2036,6 +2107,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       pending.reject(new Error("LumiMind closed before settings were saved."));
     }
     settingsSaveRequests.clear();
+    for (const pending of npcCoreDraftRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the NPC core draft completed."));
+    }
+    npcCoreDraftRequests.clear();
+    npcCoreGenerating.clear();
     destroySeedTab();
     while (cleanups.length) {
       try { cleanups.pop()?.(); } catch { /* Best-effort teardown. */ }

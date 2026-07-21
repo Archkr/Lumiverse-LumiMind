@@ -1,7 +1,7 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
 import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
-import { analyzeMessages, generateSeedDraft, isAbortError } from "./controller";
+import { analyzeMessages, generateNpcCoreDraft, generateSeedDraft, isAbortError } from "./controller";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
@@ -1092,6 +1092,20 @@ spindle.onFrontendMessage(async (payload, userId) => {
       send({ type: "seed_draft", characterId: message.characterId, seed }, userId);
       return;
     }
+    if (message.type === "generate_npc_core") {
+      if (!hasPermission("generation")) throw new Error("Generation permission is required to draft an NPC core.");
+      const timeline = await getTimeline(message.chatId, userId);
+      const actor = timeline.actors[message.actorId];
+      if (!timeline.active || !actor || actor.kind !== "npc") throw new Error("An active timeline NPC is required to generate a core draft.");
+      const core = await generateNpcCoreDraft({
+        actorName: actor.canonicalName,
+        lore: message.lore,
+        settings: await getSettings(userId),
+        userId,
+      });
+      send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, actorId: actor.id, core }, userId);
+      return;
+    }
     if (!chatId) throw new Error("This LumiMind action requires an active chat.");
     await mutateTimeline(userId, chatId, async (timeline) => {
       if (message.type === "rename_actor") {
@@ -1165,6 +1179,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
     }
     if (message.type === "save_settings") {
       send({ type: "settings_save_error", requestId: message.requestId, message: detail }, userId);
+      return;
+    }
+    if (message.type === "generate_npc_core") {
+      send({
+        type: "npc_core_draft_error",
+        requestId: message.requestId,
+        chatId: message.chatId,
+        actorId: message.actorId,
+        message: detail,
+      }, userId);
       return;
     }
     send({ type: "error", message: detail }, userId);

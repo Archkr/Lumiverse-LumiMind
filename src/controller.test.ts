@@ -3,6 +3,7 @@ import {
   analyzeMessages,
   applyControllerMindPolicy,
   buildAnalysisPrompt,
+  generateNpcCoreDraft,
   isNontrivialAnalysisBatch,
   makeControllerResponseTelemetry,
   mergeControllerAnalyses,
@@ -538,5 +539,56 @@ describe("controller response parsing", () => {
     expect(quiet).toHaveBeenCalledTimes(2);
     expect(quiet.mock.calls[0][0]).toMatchObject({ signal: abortController.signal });
     expect(quiet.mock.calls[1][0]).toMatchObject({ signal: abortController.signal });
+  });
+});
+
+describe("NPC core drafting", () => {
+  it("drafts an enduring frame from supplied NPC lore through structured output", async () => {
+    const quiet = vi.fn().mockResolvedValue({
+      content: "",
+      tool_calls: [{
+        name: "lumi_mind_npc_core_v1",
+        call_id: "call-npc-core",
+        args: {
+          selfConcept: "I am the last keeper of the eastern gate.",
+          values: ["Duty", "Measured mercy"],
+          desires: ["Keep the city safe"],
+          fears: ["Failing those under her protection"],
+          boundaries: ["Will not abandon civilians"],
+          notes: ["Reserved and observant"],
+        },
+      }],
+    });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet } };
+
+    const core = await generateNpcCoreDraft({
+      actorName: "Mira Vale",
+      lore: "Mira is a reserved gate captain who survived the old siege and protects civilians above all else.",
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    });
+
+    expect(core).toMatchObject({
+      selfConcept: "I am the last keeper of the eastern gate.",
+      values: ["Duty", "Measured mercy"],
+      boundaries: ["Will not abandon civilians"],
+    });
+    const request = quiet.mock.calls[0][0] as {
+      messages: Array<{ role: string; content: string }>;
+      tools: Array<{ name: string; parameters: { required: string[] } }>;
+    };
+    expect(request.messages[1].content).toContain("Mira Vale");
+    expect(request.messages[1].content).toContain("reserved gate captain");
+    expect(request.tools[0]).toMatchObject({ name: "lumi_mind_npc_core_v1" });
+    expect(request.tools[0].parameters.required).toEqual(["selfConcept", "values", "desires", "fears", "boundaries", "notes"]);
+  });
+
+  it("rejects blank lore before calling the controller", async () => {
+    await expect(generateNpcCoreDraft({
+      actorName: "Mira Vale",
+      lore: "   ",
+      settings: DEFAULT_SETTINGS,
+      userId: "user",
+    })).rejects.toThrow("NPC lore is required");
   });
 });

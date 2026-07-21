@@ -4,6 +4,7 @@ import {
   canonicalMindText,
   makeEmptySeed,
   mindTextsNearDuplicate,
+  normalizeCore,
   normalizeSeed,
   projectControllerState,
   stableHash,
@@ -23,6 +24,7 @@ import type {
   InvalidMindChangeReasonCounts,
   LumiMindSettings,
   MindCategory,
+  MindCore,
   MindOperation,
   MindSeedV1,
 } from "./types";
@@ -507,24 +509,26 @@ const ANALYSIS_SCHEMA: Record<string, unknown> = {
   required: ["actorMentions", "changes"],
 };
 
+const CORE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    selfConcept: { type: "string" },
+    values: { type: "array", items: { type: "string" } },
+    desires: { type: "array", items: { type: "string" } },
+    fears: { type: "array", items: { type: "string" } },
+    boundaries: { type: "array", items: { type: "string" } },
+    notes: { type: "array", items: { type: "string" } },
+  },
+  required: ["selfConcept", "values", "desires", "fears", "boundaries", "notes"],
+};
+
 const SEED_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
   properties: {
     schemaVersion: { type: "number", enum: [1] },
-    core: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        selfConcept: { type: "string" },
-        values: { type: "array", items: { type: "string" } },
-        desires: { type: "array", items: { type: "string" } },
-        fears: { type: "array", items: { type: "string" } },
-        boundaries: { type: "array", items: { type: "string" } },
-        notes: { type: "array", items: { type: "string" } },
-      },
-      required: ["selfConcept", "values", "desires", "fears", "boundaries", "notes"],
-    },
+    core: CORE_SCHEMA,
     startingBeliefs: { type: "array", items: { type: "string" } },
     startingSecrets: { type: "array", items: { type: "string" } },
     startingGoals: { type: "array", items: { type: "string" } },
@@ -908,4 +912,34 @@ export async function generateSeedDraft(input: {
   const normalized = normalizeSeed(result.parsed);
   if (!normalized) throw new Error("The LumiMind controller returned an invalid mind seed.");
   return { ...makeEmptySeed(), ...normalized, schemaVersion: 1, updatedAt: Date.now() };
+}
+
+const NPC_CORE_SYSTEM_PROMPT = [
+  "You draft editable LumiMind enduring frames for timeline NPCs from user-provided lore.",
+  "Call the required LumiMind result tool exactly once. Use only characterization supported by the lore; do not invent events, relationships, secrets, or temporary scene state.",
+  "Write a concise private subjective frame covering stable self-concept, values, desires, fears, boundaries, and other enduring notes.",
+].join("\n");
+
+export async function generateNpcCoreDraft(input: {
+  actorName: string;
+  lore: string;
+  settings: LumiMindSettings;
+  userId: string;
+}): Promise<MindCore> {
+  const lore = input.lore.trim();
+  if (!lore) throw new Error("NPC lore is required to generate a core draft.");
+  const boundedLore = lore.slice(0, 75_000);
+  const prompt = [
+    `Draft an enduring frame for the timeline NPC named ${JSON.stringify(input.actorName.trim() || "Unnamed NPC")}.`,
+    `<npc_lore>\n${boundedLore}\n</npc_lore>`,
+    "Return only characterization supported by this lore.",
+  ].join("\n\n");
+  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId);
+  const raw = asObject(result.parsed);
+  if (!Object.keys(raw).length) throw new Error("The LumiMind controller returned an invalid NPC core draft.");
+  const core = normalizeCore(raw);
+  if (!core.selfConcept && !core.values.length && !core.desires.length && !core.fears.length && !core.boundaries.length && !core.notes.length) {
+    throw new Error("The LumiMind controller returned an empty NPC core draft.");
+  }
+  return core;
 }

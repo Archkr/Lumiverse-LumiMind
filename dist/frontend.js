@@ -730,6 +730,8 @@ function setup(ctx) {
   const developerReportRequests = /* @__PURE__ */ new Map();
   const activationPreviewRequests = /* @__PURE__ */ new Map();
   const settingsSaveRequests = /* @__PURE__ */ new Map();
+  const npcCoreDraftRequests = /* @__PURE__ */ new Map();
+  const npcCoreGenerating = /* @__PURE__ */ new Set();
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise = null;
@@ -1054,6 +1056,17 @@ function setup(ctx) {
       }, 15e3);
       settingsSaveRequests.set(requestId, { resolve, reject, timeout });
       send({ type: "save_settings", requestId, patch, chatId });
+    });
+  }
+  function requestNpcCoreDraft(chatId, actorId, lore) {
+    const requestId = createRequestId();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        npcCoreDraftRequests.delete(requestId);
+        reject(new Error("The NPC core draft request timed out."));
+      }, 12e4);
+      npcCoreDraftRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "generate_npc_core", chatId, actorId, lore, requestId });
     });
   }
   function persistSettingsDraft() {
@@ -1460,7 +1473,7 @@ function setup(ctx) {
       const modal = ctx.ui.showModal({ title: options.title, width: 480, maxHeight: 620 });
       const form = element("form", "lm-modal-form");
       const control = options.multiline ? textarea(options.value ?? "", 7, options.placeholder) : input(options.value ?? "", options.placeholder);
-      form.appendChild(field(options.label, control));
+      form.appendChild(field(options.label, control, options.hint));
       const actions = element("div", "lm-modal-actions");
       const cancel = textButton("Cancel", () => modal.dismiss(), "secondary");
       const confirm = element("button", "lm-button lm-button-primary", options.confirmLabel ?? "Save");
@@ -1489,15 +1502,17 @@ function setup(ctx) {
       setTimeout(() => control.focus(), 0);
     });
   }
-  async function editCore(actor, mind) {
-    const modal = ctx.ui.showModal({ title: `${actor.canonicalName} \u2014 Core`, width: 620, maxHeight: 760 });
+  async function editCore(actor, mind, draft) {
+    const initial = draft ?? mind.core;
+    const modal = ctx.ui.showModal({ title: draft ? `${actor.canonicalName} \u2014 Review core draft` : `${actor.canonicalName} \u2014 Core`, width: 620, maxHeight: 760 });
     const form = element("form", "lm-modal-form lm-core-form");
-    const selfConcept = textarea(mind.core.selfConcept, 5, "How this person understands themself\u2026");
-    const values = textarea(mind.core.values.join("\n"), 4, "One value per line");
-    const desires = textarea(mind.core.desires.join("\n"), 4, "One desire per line");
-    const fears = textarea(mind.core.fears.join("\n"), 4, "One fear per line");
-    const boundaries = textarea(mind.core.boundaries.join("\n"), 4, "One boundary per line");
-    const notes = textarea(mind.core.notes.join("\n"), 4, "One enduring note per line");
+    if (draft) form.appendChild(element("div", "lm-seed-hint", "Generated from the lore you provided. Review every field; nothing changes until you save this core."));
+    const selfConcept = textarea(initial.selfConcept, 5, "How this person understands themself\u2026");
+    const values = textarea(initial.values.join("\n"), 4, "One value per line");
+    const desires = textarea(initial.desires.join("\n"), 4, "One desire per line");
+    const fears = textarea(initial.fears.join("\n"), 4, "One fear per line");
+    const boundaries = textarea(initial.boundaries.join("\n"), 4, "One boundary per line");
+    const notes = textarea(initial.notes.join("\n"), 4, "One enduring note per line");
     form.append(
       field("Self-concept", selfConcept),
       field("Values", values),
@@ -1507,7 +1522,7 @@ function setup(ctx) {
       field("Notes", notes)
     );
     const actions = element("div", "lm-modal-actions");
-    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", "Save core"));
+    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core"));
     actions.lastElementChild.type = "submit";
     form.appendChild(actions);
     form.addEventListener("submit", (event) => {
@@ -1525,6 +1540,38 @@ function setup(ctx) {
       modal.dismiss();
     });
     modal.root.appendChild(form);
+  }
+  async function generateNpcCore(actor) {
+    if (actor.kind !== "npc" || npcCoreGenerating.has(actor.id)) return;
+    const lore = await promptText({
+      title: `${actor.canonicalName} \u2014 Generate core draft`,
+      label: "NPC lore",
+      placeholder: "Describe their background, personality, motivations, fears, values, and boundaries\u2026",
+      hint: "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
+      multiline: true,
+      confirmLabel: "Generate draft"
+    });
+    const sourceTimeline = currentState?.timeline;
+    if (!lore || !sourceTimeline) return;
+    npcCoreGenerating.add(actor.id);
+    showNotice("info", `Generating an enduring-frame draft for ${actor.canonicalName}\u2026`, 12e4);
+    try {
+      const core = await requestNpcCoreDraft(sourceTimeline.chatId, actor.id, lore);
+      const timeline = currentState?.timeline;
+      const currentActor = timeline?.chatId === sourceTimeline.chatId ? timeline.actors.find((candidate) => candidate.id === actor.id) : null;
+      const currentMind = currentActor && timeline ? timeline.minds[currentActor.id] : null;
+      if (!currentActor || !currentMind) {
+        showNotice("warning", "The NPC draft finished after the active timeline changed. No core was modified.");
+        return;
+      }
+      showNotice("success", "NPC core draft ready for review. Nothing has been saved yet.");
+      await editCore(currentActor, currentMind, core);
+    } catch (error) {
+      showNotice("error", error instanceof Error ? error.message : "LumiMind could not generate the NPC core draft.");
+    } finally {
+      npcCoreGenerating.delete(actor.id);
+      render();
+    }
   }
   async function editMindItem(actor, item) {
     const modal = ctx.ui.showModal({ title: `Edit ${categoryLabel(item.category).slice(0, -1)}`, width: 520, maxHeight: 620 });
@@ -1593,7 +1640,14 @@ function setup(ctx) {
     const heading = element("div", "lm-card-heading");
     const title = element("div");
     title.append(element("div", "lm-kicker", "Enduring frame"), element("h3", "lm-card-title", "Core self"));
-    heading.append(title, iconButton("edit", "Edit core self", () => void editCore(actor, mind)));
+    const actions = element("div", "lm-inline-actions");
+    if (actor.kind === "npc") {
+      const generate = iconButton("spark", npcCoreGenerating.has(actor.id) ? "Generating core draft" : "Generate core draft from NPC lore", () => void generateNpcCore(actor));
+      generate.disabled = npcCoreGenerating.has(actor.id) || !currentState?.permissions.generation;
+      actions.appendChild(generate);
+    }
+    actions.appendChild(iconButton("edit", "Edit core self", () => void editCore(actor, mind)));
+    heading.append(title, actions);
     card.appendChild(heading);
     if (mind.core.selfConcept) card.appendChild(element("p", "lm-self-concept", mind.core.selfConcept));
     else card.appendChild(element("p", "lm-empty-inline", "No reviewed self-concept yet."));
@@ -2412,6 +2466,13 @@ function setup(ctx) {
       settingsSaveRequests.delete(message.requestId);
       if (message.type === "settings_saved") pending.resolve(message.settings);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "npc_core_draft" || message.type === "npc_core_draft_error") {
+      const pending = npcCoreDraftRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      npcCoreDraftRequests.delete(message.requestId);
+      if (message.type === "npc_core_draft") pending.resolve(message.core);
+      else pending.reject(new Error(message.message));
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -2462,6 +2523,12 @@ function setup(ctx) {
       pending.reject(new Error("LumiMind closed before settings were saved."));
     }
     settingsSaveRequests.clear();
+    for (const pending of npcCoreDraftRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the NPC core draft completed."));
+    }
+    npcCoreDraftRequests.clear();
+    npcCoreGenerating.clear();
     destroySeedTab();
     while (cleanups.length) {
       try {
