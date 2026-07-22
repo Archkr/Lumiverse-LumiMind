@@ -640,7 +640,6 @@ async function quietJson(
     ],
     parameters: {
       temperature: settings.controllerTemperature,
-      max_tokens: settings.controllerMaxTokens,
       ...toolChoiceParameters(connection.provider),
     },
     tools: [{

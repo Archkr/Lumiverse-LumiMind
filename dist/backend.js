@@ -7,7 +7,6 @@ var EXTENSION_KEY = "lumi_mind";
 var DEFAULT_SETTINGS = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
-  controllerMaxTokens: 1800,
   analysisStateTokenBudget: 24e3,
   injectionTokenBudget: 8e3,
   injectionPosition: "prompt_start",
@@ -67,7 +66,6 @@ function clamp(value, min, max, fallback) {
 function normalizeSettings(value) {
   const raw = asObject(value);
   const characterCardDirectorMode = raw.characterCardDirectorMode === true;
-  const controllerMaxTokens = typeof raw.controllerMaxTokens === "number" ? raw.controllerMaxTokens : Number(raw.controllerMaxTokens);
   const analysisStateTokenBudget = typeof raw.analysisStateTokenBudget === "number" ? raw.analysisStateTokenBudget : Number(raw.analysisStateTokenBudget);
   const injectionTokenBudget = typeof raw.injectionTokenBudget === "number" ? raw.injectionTokenBudget : Number(raw.injectionTokenBudget);
   const analysisContextMessageLimit = typeof raw.analysisContextMessageLimit === "number" ? raw.analysisContextMessageLimit : Number(raw.analysisContextMessageLimit);
@@ -75,7 +73,6 @@ function normalizeSettings(value) {
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
-    controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens) ? Math.max(300, controllerMaxTokens) : DEFAULT_SETTINGS.controllerMaxTokens),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget) ? Math.max(0, analysisStateTokenBudget) : DEFAULT_SETTINGS.analysisStateTokenBudget),
     injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget) ? Math.max(0, injectionTokenBudget) : DEFAULT_SETTINGS.injectionTokenBudget),
     injectionPosition: raw.injectionPosition === "before_last_user" || raw.injectionPosition === "prompt_end" ? raw.injectionPosition : DEFAULT_SETTINGS.injectionPosition,
@@ -1839,7 +1836,6 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
     ],
     parameters: {
       temperature: settings.controllerTemperature,
-      max_tokens: settings.controllerMaxTokens,
       ...toolChoiceParameters(connection.provider)
     },
     tools: [{

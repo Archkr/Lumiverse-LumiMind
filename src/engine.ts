@@ -29,7 +29,6 @@ import {
 export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerConnectionId: null,
   controllerTemperature: 0.1,
-  controllerMaxTokens: 1800,
   analysisStateTokenBudget: 24_000,
   injectionTokenBudget: 8_000,
   injectionPosition: "prompt_start",
@@ -97,9 +96,6 @@ export function clamp(value: unknown, min: number, max: number, fallback: number
 export function normalizeSettings(value: unknown): LumiMindSettings {
   const raw = asObject(value);
   const characterCardDirectorMode = raw.characterCardDirectorMode === true;
-  const controllerMaxTokens = typeof raw.controllerMaxTokens === "number"
-    ? raw.controllerMaxTokens
-    : Number(raw.controllerMaxTokens);
   const analysisStateTokenBudget = typeof raw.analysisStateTokenBudget === "number"
     ? raw.analysisStateTokenBudget
     : Number(raw.analysisStateTokenBudget);
@@ -115,9 +111,6 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
-    controllerMaxTokens: Math.round(Number.isFinite(controllerMaxTokens)
-      ? Math.max(300, controllerMaxTokens)
-      : DEFAULT_SETTINGS.controllerMaxTokens),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget)
       ? Math.max(0, analysisStateTokenBudget)
       : DEFAULT_SETTINGS.analysisStateTokenBudget),

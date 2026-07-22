@@ -234,6 +234,7 @@ describe("controller response parsing", () => {
       tools: Array<{ name: string; parameters: Record<string, unknown> }>;
     };
     expect(request.parameters).toMatchObject(expectedChoice);
+    expect(request.parameters).not.toHaveProperty("max_tokens");
     expect(request.reasoning).toEqual({ source: "off" });
     expect(request.tools).toHaveLength(1);
     expect(request.tools[0]).toMatchObject({ name: "lumi_mind_analysis_v1" });

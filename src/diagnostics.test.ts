@@ -9,7 +9,7 @@ describe("developer diagnostic credential redaction", () => {
       authorization: "Bearer key-3",
       nested: { access_token: "key-4", clientSecret: "key-5", password: "key-6" },
       has_api_key: true,
-      maxOutputTokens: 8000,
+      stateTokenBudget: 8000,
       startingSecrets: ["The door is unlocked"],
     })).toEqual({
       api_key: "[REDACTED]",
@@ -17,7 +17,7 @@ describe("developer diagnostic credential redaction", () => {
       authorization: "[REDACTED]",
       nested: { access_token: "[REDACTED]", clientSecret: "[REDACTED]", password: "[REDACTED]" },
       has_api_key: true,
-      maxOutputTokens: 8000,
+      stateTokenBudget: 8000,
       startingSecrets: ["The door is unlocked"],
     });
   });

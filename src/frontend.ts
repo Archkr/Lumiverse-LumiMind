@@ -426,7 +426,6 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           credentialConfigured: connection.hasApiKey,
         })),
         temperature: state.settings.controllerTemperature,
-        maxOutputTokens: state.settings.controllerMaxTokens,
         stateTokenBudget: state.settings.analysisStateTokenBudget,
         contextMessageLimit: state.settings.analysisContextMessageLimit,
       } : null,
@@ -1610,11 +1609,11 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       settingsDraft.controllerConnectionId = connection.value || null;
       markSettingsDirty(save);
     });
-    controller.appendChild(field("Connection", connection, "Falls back to the chat's active connection when no dedicated controller is selected."));
+    controller.appendChild(field("Connection", connection, "Uses the active connection if unset."));
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
-      key: "controllerTemperature" | "controllerMaxTokens" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
+      key: "controllerTemperature" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
       max: number | null,
       step: number,
@@ -1641,20 +1640,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
       numberSetting(
-        "Analysis output tokens",
-        "controllerMaxTokens",
-        300,
-        null,
-        100,
-        "Maximum output requested for each analysis call. LumiMind does not impose an upper limit; the selected model or provider may still enforce one.",
-      ),
-      numberSetting(
         "Analysis state tokens",
         "analysisStateTokenBudget",
         0,
         null,
         500,
-        "Target token budget for unresolved mind state sent to the controller. Actor identities remain available. Set to 0 for unlimited.",
+        "State sent for analysis. 0 = unlimited.",
       ),
       numberSetting(
         "Private injection tokens",
@@ -1662,7 +1653,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         0,
         null,
         500,
-        "Target token budget for LumiMind state added to the roleplay prompt. Stored state is never deleted. Set to 0 for unlimited.",
+        "State added to prompts. 0 = unlimited.",
       ),
       numberSetting(
         "Analysis context messages",
@@ -1670,7 +1661,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         0,
         null,
         1,
-        "Maximum earlier transcript messages included as context for each analysis batch. Set to 0 for none.",
+        "Earlier messages for analysis. 0 = none.",
       ),
       numberSetting(
         "Chat history messages",
@@ -1678,7 +1669,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         0,
         null,
         1,
-        "Maximum stored chat messages retained in the main generation prompt and the optional recent range offered on first activation. Set to 0 for unlimited.",
+        "Messages kept in prompts. 0 = unlimited.",
       ),
     );
     controller.appendChild(numberGrid);

@@ -554,10 +554,9 @@ describe("hashing, settings, and compaction", () => {
     expect(nextPrefixHash("a", "b", 0)).not.toBe(nextPrefixHash("a", "b", 1));
   });
 
-  it("normalizes limits without imposing former message or token ceilings", () => {
+  it("normalizes configurable limits without imposing maximum values", () => {
     const settings = normalizeSettings({
       controllerTemperature: 9,
-      controllerMaxTokens: 20,
       analysisStateTokenBudget: 240_000,
       injectionTokenBudget: 80_000,
       analysisContextMessageLimit: 99,
@@ -565,7 +564,6 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(settings).toMatchObject({
       controllerTemperature: 2,
-      controllerMaxTokens: 300,
       analysisStateTokenBudget: 240_000,
       injectionTokenBudget: 80_000,
       analysisContextMessageLimit: 99,
@@ -587,7 +585,6 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
-    expect(normalizeSettings({ controllerMaxTokens: 128000 }).controllerMaxTokens).toBe(128000);
     expect(normalizeSettings({ injectionPosition: "before_last_user" }).injectionPosition).toBe("before_last_user");
     expect(normalizeSettings({ injectionPosition: "unsupported" }).injectionPosition).toBe("prompt_start");
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("ledger-policy:1|persona:1|director:0"));

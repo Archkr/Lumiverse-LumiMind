@@ -350,13 +350,12 @@ LumiMind settings are user-scoped and apply across chats.
 |---|---:|---|
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
-| Analysis output tokens | `1,800` | Maximum output requested per analysis call, with no LumiMind-imposed upper bound. The selected model or provider may enforce its own limit. |
 | Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |
 | Private injection tokens | `8,000` | Target token budget for state added to a roleplay prompt. All stored state remains in the timeline and Mind Lens; `0` injects all eligible state. |
 | Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
 | Chat history messages | Unlimited | Maximum number of stored chat messages retained in the main generation prompt and the optional recent range offered on first activation; `0` keeps the full history. |
 
-LumiMind does not impose maximum values on the output-token, state-token, injection-token, analysis-context, or chat-history fields. Model and provider context windows still apply to the final requests they receive.
+LumiMind does not cap controller output. Model and provider limits still apply. The state-token, injection-token, analysis-context, and chat-history settings have no maximum value.
 
 ### Privacy and interoperability
 
