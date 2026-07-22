@@ -2040,7 +2040,7 @@ function setup(ctx) {
       settingsDraft.controllerConnectionId = connection.value || null;
       markSettingsDirty(save);
     });
-    controller.appendChild(field("Connection", connection, "Uses the active connection if unset."));
+    controller.appendChild(field("Connection", connection, "Used for background analysis. Defaults to the active chat connection."));
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (label, key, min, max, step, description) => {
       const control = element("input", "lm-input");
@@ -2067,7 +2067,7 @@ function setup(ctx) {
         0,
         null,
         500,
-        "State sent for analysis. 0 = unlimited."
+        "Limits unresolved mind state in each analysis request. 0 includes all state."
       ),
       numberSetting(
         "Private injection tokens",
@@ -2075,7 +2075,7 @@ function setup(ctx) {
         0,
         null,
         500,
-        "State added to prompts. 0 = unlimited."
+        "Limits private mind state added to roleplay prompts. 0 includes all state."
       ),
       numberSetting(
         "Analysis context messages",
@@ -2083,7 +2083,7 @@ function setup(ctx) {
         0,
         null,
         1,
-        "Earlier messages for analysis. 0 = none."
+        "Earlier transcript messages included with each analysis batch. 0 disables context."
       ),
       numberSetting(
         "Chat history messages",
@@ -2091,7 +2091,7 @@ function setup(ctx) {
         0,
         null,
         1,
-        "Messages kept in prompts. 0 = unlimited."
+        "Chat messages retained in roleplay prompts. 0 keeps the full history."
       )
     );
     controller.appendChild(numberGrid);
