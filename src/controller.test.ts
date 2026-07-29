@@ -53,6 +53,27 @@ describe("controller response parsing", () => {
     ]);
   });
 
+  it("normalizes harmless category and operation formatting without coercing ambiguous semantics", () => {
+    const result = normalizeControllerAnalysis({
+      actorMentions: [],
+      changes: [
+        { subjectRef: "mira", category: " Emotion ", operation: " ADD ", text: "Wary", messageId: "m1" },
+        { subjectRef: "mira", category: "GOALS", operation: "add", text: "Escape", messageId: "m1" },
+        { subjectRef: "mira", category: "Relationships", operation: "add", text: "Distrusts Rowan", messageId: "m1" },
+        { subjectRef: "mira", category: "motive", operation: "add", text: "Find the truth", messageId: "m1" },
+        { subjectRef: "mira", category: "fear", operation: "add", text: "Being followed", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "create", text: "The door is locked", messageId: "m1" },
+        { subjectRef: "mira", category: "belief", operation: "replace", text: "The door is open", messageId: "m1" },
+      ],
+    });
+
+    expect(result.changes).toEqual([
+      expect.objectContaining({ category: "emotion", operation: "add", text: "Wary" }),
+      expect.objectContaining({ category: "goal", operation: "add", text: "Escape" }),
+      expect.objectContaining({ category: "relationship", operation: "add", text: "Distrusts Rowan" }),
+    ]);
+  });
+
   it("deduplicates paraphrased additions within one controller response", () => {
     const result = normalizeControllerAnalysis({
       actorMentions: [],
@@ -221,6 +242,12 @@ describe("controller response parsing", () => {
       text: "Wary of the visitor",
     })]);
     expect(result.telemetry.first.outputMode).toBe("tool");
+    expect(result.telemetry.first).toMatchObject({
+      structuredSource: "tool",
+      toolCallsReceived: 1,
+      matchingToolCalls: 1,
+      usableToolCalls: 1,
+    });
     expect(result.telemetry).toMatchObject({
       tokenModel: "provider-model",
       tokenizerName: "provider-tokenizer",
@@ -229,6 +256,7 @@ describe("controller response parsing", () => {
       inputTokens: 321,
     });
     const request = quiet.mock.calls[0][0] as {
+      messages: Array<{ role: string; content: string }>;
       parameters: Record<string, unknown>;
       reasoning: unknown;
       tools: Array<{ name: string; parameters: Record<string, unknown> }>;
@@ -239,6 +267,17 @@ describe("controller response parsing", () => {
     expect(request.tools).toHaveLength(1);
     expect(request.tools[0]).toMatchObject({ name: "lumi_mind_analysis_v1" });
     expect(request.tools[0].parameters.required).toEqual(["actorMentions", "changes"]);
+    const systemPrompt = request.messages.find((message) => message.role === "system")?.content ?? "";
+    const properties = (request.tools[0].parameters.properties as Record<string, {
+      items?: { properties?: Record<string, { description?: string }> };
+    }>);
+    const changeProperties = properties.changes.items?.properties ?? {};
+    expect(changeProperties.category?.description).toContain("Motives/desires/intentions are goals");
+    expect(changeProperties.operation?.description).toContain("Use exactly one operation");
+    expect(systemPrompt).toContain("Use only these category tokens: belief, secret, goal, plan, emotion, relationship, awareness.");
+    expect(systemPrompt).toContain("Map a motive, desire, intention, or intended outcome to goal");
+    expect(systemPrompt).toContain("Every actor mention must cite one supplied messageId. Every change must cite one supplied messageId and a short evidenceExcerpt.");
+    expect(systemPrompt).not.toContain("Every actor mention and change must cite");
   });
 
   it("falls back to plain JSON when a provider does not return tool arguments", async () => {
@@ -265,7 +304,50 @@ describe("controller response parsing", () => {
       userId: "user",
     });
     expect(result.telemetry.first.outputMode).toBe("json");
+    expect(result.telemetry.first).toMatchObject({
+      structuredSource: "content_json",
+      toolCallsReceived: 0,
+      matchingToolCalls: 0,
+      usableToolCalls: 0,
+    });
     expect(result.analysis).toEqual({ actorMentions: [], changes: [] });
+  });
+
+  it("tries reasoning JSON when nonempty content is not parseable", async () => {
+    const quiet = vi.fn().mockResolvedValue({
+      content: "The structured result follows in reasoning.",
+      reasoning: JSON.stringify({ actorMentions: [], changes: [] }),
+    });
+    (globalThis as Record<string, unknown>).spindle = {
+      generate: { quiet },
+      connections: { get: vi.fn().mockResolvedValue({ provider: "openrouter", model: "test-model" }) },
+      tokens: {
+        countText: vi.fn(async () => ({ total_tokens: 20, model: "test-model", tokenizer_name: "test", approximate: false })),
+        countMessages: vi.fn(async () => ({ total_tokens: 100, model: "test-model", tokenizer_name: "test", approximate: false })),
+      },
+    };
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "A short covered scene.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{
+        ref: "mira",
+        name: "Mira",
+        aliases: [],
+        managed: true,
+        items: [{ id: "seed:belief", category: "belief", text: "The room is safe", controllerWritable: false }],
+      }],
+      settings: { ...DEFAULT_SETTINGS, controllerConnectionId: "connection-1" },
+      userId: "user",
+    });
+
+    expect(result.analysis).toEqual({ actorMentions: [], changes: [] });
+    expect(result.telemetry.first).toMatchObject({
+      outputMode: "json",
+      structuredSource: "reasoning_json",
+      toolCallsReceived: 0,
+      matchingToolCalls: 0,
+      usableToolCalls: 0,
+    });
   });
 
   it("merges corrective mentions while taking corrective state changes", () => {
@@ -502,6 +584,124 @@ describe("controller response parsing", () => {
     expect(quiet).toHaveBeenCalledTimes(2);
     expect(result.analysis.changes).toHaveLength(1);
     expect(result.telemetry).toMatchObject({ attempts: 2, finalChanges: 1, warningCodes: [] });
+  });
+
+  it("reuses the analysis tool and gives the corrective pass privacy-safe rejection feedback", async () => {
+    const quiet = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({
+        actorMentions: [{
+          ref: "Aster",
+          name: "Aster",
+          aliases: [],
+          kind: "npc",
+          confidence: 0.9,
+          present: true,
+          messageId: "m1",
+        }],
+        changes: [
+          { subjectRef: "Aster", category: "motive", operation: "add", text: "RAW_CONTROLLER_SECRET", messageId: "m1" },
+          { subjectRef: "Aster", category: "goal", operation: "create", text: "RAW_CONTROLLER_SECRET", messageId: "m1" },
+        ],
+      }) })
+      .mockResolvedValueOnce({
+        content: "",
+        tool_calls: [{
+          name: "lumi_mind_analysis_v1",
+          call_id: "call-corrective",
+          args: {
+            actorMentions: [{
+              ref: "Aster",
+              name: "Aster",
+              aliases: [],
+              kind: "npc",
+              confidence: 0.9,
+              present: true,
+              messageId: "m1",
+            }],
+            changes: [{
+              subjectRef: "Aster",
+              category: "goal",
+              operation: "add",
+              targetItemId: null,
+              text: "Find the source of the noise",
+              status: "active",
+              confidence: 0.8,
+              targetRefs: [],
+              concealedFromRefs: [],
+              intensity: null,
+              dimensions: {},
+              messageId: "m1",
+              evidenceExcerpt: "Aster moved toward the sound.",
+            }],
+          },
+        }],
+      });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{
+      id: "m1",
+      role: "assistant",
+      content: "Aster moved toward the sound and searched the darkened hall. ".repeat(8),
+      index_in_chat: 0,
+    }];
+    const result = await analyzeMessages({ messages, recentContext: [], compactState: [], settings: DEFAULT_SETTINGS, userId: "user" });
+
+    expect(result.analysis.changes).toEqual([expect.objectContaining({ category: "goal", operation: "add" })]);
+    expect(result.telemetry.first.invalidChangeReasons).toEqual({ invalid_category: 1, invalid_operation: 1 });
+    expect(result.telemetry.retry).toMatchObject({
+      structuredSource: "tool",
+      toolCallsReceived: 1,
+      matchingToolCalls: 1,
+      usableToolCalls: 1,
+    });
+    const firstRequest = quiet.mock.calls[0][0] as { tools: Array<{ name: string }> };
+    const retryRequest = quiet.mock.calls[1][0] as { messages: Array<{ role: string; content: string }>; tools: Array<{ name: string }> };
+    expect(firstRequest.tools[0].name).toBe("lumi_mind_analysis_v1");
+    expect(retryRequest.tools[0].name).toBe(firstRequest.tools[0].name);
+    const retryUserPrompt = retryRequest.messages.find((message) => message.role === "user")?.content ?? "";
+    const feedback = retryUserPrompt.match(/<corrective_feedback>([\s\S]*?)<\/corrective_feedback>/)?.[1] ?? "";
+    expect(feedback).toContain("First pass raw changes: 2. Accepted changes: 0.");
+    expect(feedback).toContain("invalid_category=1");
+    expect(feedback).toContain("invalid_operation=1");
+    expect(feedback).toContain("Category must be exactly one of: belief, secret, goal, plan, emotion, relationship, awareness.");
+    expect(feedback).not.toContain("RAW_CONTROLLER_SECRET");
+  });
+
+  it.each([
+    {
+      label: "wrong tool name",
+      response: {
+        content: "",
+        tool_calls: [{ name: "unexpected_tool", call_id: "wrong", args: { actorMentions: [], changes: [] } }],
+      },
+      expected: { toolCallsReceived: 1, matchingToolCalls: 0, usableToolCalls: 0 },
+    },
+    {
+      label: "empty matching arguments",
+      response: {
+        content: "",
+        tool_calls: [{ name: "lumi_mind_analysis_v1", call_id: "empty", args: {} }],
+      },
+      expected: { toolCallsReceived: 1, matchingToolCalls: 1, usableToolCalls: 0 },
+    },
+    {
+      label: "unparseable text",
+      response: { content: "not structured", reasoning: "still not structured" },
+      expected: { toolCallsReceived: 0, matchingToolCalls: 0, usableToolCalls: 0 },
+    },
+  ])("reports $label on a failed corrective response without exposing tool payloads", async ({ response, expected }) => {
+    const quiet = vi.fn()
+      .mockResolvedValueOnce({ content: JSON.stringify({ actorMentions: [], changes: [] }) })
+      .mockResolvedValueOnce(response);
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet }, connections: { get: vi.fn() } };
+    const messages: ChatMessageLike[] = [{ id: "m1", role: "assistant", content: "D".repeat(500), index_in_chat: 0 }];
+    const result = await analyzeMessages({ messages, recentContext: [], compactState: [], settings: DEFAULT_SETTINGS, userId: "user" });
+
+    expect(result.telemetry.retry).toMatchObject({
+      structuredSource: "none",
+      ...expected,
+    });
+    expect(result.telemetry.warningCodes).toEqual(expect.arrayContaining(["retry_failed", "empty_nontrivial_batch"]));
+    expect(result.telemetry.retryError).toBe("Corrective controller pass returned no parseable structured result.");
   });
 
   it("retains a valid first pass and warns when the corrective request fails", async () => {

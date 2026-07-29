@@ -154,6 +154,10 @@ export type ControllerWarningCode = "empty_nontrivial_batch" | "normalization_dr
 
 export interface ControllerResponseTelemetry {
   outputMode: "tool" | "json";
+  structuredSource?: "tool" | "content_json" | "reasoning_json" | "none";
+  toolCallsReceived?: number;
+  matchingToolCalls?: number;
+  usableToolCalls?: number;
   responseChars: number;
   responseHash: string;
   rawActorMentions: number;

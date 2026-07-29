@@ -1357,6 +1357,25 @@ function buildProjectedDirectorMindInjection(timeline, settings, contextMessages
 
 // src/controller.ts
 var THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
+var ANALYSIS_TOOL_NAME = "lumi_mind_analysis_v1";
+var MIND_CATEGORIES = ["belief", "secret", "goal", "plan", "emotion", "relationship", "awareness"];
+var MIND_OPERATIONS = ["add", "update", "resolve", "abandon", "remove"];
+var CATEGORY_NORMALIZATIONS = {
+  belief: "belief",
+  beliefs: "belief",
+  secret: "secret",
+  secrets: "secret",
+  goal: "goal",
+  goals: "goal",
+  plan: "plan",
+  plans: "plan",
+  emotion: "emotion",
+  emotions: "emotion",
+  relationship: "relationship",
+  relationships: "relationship",
+  awareness: "awareness",
+  awarenesses: "awareness"
+};
 function isAbortError(error) {
   return !!error && typeof error === "object" && "name" in error && error.name === "AbortError";
 }
@@ -1395,10 +1414,12 @@ function parseJsonValue(content) {
   }
 }
 function category(value) {
-  return value === "belief" || value === "secret" || value === "goal" || value === "plan" || value === "emotion" || value === "relationship" || value === "awareness" ? value : null;
+  const normalized = typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+  return CATEGORY_NORMALIZATIONS[normalized] ?? null;
 }
 function operation(value) {
-  return value === "add" || value === "update" || value === "resolve" || value === "abandon" || value === "remove" ? value : null;
+  const normalized = typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
+  return MIND_OPERATIONS.find((candidate) => candidate === normalized) ?? null;
 }
 function normalizedReference(value) {
   return value.trim().toLocaleLowerCase();
@@ -1644,12 +1665,13 @@ function isNontrivialAnalysisBatch(messages) {
   const total = lengths.reduce((sum, length) => sum + length, 0);
   return total >= 400 || lengths.some((length) => length >= 280) || messages.length >= 2 && total >= 240;
 }
-function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}, outputMode = "json") {
+function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}, outputMode = "json", transport = {}) {
   const object = asObject2(parsed);
   const rawChanges = Array.isArray(object.changes) ? object.changes.length : 0;
   const duplicatesSuppressed = diagnostics.duplicatesSuppressed ?? 0;
   return {
     outputMode,
+    ...transport,
     responseChars: raw.length,
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
@@ -1675,46 +1697,64 @@ function mergeControllerAnalyses(first, corrective) {
 var ANALYSIS_SCHEMA = {
   type: "object",
   additionalProperties: false,
+  description: "The complete LumiMind analysis result. Always include both arrays, using empty arrays when nothing qualifies.",
   properties: {
     actorMentions: {
       type: "array",
+      description: "Actors actually present after each analyzed message. Every mention cites an exact analysis-batch messageId.",
       items: {
         type: "object",
         additionalProperties: false,
         properties: {
-          ref: { type: "string" },
-          name: { type: "string" },
-          aliases: { type: "array", items: { type: "string" } },
-          kind: { type: "string", enum: ["character", "persona", "npc"] },
+          ref: { type: "string", description: "Stable actor reference. Copy the exact existing mind_state ref when one matches." },
+          name: { type: "string", description: "Actor name as supported by the transcript." },
+          aliases: { type: "array", items: { type: "string" }, description: "Supported alternate names; otherwise an empty array." },
+          kind: { type: "string", enum: ["character", "persona", "npc"], description: "Use exactly character, persona, or npc." },
           confidence: { type: "number", minimum: 0, maximum: 1 },
           present: { type: "boolean" },
-          messageId: { type: "string" }
+          messageId: { type: "string", description: "Exact id of one message in analysis_batch supporting this presence mention." }
         },
         required: ["ref", "name", "aliases", "kind", "confidence", "present", "messageId"]
       }
     },
     changes: {
       type: "array",
+      description: "Accepted ledger operations only. Use an empty array when all supported state is covered or protected.",
       items: {
         type: "object",
         additionalProperties: false,
         properties: {
-          subjectRef: { type: "string" },
-          category: { type: "string", enum: ["belief", "secret", "goal", "plan", "emotion", "relationship", "awareness"] },
-          operation: { type: "string", enum: ["add", "update", "resolve", "abandon", "remove"] },
-          targetItemId: { anyOf: [{ type: "string" }, { type: "null" }] },
-          text: { type: "string" },
-          status: { type: "string", enum: ["active", "resolved", "abandoned", "uncertain"] },
+          subjectRef: { type: "string", description: "Exact existing actor ref, or the same stable ref used in a new actorMention." },
+          category: {
+            type: "string",
+            enum: [...MIND_CATEGORIES],
+            description: "Use exactly one category: belief, secret, goal, plan, emotion, relationship, or awareness. Motives/desires/intentions are goals; methods/strategies are plans; current fears/feelings/reactions are emotions."
+          },
+          operation: {
+            type: "string",
+            enum: [...MIND_OPERATIONS],
+            description: "Use exactly one operation: add, update, resolve, abandon, or remove. These are verbs; never use status words such as active, resolved, or abandoned here."
+          },
+          targetItemId: {
+            anyOf: [{ type: "string" }, { type: "null" }],
+            description: "Null for add. For every other operation, copy the exact writable mind_state item id."
+          },
+          text: { type: "string", description: "Concise subjective-state text. Required for add and update; use an empty string for other operations." },
+          status: {
+            type: "string",
+            enum: ["active", "resolved", "abandoned", "uncertain"],
+            description: "Resulting state status. Do not place this status token in operation."
+          },
           confidence: { type: "number", minimum: 0, maximum: 1 },
-          targetRefs: { type: "array", items: { type: "string" } },
-          concealedFromRefs: { type: "array", items: { type: "string" } },
+          targetRefs: { type: "array", items: { type: "string" }, description: "Known actor refs targeted by this state; otherwise an empty array." },
+          concealedFromRefs: { type: "array", items: { type: "string" }, description: "Known actor refs from whom a secret is concealed; otherwise an empty array." },
           intensity: { anyOf: [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }] },
           dimensions: {
             type: "object",
             additionalProperties: { type: "number", minimum: -1, maximum: 1 }
           },
-          messageId: { type: "string" },
-          evidenceExcerpt: { type: "string" }
+          messageId: { type: "string", description: "Exact id of one message in analysis_batch supporting this change." },
+          evidenceExcerpt: { type: "string", description: "Short excerpt from that message supporting the subjective inference." }
         },
         required: [
           "subjectRef",
@@ -1851,17 +1891,27 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
   const object = asObject2(result);
   const content = sanitizeControllerText(text(object.content));
   const reasoning = sanitizeControllerText(text(object.reasoning));
-  const toolCall = (Array.isArray(object.tool_calls) ? object.tool_calls : []).map(asObject2).find((call) => text(call.name) === schemaName && Object.keys(asObject2(call.args)).length > 0);
-  const toolArgs = toolCall ? asObject2(toolCall.args) : null;
+  const toolCalls = (Array.isArray(object.tool_calls) ? object.tool_calls : []).map(asObject2);
+  const matchingToolCalls = toolCalls.filter((call) => text(call.name) === schemaName);
+  const usableToolCalls = matchingToolCalls.filter((call) => Object.keys(asObject2(call.args)).length > 0);
+  const toolArgs = usableToolCalls.length ? asObject2(usableToolCalls[0].args) : null;
+  const contentParsed = toolArgs ? null : parseJsonValue(content);
+  const reasoningParsed = toolArgs || contentParsed !== null ? null : parseJsonValue(reasoning);
+  const parsed = toolArgs ?? (contentParsed !== null ? contentParsed : reasoningParsed);
+  const structuredSource = toolArgs ? "tool" : contentParsed !== null ? "content_json" : reasoningParsed !== null ? "reasoning_json" : "none";
   const outputMode = toolArgs ? "tool" : "json";
-  const raw = toolArgs ? JSON.stringify(toolArgs) : content || reasoning;
+  const raw = toolArgs ? JSON.stringify(toolArgs) : contentParsed !== null ? content : reasoningParsed !== null ? reasoning : content || reasoning;
   const usage = asObject2(object.usage);
   const providerInputTokens = typeof usage.prompt_tokens === "number" && Number.isFinite(usage.prompt_tokens) ? Math.max(0, Math.round(usage.prompt_tokens)) : null;
   return {
-    parsed: toolArgs ?? parseJsonValue(raw),
+    parsed,
     raw,
     meta: { connectionId: connection.id, provider: connection.provider, model: connection.model },
     outputMode,
+    structuredSource,
+    toolCallsReceived: toolCalls.length,
+    matchingToolCalls: matchingToolCalls.length,
+    usableToolCalls: usableToolCalls.length,
     providerInputTokens
   };
 }
@@ -1876,7 +1926,10 @@ ${message.content}
 var ANALYSIS_SYSTEM_PROMPT = [
   "You are LumiMind's evidence-bound subjective-state analyst for an interactive roleplay transcript.",
   "Call the required LumiMind result tool exactly once. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
-  "Infer emotions, motives, goals, plans, relationships, and beliefs only when directly stated or strongly supported by subtext.",
+  `Use only these category tokens: ${MIND_CATEGORIES.join(", ")}.`,
+  "Map a motive, desire, intention, or intended outcome to goal; a chosen method, strategy, or intended action sequence to plan; a current fear, feeling, or reaction to emotion; a noticed, witnessed, or currently known fact to awareness; a subjective proposition accepted as true or likely to belief; deliberately concealed knowledge to secret; and a stance toward another actor to relationship.",
+  `Use only these operation tokens: ${MIND_OPERATIONS.join(", ")}. Use add for novel state, update for materially evolved writable state, resolve for concluded state, abandon for renounced state, and remove only when the writable ledger item itself should be deleted.`,
+  "Infer subjective state only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
   "Treat mind_state as an authoritative ledger to reconcile, not background prose to summarize. Adds are the last resort, not the default output.",
@@ -1898,7 +1951,7 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Include actorMentions for the actors actually present in the scene after each message, not merely referenced.",
   "For an actor already in mind_state, copy its exact ref into actorMentions and subjectRef. For a newly discovered actor, use one stable ref consistently in both its actorMention and every change.",
   "A positive omittedItemCount means lower-ranked state remains stored outside this request. Do not treat omission as proof that the actor has no other state.",
-  "Every actor mention and change must cite one supplied messageId and a short evidenceExcerpt."
+  "Every actor mention must cite one supplied messageId. Every change must cite one supplied messageId and a short evidenceExcerpt."
 ].join("\n");
 function correctiveBootstrapNeeded(compactState, mentions) {
   const stateActors = (Array.isArray(compactState) ? compactState : []).map(asObject2).filter((actor) => policyReference(actor.ref) || policyReference(actor.name));
@@ -1924,6 +1977,17 @@ function analysisSystemPrompt(settings, corrective = false) {
     "Do not manufacture facts or force every category. An empty changes array is valid only when the batch truly contains no evidence of any managed actor's subjective state."
   ].join("\n") : "";
   return [ANALYSIS_SYSTEM_PROMPT, mode, persona, correction].filter(Boolean).join("\n");
+}
+function correctiveFeedback(telemetry) {
+  const reasons = Object.entries(telemetry.invalidChangeReasons).filter(([, count]) => count > 0).sort(([left], [right]) => left.localeCompare(right)).map(([reason, count]) => `${reason}=${count}`).join(", ");
+  return [
+    `First pass raw changes: ${telemetry.rawChanges}. Accepted changes: ${telemetry.acceptedChanges}.`,
+    `Rejected change reasons: ${reasons || "none; the first pass emitted no usable state changes"}.`,
+    `Category must be exactly one of: ${MIND_CATEGORIES.join(", ")}.`,
+    `Operation must be exactly one of: ${MIND_OPERATIONS.join(", ")}.`,
+    "Use goal for motives/desires/intentions, plan for methods/strategies, and emotion for current fears/feelings/reactions. Do not emit motive, desire, fear, feeling, create, replace, active, resolved, or abandoned as category/operation values.",
+    "Copy subjectRef and messageId exactly from mind_state, actorMentions, or analysis_batch. Non-add operations require an exact writable targetItemId."
+  ].join("\n");
 }
 function buildAnalysisPrompt(input) {
   return [
@@ -1961,7 +2025,7 @@ async function analyzeMessages(input) {
   const result = await quietJson(
     prompt,
     systemPrompt,
-    "lumi_mind_analysis_v1",
+    ANALYSIS_TOOL_NAME,
     ANALYSIS_SCHEMA,
     input.settings,
     input.userId,
@@ -1979,7 +2043,12 @@ async function analyzeMessages(input) {
     duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
     invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
     invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons)
-  }, result.outputMode);
+  }, result.outputMode, {
+    structuredSource: result.structuredSource,
+    toolCallsReceived: result.toolCallsReceived,
+    matchingToolCalls: result.matchingToolCalls,
+    usableToolCalls: result.usableToolCalls
+  });
   const nontrivial = isNontrivialAnalysisBatch(input.messages);
   const bootstrapNeeded = correctiveBootstrapNeeded(input.compactState, firstAnalysis.actorMentions);
   let finalAnalysis = firstAnalysis;
@@ -1993,9 +2062,13 @@ async function analyzeMessages(input) {
       const corrective = await quietJson(
         `${prompt}
 
-The first pass produced zero accepted changes. Perform the corrective bootstrap extraction now.`,
+<corrective_feedback>
+${correctiveFeedback(firstTelemetry)}
+</corrective_feedback>
+
+Perform the corrective bootstrap extraction now.`,
         analysisSystemPrompt(input.settings, true),
-        "lumi_mind_analysis_v1_corrective",
+        ANALYSIS_TOOL_NAME,
         ANALYSIS_SCHEMA,
         input.settings,
         input.userId,
@@ -2013,7 +2086,12 @@ The first pass produced zero accepted changes. Perform the corrective bootstrap 
         duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
         invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
         invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons)
-      }, corrective.outputMode);
+      }, corrective.outputMode, {
+        structuredSource: corrective.structuredSource,
+        toolCallsReceived: corrective.toolCallsReceived,
+        matchingToolCalls: corrective.matchingToolCalls,
+        usableToolCalls: corrective.usableToolCalls
+      });
       if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
