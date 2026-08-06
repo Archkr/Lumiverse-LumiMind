@@ -3,6 +3,8 @@ import {
   analyzeMessages,
   applyControllerMindPolicy,
   buildAnalysisPrompt,
+  composeNpcCoreLore,
+  generateMindTidyProposals,
   generateNpcCoreDraft,
   isNontrivialAnalysisBatch,
   makeControllerResponseTelemetry,
@@ -12,7 +14,7 @@ import {
   sanitizeControllerText,
 } from "./controller";
 import { DEFAULT_SETTINGS } from "./engine";
-import type { ChatMessageLike, ControllerAnalysis } from "./types";
+import type { ActorMind, ActorRecord, ChatMessageLike, ControllerAnalysis } from "./types";
 
 afterEach(() => {
   delete (globalThis as Record<string, unknown>).spindle;
@@ -744,6 +746,12 @@ describe("controller response parsing", () => {
 });
 
 describe("NPC core drafting", () => {
+  it("composes Cortex description and facts with optional user notes", () => {
+    expect(composeNpcCoreLore("A reserved gate captain.", ["Protects civilians", "Protects civilians", "Survived the siege"], "Carries a broken compass."))
+      .toBe("Cortex description:\nA reserved gate captain.\n\nCortex facts:\n- Protects civilians\n- Survived the siege\n\nUser-provided supplemental lore:\nCarries a broken compass.");
+    expect(composeNpcCoreLore("", [], "Manual characterization")).toBe("User-provided lore:\nManual characterization");
+  });
+
   it("drafts an enduring frame from supplied NPC lore through structured output", async () => {
     const quiet = vi.fn().mockResolvedValue({
       content: "",
@@ -791,5 +799,124 @@ describe("NPC core drafting", () => {
       settings: DEFAULT_SETTINGS,
       userId: "user",
     })).rejects.toThrow("NPC lore is required");
+  });
+});
+
+describe("Mind Tidy proposals", () => {
+  const actor: ActorRecord = {
+    id: "actor:mira",
+    kind: "npc",
+    canonicalName: "Mira Vale",
+    aliases: ["Mira"],
+    suppressedAliases: [],
+    characterId: null,
+    personaId: null,
+    cortexEntityId: null,
+    confidence: 1,
+    confirmed: true,
+    present: false,
+    firstSeenMessageId: "m1",
+    lastSeenMessageId: "m1",
+    updatedAt: 1,
+  };
+  const mind: ActorMind = {
+    actorId: actor.id,
+    core: {
+      selfConcept: "I keep the eastern gate.",
+      values: ["Duty"],
+      desires: [],
+      fears: [],
+      boundaries: [],
+      notes: [],
+    },
+    items: [{
+      id: "item:old",
+      category: "belief",
+      text: "The eastern gate is secure.",
+      status: "active",
+      confidence: 0.7,
+      targetActorIds: [],
+      concealedFromActorIds: [],
+      intensity: null,
+      dimensions: {},
+      evidence: { messageId: "m1", swipeId: 0, excerpt: "The gate is secure", messageIndex: 0 },
+      locked: false,
+      pinned: false,
+      source: "controller",
+      createdAt: 1,
+      updatedAt: 1,
+    }],
+    sceneSummary: "Mira is standing watch.",
+    attention: "The eastern gate",
+    presentActorIds: [],
+    lastUpdatedMessageId: "m1",
+  };
+
+  it("normalizes valid proposals and rejects unknown actors or entries", async () => {
+    const quiet = vi.fn().mockResolvedValue({
+      content: "",
+      tool_calls: [{
+        name: "lumi_mind_tidy_v1",
+        call_id: "call-tidy",
+        args: {
+          proposals: [{
+            actorId: actor.id,
+            finding: "outdated",
+            operation: "update_item",
+            rationale: "The recent scene contradicts the stored belief.",
+            confidence: 2,
+            targetItemIds: ["item:old"],
+            item: {
+              category: "belief",
+              text: "The eastern gate may have been breached.",
+              status: "uncertain",
+              targetActorIds: [],
+              concealedFromActorIds: [],
+              intensity: null,
+              dimensions: {},
+            },
+          }, {
+            actorId: "actor:unknown",
+            finding: "missing",
+            operation: "add_item",
+            rationale: "Wrong actor.",
+            confidence: 0.5,
+            targetItemIds: [],
+            item: { category: "goal", text: "Leave", status: "active" },
+          }, {
+            actorId: actor.id,
+            finding: "outdated",
+            operation: "remove_items",
+            rationale: "Wrong item.",
+            confidence: 0.5,
+            targetItemIds: ["item:unknown"],
+          }],
+        },
+      }],
+    });
+    (globalThis as Record<string, unknown>).spindle = { generate: { quiet } };
+
+    const proposals = await generateMindTidyProposals({
+      actor,
+      mind,
+      knownActors: [actor],
+      recentContext: [{ id: "m2", role: "assistant", content: "The gate shudders under an impact." }],
+      settings: { ...DEFAULT_SETTINGS, analysisStateTokenBudget: 0 },
+      userId: "user",
+    });
+
+    expect(proposals).toHaveLength(1);
+    expect(proposals[0]).toMatchObject({
+      actorId: actor.id,
+      finding: "outdated",
+      operation: "update_item",
+      confidence: 1,
+      targetItemIds: ["item:old"],
+      item: { text: "The eastern gate may have been breached.", status: "uncertain" },
+    });
+    const request = quiet.mock.calls[0][0] as { messages: Array<{ content: string }>; tools: Array<{ name: string }> };
+    expect(request.messages[1].content).toContain("item:old");
+    expect(request.messages[1].content).toContain("gate shudders");
+    expect(request.tools[0].name).toBe("lumi_mind_tidy_v1");
   });
 });

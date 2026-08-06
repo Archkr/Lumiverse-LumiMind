@@ -218,6 +218,7 @@ export function healthLabel(health: TimelineHealth): string {
     inactive: "Inactive",
     initializing: "Initializing",
     ready: "Current",
+    waiting: "Waiting to update",
     pending: "Analyzing",
     stale: "Using checkpoint",
     paused: "Paused",
@@ -228,7 +229,7 @@ export function healthLabel(health: TimelineHealth): string {
 export function healthTone(health: TimelineHealth): "neutral" | "good" | "working" | "warning" | "danger" {
   if (health === "ready") return "good";
   if (health === "initializing" || health === "pending") return "working";
-  if (health === "stale" || health === "paused") return "warning";
+  if (health === "waiting" || health === "stale" || health === "paused") return "warning";
   if (health === "error") return "danger";
   return "neutral";
 }

@@ -170,6 +170,7 @@ function healthLabel(health) {
     inactive: "Inactive",
     initializing: "Initializing",
     ready: "Current",
+    waiting: "Waiting to update",
     pending: "Analyzing",
     stale: "Using checkpoint",
     paused: "Paused",
@@ -179,7 +180,7 @@ function healthLabel(health) {
 function healthTone(health) {
   if (health === "ready") return "good";
   if (health === "initializing" || health === "pending") return "working";
-  if (health === "stale" || health === "paused") return "warning";
+  if (health === "waiting" || health === "stale" || health === "paused") return "warning";
   if (health === "error") return "danger";
   return "neutral";
 }
@@ -407,7 +408,7 @@ var LUMI_MIND_CSS = `
 .lm-quality-marker { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border:1px solid color-mix(in srgb,var(--lm-warning) 45%,var(--lm-line)); border-radius:50%; color:var(--lm-warning); background:color-mix(in srgb,var(--lm-warning) 10%,transparent); font-size:10px; font-weight:850; }
 .lm-quality-dismiss { position:absolute; top:5px; right:5px; }
 
-.lm-section-heading { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
+.lm-section-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
 .lm-section-title { color:var(--lm-muted); font-size:10px; font-weight:750; letter-spacing:.09em; text-transform:uppercase; }
 .lm-count { min-width:18px; padding:1px 5px; border-radius:999px; color:var(--lm-dim); background:var(--lm-fill); text-align:center; font-size:9px; }
 .lm-actor-rail { display:flex; gap:7px; overflow-x:auto; scrollbar-width:none; padding-bottom:2px; }
@@ -537,6 +538,15 @@ var LUMI_MIND_CSS = `
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
 .lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
 .lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
+.lm-tidy-review { gap:9px; }
+.lm-tidy-proposal { display:grid; grid-template-columns:auto minmax(0,1fr); gap:9px; align-items:start; padding:10px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); cursor:pointer; }
+.lm-tidy-proposal input { margin-top:3px; accent-color:var(--lm-accent); }
+.lm-tidy-proposal-copy { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.lm-tidy-proposal-copy strong { font-size:10px; text-transform:capitalize; }
+.lm-tidy-proposal-copy p { color:var(--lm-text); font-size:10px; line-height:1.45; overflow-wrap:anywhere; }
+.lm-tidy-proposal-copy small { color:var(--lm-muted); font-size:9px; line-height:1.4; }
+.lm-tidy-value { white-space:pre-line; }
+.lm-tidy-affected { color:var(--lm-accent) !important; }
 
 .lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
 .lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }
@@ -732,6 +742,10 @@ function setup(ctx) {
   const settingsSaveRequests = /* @__PURE__ */ new Map();
   const npcCoreDraftRequests = /* @__PURE__ */ new Map();
   const npcCoreGenerating = /* @__PURE__ */ new Set();
+  const npcCreateRequests = /* @__PURE__ */ new Map();
+  let tidyRunning = null;
+  let tidyReviewModal = null;
+  let tidyReviewRequestId = null;
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise = null;
@@ -1057,7 +1071,7 @@ function setup(ctx) {
       send({ type: "save_settings", requestId, patch, chatId });
     });
   }
-  function requestNpcCoreDraft(chatId, actorId, lore) {
+  function requestNpcCoreDraft(input2) {
     const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -1065,7 +1079,18 @@ function setup(ctx) {
         reject(new Error("The NPC core draft request timed out."));
       }, 12e4);
       npcCoreDraftRequests.set(requestId, { resolve, reject, timeout });
-      send({ type: "generate_npc_core", chatId, actorId, lore, requestId });
+      send({ type: "generate_npc_core", ...input2, requestId });
+    });
+  }
+  function requestNpcCreate(input2) {
+    const requestId = createRequestId();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        npcCreateRequests.delete(requestId);
+        reject(new Error("Saving the NPC timed out."));
+      }, 3e4);
+      npcCreateRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "create_npc", ...input2, requestId });
     });
   }
   function persistSettingsDraft() {
@@ -1397,11 +1422,16 @@ function setup(ctx) {
     const pulse = element("span", "lm-pulse");
     const copy = element("div", "lm-timeline-status-copy");
     copy.appendChild(element("strong", void 0, healthLabel(timeline.health)));
-    const detail = timeline.error ?? (timeline.health === "paused" ? "Automatic analysis is paused. The last valid checkpoint remains available for injection." : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
+    const detail = timeline.error ?? (timeline.health === "paused" ? "Analysis and private mind injection are paused." : timeline.health === "waiting" ? `${timeline.pendingTurnCount} completed ${timeline.pendingTurnCount === 1 ? "turn is" : "turns are"} waiting. The last valid checkpoint remains available for injection.` : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
     copy.appendChild(element("span", void 0, detail));
     const actions = element("div", "lm-inline-actions");
     if (timeline.health === "error") {
       actions.appendChild(textButton("Retry", () => send({ type: "retry", chatId: timeline.chatId }), "quiet"));
+    }
+    if (timeline.pendingTurnCount > 0 && !timeline.paused) {
+      const updateNow = textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary");
+      updateNow.disabled = !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      actions.appendChild(updateNow);
     }
     actions.appendChild(textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"));
     panel.append(pulse, copy, actions);
@@ -1444,10 +1474,205 @@ function setup(ctx) {
     panel.append(marker, copy, actions, dismiss);
     return panel;
   }
+  async function addNpcWizard() {
+    const timeline = currentState?.timeline;
+    if (!timeline?.active) {
+      showNotice("warning", "Activate this LumiMind timeline before adding an NPC.");
+      return;
+    }
+    const cortexActors = timeline.actors.filter((actor) => actor.kind === "npc" && !!actor.cortexEntityId);
+    const modal = ctx.ui.showModal({ title: "Add or enrich an NPC", width: 560, maxHeight: 720 });
+    const form = element("form", "lm-modal-form");
+    const source = element("select", "lm-select");
+    const fresh = element("option", void 0, "New local NPC");
+    fresh.value = "";
+    source.appendChild(fresh);
+    for (const actor of cortexActors) {
+      const option = element("option", void 0, `Cortex \xB7 ${actor.canonicalName}`);
+      option.value = actor.id;
+      source.appendChild(option);
+    }
+    const name = input("", "NPC name");
+    const aliases = textarea("", 3, "One alias per line");
+    const lore = textarea("", 8, "Background, personality, motivations, fears, values, and boundaries\u2026");
+    const syncSource = () => {
+      const actor = timeline.actors.find((candidate) => candidate.id === source.value) ?? null;
+      name.value = actor?.canonicalName ?? "";
+      aliases.value = actor?.aliases.join("\n") ?? "";
+      name.disabled = !!actor;
+      aliases.disabled = !!actor;
+      lore.placeholder = actor ? "Optional notes to supplement this character's Cortex description and facts\u2026" : "Background, personality, motivations, fears, values, and boundaries\u2026";
+    };
+    source.addEventListener("change", syncSource);
+    form.append(
+      field("Source", source, cortexActors.length ? "Choose a Cortex character or stage a new local NPC." : "No Cortex characters are currently linked to this timeline."),
+      field("Name", name),
+      field("Aliases", aliases),
+      field("Lore", lore, "Generation creates a draft only. The actor is not created or changed until you save the reviewed core.")
+    );
+    const actions = element("div", "lm-modal-actions");
+    const generate = element("button", "lm-button lm-button-primary", "Generate core draft");
+    generate.type = "submit";
+    actions.append(textButton("Cancel", () => modal.dismiss()), generate);
+    form.appendChild(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const cortexActor = timeline.actors.find((candidate) => candidate.id === source.value) ?? null;
+      const npcName = (cortexActor?.canonicalName ?? name.value).trim();
+      const npcLore = lore.value.trim();
+      if (!npcName || !cortexActor && !npcLore) {
+        showNotice("warning", cortexActor ? "That Cortex actor is unavailable." : "A name and lore are required for a new NPC.");
+        return;
+      }
+      generate.disabled = true;
+      generate.textContent = "Generating\u2026";
+      void (async () => {
+        if (cortexActor) {
+          modal.dismiss();
+          await generateNpcCore(cortexActor, npcLore);
+          return;
+        }
+        const npcAliases = uniqueLines(aliases.value);
+        const core = await requestNpcCoreDraft({
+          chatId: timeline.chatId,
+          name: npcName,
+          aliases: npcAliases,
+          lore: npcLore
+        });
+        modal.dismiss();
+        showNotice("success", "NPC core draft ready for review. The NPC has not been created yet.");
+        await showCoreEditor(npcName, core, true, async (reviewedCore) => {
+          const actorId = await requestNpcCreate({
+            chatId: timeline.chatId,
+            name: npcName,
+            aliases: npcAliases,
+            core: reviewedCore
+          });
+          selectedActorId = actorId;
+          showNotice("success", `${npcName} was added to this timeline.`);
+        });
+      })().catch((error) => {
+        generate.disabled = false;
+        generate.textContent = "Generate core draft";
+        showNotice("error", error instanceof Error ? error.message : "The NPC core draft could not be generated.");
+      });
+    });
+    modal.root.appendChild(form);
+    setTimeout(() => name.focus(), 0);
+  }
+  function tidyProposalSummary(proposal) {
+    if (proposal.operation === "replace_core") {
+      const core = proposal.core;
+      if (!core) return "Replace core";
+      return [core.selfConcept, ...core.values, ...core.desires, ...core.fears, ...core.boundaries, ...core.notes].filter(Boolean).join(" \xB7 ");
+    }
+    if (proposal.item) return `${categoryLabel(proposal.item.category)} \xB7 ${proposal.item.status} \xB7 ${proposal.item.text}`;
+    return `${proposal.operation === "remove_items" ? "Remove" : proposal.operation} ${proposal.targetItemIds.length} ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}`;
+  }
+  function tidyBeforeAfter(proposal) {
+    const mind = currentState?.timeline?.minds[proposal.actorId];
+    if (proposal.operation === "replace_core") {
+      const summarize = (core) => core ? [core.selfConcept, ...core.values, ...core.desires, ...core.fears, ...core.boundaries, ...core.notes].filter(Boolean).join(" \xB7 ") || "Empty core" : "Empty core";
+      return { before: summarize(mind?.core), after: summarize(proposal.core) };
+    }
+    const affected = proposal.targetItemIds.map((itemId) => mind?.items.find((item) => item.id === itemId)).filter((item) => !!item).map((item) => `${categoryLabel(item.category)} \xB7 ${item.status} \xB7 ${item.text}`);
+    const after = proposal.item ? `${categoryLabel(proposal.item.category)} \xB7 ${proposal.item.status} \xB7 ${proposal.item.text}` : proposal.operation === "remove_items" ? "Removed" : "No replacement";
+    return {
+      before: affected.length ? affected.join("\n") : "Missing entry",
+      after
+    };
+  }
+  function showTidyReview(requestId, proposals, errors) {
+    tidyReviewModal?.dismiss();
+    const modal = ctx.ui.showModal({ title: "Review Mind Tidy", width: 760, maxHeight: 820 });
+    tidyReviewModal = modal;
+    tidyReviewRequestId = requestId;
+    const content = element("div", "lm-modal-form lm-tidy-review");
+    content.appendChild(element("div", "lm-seed-hint", "Nothing changes until you apply selected findings. Accepted entry changes become locked manual overrides; core changes remain timeline-local."));
+    const selected = /* @__PURE__ */ new Set();
+    for (const proposal of proposals) {
+      selected.add(proposal.id);
+      const row = element("label", "lm-tidy-proposal");
+      const checkbox = element("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = true;
+      checkbox.addEventListener("change", () => checkbox.checked ? selected.add(proposal.id) : selected.delete(proposal.id));
+      const copy = element("div", "lm-tidy-proposal-copy");
+      const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === proposal.actorId);
+      const comparison = tidyBeforeAfter(proposal);
+      copy.append(
+        element("strong", void 0, `${actor?.canonicalName ?? "Actor"} \xB7 ${proposal.finding}`),
+        element("p", void 0, tidyProposalSummary(proposal)),
+        element("small", "lm-tidy-value", `Before: ${comparison.before}`),
+        element("small", "lm-tidy-value", `After: ${comparison.after}`),
+        element("small", "lm-tidy-affected", `${proposal.targetItemIds.length} affected ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}`),
+        element("small", void 0, `${Math.round(proposal.confidence * 100)}% confidence \xB7 ${proposal.rationale}`)
+      );
+      row.append(checkbox, copy);
+      content.appendChild(row);
+    }
+    if (!proposals.length) content.appendChild(element("div", "lm-empty-inline", "No cleanup changes were proposed."));
+    for (const error of errors) {
+      const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === error.actorId);
+      content.appendChild(element("div", "lm-seed-hint warning", `${actor?.canonicalName ?? "Actor"}: ${error.message}`));
+    }
+    const actions = element("div", "lm-modal-actions");
+    const apply = element("button", "lm-button lm-button-primary", "Apply selected");
+    apply.type = "button";
+    apply.disabled = proposals.length === 0;
+    apply.addEventListener("click", () => {
+      if (!selected.size || !currentState?.timeline) return;
+      apply.disabled = true;
+      apply.textContent = "Applying\u2026";
+      send({ type: "apply_tidy", chatId: currentState.timeline.chatId, requestId, proposalIds: [...selected] });
+    });
+    actions.append(textButton("Close", () => modal.dismiss()), apply);
+    content.appendChild(actions);
+    modal.onDismiss(() => {
+      if (tidyReviewModal === modal) tidyReviewModal = null;
+      if (tidyReviewRequestId === requestId) tidyReviewRequestId = null;
+    });
+    modal.root.appendChild(content);
+  }
+  async function startTidy(actorIds, all) {
+    const timeline = currentState?.timeline;
+    if (!timeline || tidyRunning || !actorIds.length) return;
+    if (all) {
+      const result = await ctx.ui.showConfirm({
+        title: `Tidy ${actorIds.length} minds?`,
+        message: `This will make ${actorIds.length} sequential controller ${actorIds.length === 1 ? "request" : "requests"}, one per managed actor. You can cancel the remaining scan at any time.`,
+        variant: "warning",
+        confirmLabel: "Start tidy"
+      });
+      if (!result.confirmed) return;
+    }
+    const requestId = createRequestId();
+    tidyRunning = { requestId, completed: 0, total: actorIds.length };
+    render();
+    send({ type: "start_tidy", chatId: timeline.chatId, requestId, actorIds });
+  }
   function renderActorRail(actors, minds) {
     const section = element("section", "lm-actor-rail-section");
     const heading = element("div", "lm-section-heading");
-    heading.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
+    const title = element("div", "lm-inline-actions");
+    title.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
+    const actions = element("div", "lm-inline-actions");
+    if (tidyRunning) {
+      actions.appendChild(textButton(`Cancel tidy ${tidyRunning.completed}/${tidyRunning.total}`, () => {
+        const timeline = currentState?.timeline;
+        if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: timeline.chatId, requestId: tidyRunning.requestId });
+      }, "quiet"));
+    } else {
+      const selected = actors.find((actor) => actor.id === selectedActorId) ?? null;
+      const tidySelected = textButton("Tidy selected", () => selected && void startTidy([selected.id], false), "quiet");
+      tidySelected.disabled = !selected || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      const tidyAll = textButton("Tidy all", () => void startTidy(actors.map((actor) => actor.id), true), "quiet");
+      tidyAll.disabled = !actors.length || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      const addNpc = textButton("Add NPC", () => void addNpcWizard(), "primary");
+      addNpc.disabled = !currentState?.permissions.generation;
+      actions.append(tidySelected, tidyAll, addNpc);
+    }
+    heading.append(title, actions);
     section.appendChild(heading);
     const rail = element("div", "lm-actor-rail");
     for (const actor of actors) {
@@ -1490,7 +1715,7 @@ function setup(ctx) {
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         const value = control.value.trim();
-        if (!value) {
+        if (!value && !options.allowEmpty) {
           control.setAttribute("aria-invalid", "true");
           control.focus();
           return;
@@ -1501,9 +1726,8 @@ function setup(ctx) {
       setTimeout(() => control.focus(), 0);
     });
   }
-  async function editCore(actor, mind, draft) {
-    const initial = draft ?? mind.core;
-    const modal = ctx.ui.showModal({ title: draft ? `${actor.canonicalName} \u2014 Review core draft` : `${actor.canonicalName} \u2014 Core`, width: 620, maxHeight: 760 });
+  async function showCoreEditor(actorName, initial, draft, onSave) {
+    const modal = ctx.ui.showModal({ title: draft ? `${actorName} \u2014 Review core draft` : `${actorName} \u2014 Core`, width: 620, maxHeight: 760 });
     const form = element("form", "lm-modal-form lm-core-form");
     if (draft) form.appendChild(element("div", "lm-seed-hint", "Generated from the lore you provided. Review every field; nothing changes until you save this core."));
     const selfConcept = textarea(initial.selfConcept, 5, "How this person understands themself\u2026");
@@ -1521,8 +1745,9 @@ function setup(ctx) {
       field("Notes", notes)
     );
     const actions = element("div", "lm-modal-actions");
-    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core"));
-    actions.lastElementChild.type = "submit";
+    const save = element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core");
+    save.type = "submit";
+    actions.append(textButton("Cancel", () => modal.dismiss()), save);
     form.appendChild(actions);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1534,28 +1759,40 @@ function setup(ctx) {
         boundaries: uniqueLines(boundaries.value),
         notes: uniqueLines(notes.value)
       };
-      const timeline = currentState?.timeline;
-      if (timeline) send({ type: "edit_core", chatId: timeline.chatId, actorId: actor.id, core });
-      modal.dismiss();
+      save.disabled = true;
+      save.textContent = "Saving\u2026";
+      void Promise.resolve(onSave(core)).then(() => modal.dismiss()).catch((error) => {
+        save.disabled = false;
+        save.textContent = draft ? "Save reviewed core" : "Save core";
+        showNotice("error", error instanceof Error ? error.message : "The NPC core could not be saved.");
+      });
     });
     modal.root.appendChild(form);
   }
-  async function generateNpcCore(actor) {
+  async function editCore(actor, mind, draft) {
+    await showCoreEditor(actor.canonicalName, draft ?? mind.core, !!draft, (core) => {
+      const timeline = currentState?.timeline;
+      if (!timeline) throw new Error("The active LumiMind timeline changed.");
+      send({ type: "edit_core", chatId: timeline.chatId, actorId: actor.id, core });
+    });
+  }
+  async function generateNpcCore(actor, suppliedLore) {
     if (actor.kind !== "npc" || npcCoreGenerating.has(actor.id)) return;
-    const lore = await promptText({
+    const lore = suppliedLore ?? await promptText({
       title: `${actor.canonicalName} \u2014 Generate core draft`,
-      label: "NPC lore",
-      placeholder: "Describe their background, personality, motivations, fears, values, and boundaries\u2026",
-      hint: "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
+      label: actor.cortexEntityId ? "Supplemental lore (optional)" : "NPC lore",
+      placeholder: actor.cortexEntityId ? "Add any characterization not already present in Cortex\u2026" : "Describe their background, personality, motivations, fears, values, and boundaries\u2026",
+      hint: actor.cortexEntityId ? "Cortex description and facts are included automatically. Supplemental lore is sent with them to the selected controller." : "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
       multiline: true,
-      confirmLabel: "Generate draft"
+      confirmLabel: "Generate draft",
+      allowEmpty: !!actor.cortexEntityId
     });
     const sourceTimeline = currentState?.timeline;
-    if (!lore || !sourceTimeline) return;
+    if (lore === null || !sourceTimeline) return;
     npcCoreGenerating.add(actor.id);
     showNotice("info", `Generating an enduring-frame draft for ${actor.canonicalName}\u2026`, 12e4);
     try {
-      const core = await requestNpcCoreDraft(sourceTimeline.chatId, actor.id, lore);
+      const core = await requestNpcCoreDraft({ chatId: sourceTimeline.chatId, actorId: actor.id, lore });
       const timeline = currentState?.timeline;
       const currentActor = timeline?.chatId === sourceTimeline.chatId ? timeline.actors.find((candidate) => candidate.id === actor.id) : null;
       const currentMind = currentActor && timeline ? timeline.minds[currentActor.id] : null;
@@ -1641,7 +1878,8 @@ function setup(ctx) {
     title.append(element("div", "lm-kicker", "Enduring frame"), element("h3", "lm-card-title", "Core self"));
     const actions = element("div", "lm-inline-actions");
     if (actor.kind === "npc") {
-      const generate = iconButton("spark", npcCoreGenerating.has(actor.id) ? "Generating core draft" : "Generate core draft from NPC lore", () => void generateNpcCore(actor));
+      const generate = textButton(npcCoreGenerating.has(actor.id) ? "Generating\u2026" : "Generate core", () => void generateNpcCore(actor), "quiet");
+      generate.title = actor.cortexEntityId ? "Generate from Cortex description and facts, plus optional notes" : "Generate a core draft from NPC lore";
       generate.disabled = npcCoreGenerating.has(actor.id) || !currentState?.permissions.generation;
       actions.appendChild(generate);
     }
@@ -1917,12 +2155,43 @@ function setup(ctx) {
     title.append(element("div", "lm-kicker", "Deterministic fold"), element("h2", "lm-view-title", "Change timeline"));
     const actions = element("div", "lm-inline-actions");
     actions.append(
+      textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary"),
       textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
       textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary")
     );
+    actions.firstElementChild.disabled = timeline.paused || timeline.pendingTurnCount === 0 || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
     heading.append(title, actions);
-    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} \xB7 last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
+    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} \xB7 ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} \xB7 last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
     container.appendChild(heading);
+    const updatePolicy = element("section", "lm-settings-card lm-update-policy");
+    updatePolicy.appendChild(element("h3", "lm-settings-title", "Timeline updates"));
+    updatePolicy.appendChild(element("p", "lm-settings-description", "Manual mode keeps injecting the last valid checkpoint but never starts background analysis. Update now processes all committed pending turns once."));
+    const mode = element("select", "lm-select");
+    for (const [value, label] of [["immediate", "After every completed turn"], ["lagged", "Keep recent turns pending"], ["manual", "Manual only"]]) {
+      const option = element("option", void 0, label);
+      option.value = value;
+      option.selected = timeline.updateMode === value;
+      mode.appendChild(option);
+    }
+    const lag = element("input", "lm-input");
+    lag.type = "number";
+    lag.min = "1";
+    lag.step = "1";
+    lag.value = String(Math.max(1, timeline.updateLagTurns || 1));
+    lag.disabled = timeline.updateMode !== "lagged";
+    mode.addEventListener("change", () => {
+      const selectedMode = mode.value;
+      send({ type: "set_update_policy", chatId: timeline.chatId, mode: selectedMode, lagTurns: selectedMode === "lagged" ? Math.max(1, Number(lag.value) || 1) : 0 });
+    });
+    lag.addEventListener("change", () => {
+      const turns = Math.max(1, Math.floor(Number(lag.value) || 1));
+      lag.value = String(turns);
+      send({ type: "set_update_policy", chatId: timeline.chatId, mode: "lagged", lagTurns: turns });
+    });
+    const policyGrid = element("div", "lm-settings-grid");
+    policyGrid.append(field("Update mode", mode), field("Pending turns", lag, "The newest completed turns held back from automatic analysis."));
+    updatePolicy.appendChild(policyGrid);
+    container.appendChild(updatePolicy);
     const feed = element("div", "lm-change-feed");
     const records = timeline.records.slice().reverse();
     for (const record of records.slice(0, 200)) {
@@ -2464,6 +2733,33 @@ function setup(ctx) {
       npcCoreDraftRequests.delete(message.requestId);
       if (message.type === "npc_core_draft") pending.resolve(message.core);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "npc_created" || message.type === "npc_create_error") {
+      const pending = npcCreateRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      npcCreateRequests.delete(message.requestId);
+      if (message.type === "npc_created") pending.resolve(message.actorId);
+      else pending.reject(new Error(message.message));
+    } else if (message.type === "tidy_progress") {
+      if (tidyRunning?.requestId !== message.requestId) return;
+      tidyRunning = { requestId: message.requestId, completed: message.completed, total: message.total };
+      render();
+    } else if (message.type === "tidy_result") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      render();
+      showTidyReview(message.requestId, message.proposals, message.errors);
+    } else if (message.type === "tidy_cancelled") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      render();
+      showNotice("info", "Mind Tidy was cancelled. No changes were applied.");
+    } else if (message.type === "tidy_applied") {
+      if (tidyReviewRequestId === message.requestId) tidyReviewModal?.dismiss();
+      showNotice("success", `Applied ${message.applied} tidy ${message.applied === 1 ? "change" : "changes"}.`);
+    } else if (message.type === "tidy_error") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      if (tidyReviewRequestId === message.requestId) tidyReviewModal?.dismiss();
+      render();
+      showNotice("error", message.message);
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -2519,6 +2815,15 @@ function setup(ctx) {
       pending.reject(new Error("LumiMind closed before the NPC core draft completed."));
     }
     npcCoreDraftRequests.clear();
+    for (const pending of npcCreateRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the NPC was saved."));
+    }
+    npcCreateRequests.clear();
+    if (tidyRunning && currentState?.timeline) {
+      send({ type: "cancel_tidy", chatId: currentState.timeline.chatId, requestId: tidyRunning.requestId });
+    }
+    tidyReviewModal?.dismiss();
     npcCoreGenerating.clear();
     destroySeedTab();
     while (cleanups.length) {

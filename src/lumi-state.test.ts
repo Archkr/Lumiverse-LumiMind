@@ -60,7 +60,7 @@ describe("LumiState mind publisher", () => {
       lastUpdatedMessageId: "message-1",
     };
 
-    const snapshot = makeMindLumiStateSnapshot(timeline, DEFAULT_SETTINGS, "0.1.1", 2000);
+    const snapshot = makeMindLumiStateSnapshot(timeline, DEFAULT_SETTINGS, "0.2.0", 2000);
     expect(snapshot).toMatchObject({ chatId: "chat-1", revision: 8, freshness: "fresh" });
     expect(snapshot.state.cast[0]).toMatchObject({
       name: "Mira",
@@ -75,6 +75,6 @@ describe("LumiState mind publisher", () => {
   test("marks pending timelines stale", () => {
     const timeline = createTimeline("chat-1");
     timeline.health = "pending";
-    expect(makeMindLumiStateSnapshot(timeline, DEFAULT_SETTINGS, "0.1.1").freshness).toBe("stale");
+    expect(makeMindLumiStateSnapshot(timeline, DEFAULT_SETTINGS, "0.2.0").freshness).toBe("stale");
   });
 });

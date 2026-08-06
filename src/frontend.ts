@@ -14,6 +14,8 @@ import type {
   MindItem,
   MindItemStatus,
   MindSeedV1,
+  MindTidyActorError,
+  MindTidyProposal,
   TimelineDatabaseArchiveV1,
   TimelineImportMode,
 } from "./types";
@@ -208,6 +210,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     timeout: ReturnType<typeof setTimeout>;
   }>();
   const npcCoreGenerating = new Set<string>();
+  const npcCreateRequests = new Map<string, {
+    resolve: (actorId: string) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
+  let tidyRunning: { requestId: string; completed: number; total: number } | null = null;
+  let tidyReviewModal: ReturnType<SpindleFrontendContext["ui"]["showModal"]> | null = null;
+  let tidyReviewRequestId: string | null = null;
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise: Promise<LumiMindSettings> | null = null;
@@ -548,7 +558,14 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     });
   }
 
-  function requestNpcCoreDraft(chatId: string, actorId: string, lore: string): Promise<MindCore> {
+  function requestNpcCoreDraft(input: {
+    chatId: string;
+    actorId?: string;
+    name?: string;
+    aliases?: string[];
+    cortexEntityId?: string | null;
+    lore?: string;
+  }): Promise<MindCore> {
     const requestId = createRequestId();
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -556,7 +573,25 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         reject(new Error("The NPC core draft request timed out."));
       }, 120_000);
       npcCoreDraftRequests.set(requestId, { resolve, reject, timeout });
-      send({ type: "generate_npc_core", chatId, actorId, lore, requestId });
+      send({ type: "generate_npc_core", ...input, requestId });
+    });
+  }
+
+  function requestNpcCreate(input: {
+    chatId: string;
+    name: string;
+    aliases: string[];
+    cortexEntityId?: string | null;
+    core: MindCore;
+  }): Promise<string> {
+    const requestId = createRequestId();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        npcCreateRequests.delete(requestId);
+        reject(new Error("Saving the NPC timed out."));
+      }, 30_000);
+      npcCreateRequests.set(requestId, { resolve, reject, timeout });
+      send({ type: "create_npc", ...input, requestId });
     });
   }
 
@@ -921,12 +956,19 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     copy.appendChild(element("strong", undefined, healthLabel(timeline.health)));
     const detail = timeline.error
       ?? (timeline.health === "paused"
-        ? "Automatic analysis is paused. The last valid checkpoint remains available for injection."
-        : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
+        ? "Analysis and private mind injection are paused."
+        : timeline.health === "waiting"
+          ? `${timeline.pendingTurnCount} completed ${timeline.pendingTurnCount === 1 ? "turn is" : "turns are"} waiting. The last valid checkpoint remains available for injection.`
+          : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
     copy.appendChild(element("span", undefined, detail));
     const actions = element("div", "lm-inline-actions");
     if (timeline.health === "error") {
       actions.appendChild(textButton("Retry", () => send({ type: "retry", chatId: timeline.chatId }), "quiet"));
+    }
+    if (timeline.pendingTurnCount > 0 && !timeline.paused) {
+      const updateNow = textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary");
+      updateNow.disabled = !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      actions.appendChild(updateNow);
     }
     actions.appendChild(textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"));
     panel.append(pulse, copy, actions);
@@ -975,10 +1017,219 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     return panel;
   }
 
+  async function addNpcWizard(): Promise<void> {
+    const timeline = currentState?.timeline;
+    if (!timeline?.active) {
+      showNotice("warning", "Activate this LumiMind timeline before adding an NPC.");
+      return;
+    }
+    const cortexActors = timeline.actors.filter((actor) => actor.kind === "npc" && !!actor.cortexEntityId);
+    const modal = ctx.ui.showModal({ title: "Add or enrich an NPC", width: 560, maxHeight: 720 });
+    const form = element("form", "lm-modal-form");
+    const source = element("select", "lm-select");
+    const fresh = element("option", undefined, "New local NPC");
+    fresh.value = "";
+    source.appendChild(fresh);
+    for (const actor of cortexActors) {
+      const option = element("option", undefined, `Cortex · ${actor.canonicalName}`);
+      option.value = actor.id;
+      source.appendChild(option);
+    }
+    const name = input("", "NPC name");
+    const aliases = textarea("", 3, "One alias per line");
+    const lore = textarea("", 8, "Background, personality, motivations, fears, values, and boundaries…");
+    const syncSource = () => {
+      const actor = timeline.actors.find((candidate) => candidate.id === source.value) ?? null;
+      name.value = actor?.canonicalName ?? "";
+      aliases.value = actor?.aliases.join("\n") ?? "";
+      name.disabled = !!actor;
+      aliases.disabled = !!actor;
+      lore.placeholder = actor
+        ? "Optional notes to supplement this character's Cortex description and facts…"
+        : "Background, personality, motivations, fears, values, and boundaries…";
+    };
+    source.addEventListener("change", syncSource);
+    form.append(
+      field("Source", source, cortexActors.length ? "Choose a Cortex character or stage a new local NPC." : "No Cortex characters are currently linked to this timeline."),
+      field("Name", name),
+      field("Aliases", aliases),
+      field("Lore", lore, "Generation creates a draft only. The actor is not created or changed until you save the reviewed core."),
+    );
+    const actions = element("div", "lm-modal-actions");
+    const generate = element("button", "lm-button lm-button-primary", "Generate core draft");
+    generate.type = "submit";
+    actions.append(textButton("Cancel", () => modal.dismiss()), generate);
+    form.appendChild(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const cortexActor = timeline.actors.find((candidate) => candidate.id === source.value) ?? null;
+      const npcName = (cortexActor?.canonicalName ?? name.value).trim();
+      const npcLore = lore.value.trim();
+      if (!npcName || (!cortexActor && !npcLore)) {
+        showNotice("warning", cortexActor ? "That Cortex actor is unavailable." : "A name and lore are required for a new NPC.");
+        return;
+      }
+      generate.disabled = true;
+      generate.textContent = "Generating…";
+      void (async () => {
+        if (cortexActor) {
+          modal.dismiss();
+          await generateNpcCore(cortexActor, npcLore);
+          return;
+        }
+        const npcAliases = uniqueLines(aliases.value);
+        const core = await requestNpcCoreDraft({
+          chatId: timeline.chatId,
+          name: npcName,
+          aliases: npcAliases,
+          lore: npcLore,
+        });
+        modal.dismiss();
+        showNotice("success", "NPC core draft ready for review. The NPC has not been created yet.");
+        await showCoreEditor(npcName, core, true, async (reviewedCore) => {
+          const actorId = await requestNpcCreate({
+            chatId: timeline.chatId,
+            name: npcName,
+            aliases: npcAliases,
+            core: reviewedCore,
+          });
+          selectedActorId = actorId;
+          showNotice("success", `${npcName} was added to this timeline.`);
+        });
+      })().catch((error) => {
+        generate.disabled = false;
+        generate.textContent = "Generate core draft";
+        showNotice("error", error instanceof Error ? error.message : "The NPC core draft could not be generated.");
+      });
+    });
+    modal.root.appendChild(form);
+    setTimeout(() => name.focus(), 0);
+  }
+
+  function tidyProposalSummary(proposal: MindTidyProposal): string {
+    if (proposal.operation === "replace_core") {
+      const core = proposal.core;
+      if (!core) return "Replace core";
+      return [core.selfConcept, ...core.values, ...core.desires, ...core.fears, ...core.boundaries, ...core.notes].filter(Boolean).join(" · ");
+    }
+    if (proposal.item) return `${categoryLabel(proposal.item.category)} · ${proposal.item.status} · ${proposal.item.text}`;
+    return `${proposal.operation === "remove_items" ? "Remove" : proposal.operation} ${proposal.targetItemIds.length} ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}`;
+  }
+
+  function tidyBeforeAfter(proposal: MindTidyProposal): { before: string; after: string } {
+    const mind = currentState?.timeline?.minds[proposal.actorId];
+    if (proposal.operation === "replace_core") {
+      const summarize = (core: MindCore | null | undefined) => core
+        ? [core.selfConcept, ...core.values, ...core.desires, ...core.fears, ...core.boundaries, ...core.notes].filter(Boolean).join(" · ") || "Empty core"
+        : "Empty core";
+      return { before: summarize(mind?.core), after: summarize(proposal.core) };
+    }
+    const affected = proposal.targetItemIds
+      .map((itemId) => mind?.items.find((item) => item.id === itemId))
+      .filter((item): item is MindItem => !!item)
+      .map((item) => `${categoryLabel(item.category)} · ${item.status} · ${item.text}`);
+    const after = proposal.item
+      ? `${categoryLabel(proposal.item.category)} · ${proposal.item.status} · ${proposal.item.text}`
+      : proposal.operation === "remove_items" ? "Removed" : "No replacement";
+    return {
+      before: affected.length ? affected.join("\n") : "Missing entry",
+      after,
+    };
+  }
+
+  function showTidyReview(requestId: string, proposals: MindTidyProposal[], errors: MindTidyActorError[]): void {
+    tidyReviewModal?.dismiss();
+    const modal = ctx.ui.showModal({ title: "Review Mind Tidy", width: 760, maxHeight: 820 });
+    tidyReviewModal = modal;
+    tidyReviewRequestId = requestId;
+    const content = element("div", "lm-modal-form lm-tidy-review");
+    content.appendChild(element("div", "lm-seed-hint", "Nothing changes until you apply selected findings. Accepted entry changes become locked manual overrides; core changes remain timeline-local."));
+    const selected = new Set<string>();
+    for (const proposal of proposals) {
+      selected.add(proposal.id);
+      const row = element("label", "lm-tidy-proposal");
+      const checkbox = element("input") as HTMLInputElement;
+      checkbox.type = "checkbox";
+      checkbox.checked = true;
+      checkbox.addEventListener("change", () => checkbox.checked ? selected.add(proposal.id) : selected.delete(proposal.id));
+      const copy = element("div", "lm-tidy-proposal-copy");
+      const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === proposal.actorId);
+      const comparison = tidyBeforeAfter(proposal);
+      copy.append(
+        element("strong", undefined, `${actor?.canonicalName ?? "Actor"} · ${proposal.finding}`),
+        element("p", undefined, tidyProposalSummary(proposal)),
+        element("small", "lm-tidy-value", `Before: ${comparison.before}`),
+        element("small", "lm-tidy-value", `After: ${comparison.after}`),
+        element("small", "lm-tidy-affected", `${proposal.targetItemIds.length} affected ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}`),
+        element("small", undefined, `${Math.round(proposal.confidence * 100)}% confidence · ${proposal.rationale}`),
+      );
+      row.append(checkbox, copy);
+      content.appendChild(row);
+    }
+    if (!proposals.length) content.appendChild(element("div", "lm-empty-inline", "No cleanup changes were proposed."));
+    for (const error of errors) {
+      const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === error.actorId);
+      content.appendChild(element("div", "lm-seed-hint warning", `${actor?.canonicalName ?? "Actor"}: ${error.message}`));
+    }
+    const actions = element("div", "lm-modal-actions");
+    const apply = element("button", "lm-button lm-button-primary", "Apply selected");
+    apply.type = "button";
+    apply.disabled = proposals.length === 0;
+    apply.addEventListener("click", () => {
+      if (!selected.size || !currentState?.timeline) return;
+      apply.disabled = true;
+      apply.textContent = "Applying…";
+      send({ type: "apply_tidy", chatId: currentState.timeline.chatId, requestId, proposalIds: [...selected] });
+    });
+    actions.append(textButton("Close", () => modal.dismiss()), apply);
+    content.appendChild(actions);
+    modal.onDismiss(() => {
+      if (tidyReviewModal === modal) tidyReviewModal = null;
+      if (tidyReviewRequestId === requestId) tidyReviewRequestId = null;
+    });
+    modal.root.appendChild(content);
+  }
+
+  async function startTidy(actorIds: string[], all: boolean): Promise<void> {
+    const timeline = currentState?.timeline;
+    if (!timeline || tidyRunning || !actorIds.length) return;
+    if (all) {
+      const result = await ctx.ui.showConfirm({
+        title: `Tidy ${actorIds.length} minds?`,
+        message: `This will make ${actorIds.length} sequential controller ${actorIds.length === 1 ? "request" : "requests"}, one per managed actor. You can cancel the remaining scan at any time.`,
+        variant: "warning",
+        confirmLabel: "Start tidy",
+      });
+      if (!result.confirmed) return;
+    }
+    const requestId = createRequestId();
+    tidyRunning = { requestId, completed: 0, total: actorIds.length };
+    render();
+    send({ type: "start_tidy", chatId: timeline.chatId, requestId, actorIds });
+  }
+
   function renderActorRail(actors: ActorRecord[], minds: Record<string, ActorMind>): HTMLElement {
     const section = element("section", "lm-actor-rail-section");
     const heading = element("div", "lm-section-heading");
-    heading.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
+    const title = element("div", "lm-inline-actions");
+    title.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
+    const actions = element("div", "lm-inline-actions");
+    if (tidyRunning) {
+      actions.appendChild(textButton(`Cancel tidy ${tidyRunning.completed}/${tidyRunning.total}`, () => {
+        const timeline = currentState?.timeline;
+        if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: timeline.chatId, requestId: tidyRunning.requestId });
+      }, "quiet"));
+    } else {
+      const selected = actors.find((actor) => actor.id === selectedActorId) ?? null;
+      const tidySelected = textButton("Tidy selected", () => selected && void startTidy([selected.id], false), "quiet");
+      tidySelected.disabled = !selected || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      const tidyAll = textButton("Tidy all", () => void startTidy(actors.map((actor) => actor.id), true), "quiet");
+      tidyAll.disabled = !actors.length || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
+      const addNpc = textButton("Add NPC", () => void addNpcWizard(), "primary");
+      addNpc.disabled = !currentState?.permissions.generation;
+      actions.append(tidySelected, tidyAll, addNpc);
+    }
+    heading.append(title, actions);
     section.appendChild(heading);
     const rail = element("div", "lm-actor-rail");
     for (const actor of actors) {
@@ -1007,6 +1258,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     hint?: string;
     multiline?: boolean;
     confirmLabel?: string;
+    allowEmpty?: boolean;
   }): Promise<string | null> {
     return new Promise((resolve) => {
       const modal = ctx.ui.showModal({ title: options.title, width: 480, maxHeight: 620 });
@@ -1032,7 +1284,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         const value = control.value.trim();
-        if (!value) {
+        if (!value && !options.allowEmpty) {
           control.setAttribute("aria-invalid", "true");
           control.focus();
           return;
@@ -1044,9 +1296,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     });
   }
 
-  async function editCore(actor: ActorRecord, mind: ActorMind, draft?: MindCore): Promise<void> {
-    const initial = draft ?? mind.core;
-    const modal = ctx.ui.showModal({ title: draft ? `${actor.canonicalName} — Review core draft` : `${actor.canonicalName} — Core`, width: 620, maxHeight: 760 });
+  async function showCoreEditor(
+    actorName: string,
+    initial: MindCore,
+    draft: boolean,
+    onSave: (core: MindCore) => void | Promise<void>,
+  ): Promise<void> {
+    const modal = ctx.ui.showModal({ title: draft ? `${actorName} — Review core draft` : `${actorName} — Core`, width: 620, maxHeight: 760 });
     const form = element("form", "lm-modal-form lm-core-form");
     if (draft) form.appendChild(element("div", "lm-seed-hint", "Generated from the lore you provided. Review every field; nothing changes until you save this core."));
     const selfConcept = textarea(initial.selfConcept, 5, "How this person understands themself…");
@@ -1064,8 +1320,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       field("Notes", notes),
     );
     const actions = element("div", "lm-modal-actions");
-    actions.append(textButton("Cancel", () => modal.dismiss()), element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core"));
-    (actions.lastElementChild as HTMLButtonElement).type = "submit";
+    const save = element("button", "lm-button lm-button-primary", draft ? "Save reviewed core" : "Save core");
+    save.type = "submit";
+    actions.append(textButton("Cancel", () => modal.dismiss()), save);
     form.appendChild(actions);
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1077,30 +1334,47 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         boundaries: uniqueLines(boundaries.value),
         notes: uniqueLines(notes.value),
       };
-      const timeline = currentState?.timeline;
-      if (timeline) send({ type: "edit_core", chatId: timeline.chatId, actorId: actor.id, core });
-      modal.dismiss();
+      save.disabled = true;
+      save.textContent = "Saving…";
+      void Promise.resolve(onSave(core)).then(() => modal.dismiss()).catch((error) => {
+        save.disabled = false;
+        save.textContent = draft ? "Save reviewed core" : "Save core";
+        showNotice("error", error instanceof Error ? error.message : "The NPC core could not be saved.");
+      });
     });
     modal.root.appendChild(form);
   }
 
-  async function generateNpcCore(actor: ActorRecord): Promise<void> {
+  async function editCore(actor: ActorRecord, mind: ActorMind, draft?: MindCore): Promise<void> {
+    await showCoreEditor(actor.canonicalName, draft ?? mind.core, !!draft, (core) => {
+      const timeline = currentState?.timeline;
+      if (!timeline) throw new Error("The active LumiMind timeline changed.");
+      send({ type: "edit_core", chatId: timeline.chatId, actorId: actor.id, core });
+    });
+  }
+
+  async function generateNpcCore(actor: ActorRecord, suppliedLore?: string): Promise<void> {
     if (actor.kind !== "npc" || npcCoreGenerating.has(actor.id)) return;
-    const lore = await promptText({
+    const lore = suppliedLore ?? await promptText({
       title: `${actor.canonicalName} — Generate core draft`,
-      label: "NPC lore",
-      placeholder: "Describe their background, personality, motivations, fears, values, and boundaries…",
-      hint: "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
+      label: actor.cortexEntityId ? "Supplemental lore (optional)" : "NPC lore",
+      placeholder: actor.cortexEntityId
+        ? "Add any characterization not already present in Cortex…"
+        : "Describe their background, personality, motivations, fears, values, and boundaries…",
+      hint: actor.cortexEntityId
+        ? "Cortex description and facts are included automatically. Supplemental lore is sent with them to the selected controller."
+        : "This lore is sent to the selected LumiMind controller. The generated enduring frame remains editable and is not saved automatically.",
       multiline: true,
       confirmLabel: "Generate draft",
+      allowEmpty: !!actor.cortexEntityId,
     });
     const sourceTimeline = currentState?.timeline;
-    if (!lore || !sourceTimeline) return;
+    if (lore === null || !sourceTimeline) return;
 
     npcCoreGenerating.add(actor.id);
     showNotice("info", `Generating an enduring-frame draft for ${actor.canonicalName}…`, 120_000);
     try {
-      const core = await requestNpcCoreDraft(sourceTimeline.chatId, actor.id, lore);
+      const core = await requestNpcCoreDraft({ chatId: sourceTimeline.chatId, actorId: actor.id, lore });
       const timeline = currentState?.timeline;
       const currentActor = timeline?.chatId === sourceTimeline.chatId
         ? timeline.actors.find((candidate) => candidate.id === actor.id)
@@ -1191,7 +1465,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     title.append(element("div", "lm-kicker", "Enduring frame"), element("h3", "lm-card-title", "Core self"));
     const actions = element("div", "lm-inline-actions");
     if (actor.kind === "npc") {
-      const generate = iconButton("spark", npcCoreGenerating.has(actor.id) ? "Generating core draft" : "Generate core draft from NPC lore", () => void generateNpcCore(actor));
+      const generate = textButton(npcCoreGenerating.has(actor.id) ? "Generating…" : "Generate core", () => void generateNpcCore(actor), "quiet");
+      generate.title = actor.cortexEntityId ? "Generate from Cortex description and facts, plus optional notes" : "Generate a core draft from NPC lore";
       generate.disabled = npcCoreGenerating.has(actor.id) || !currentState?.permissions.generation;
       actions.appendChild(generate);
     }
@@ -1480,12 +1755,43 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     title.append(element("div", "lm-kicker", "Deterministic fold"), element("h2", "lm-view-title", "Change timeline"));
     const actions = element("div", "lm-inline-actions");
     actions.append(
+      textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary"),
       textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
       textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
     );
+    (actions.firstElementChild as HTMLButtonElement).disabled = timeline.paused || timeline.pendingTurnCount === 0 || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
     heading.append(title, actions);
-    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} · last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
+    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} · ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} · last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
     container.appendChild(heading);
+    const updatePolicy = element("section", "lm-settings-card lm-update-policy");
+    updatePolicy.appendChild(element("h3", "lm-settings-title", "Timeline updates"));
+    updatePolicy.appendChild(element("p", "lm-settings-description", "Manual mode keeps injecting the last valid checkpoint but never starts background analysis. Update now processes all committed pending turns once."));
+    const mode = element("select", "lm-select");
+    for (const [value, label] of [["immediate", "After every completed turn"], ["lagged", "Keep recent turns pending"], ["manual", "Manual only"]] as const) {
+      const option = element("option", undefined, label);
+      option.value = value;
+      option.selected = timeline.updateMode === value;
+      mode.appendChild(option);
+    }
+    const lag = element("input", "lm-input") as HTMLInputElement;
+    lag.type = "number";
+    lag.min = "1";
+    lag.step = "1";
+    lag.value = String(Math.max(1, timeline.updateLagTurns || 1));
+    lag.disabled = timeline.updateMode !== "lagged";
+    mode.addEventListener("change", () => {
+      const selectedMode = mode.value as typeof timeline.updateMode;
+      send({ type: "set_update_policy", chatId: timeline.chatId, mode: selectedMode, lagTurns: selectedMode === "lagged" ? Math.max(1, Number(lag.value) || 1) : 0 });
+    });
+    lag.addEventListener("change", () => {
+      const turns = Math.max(1, Math.floor(Number(lag.value) || 1));
+      lag.value = String(turns);
+      send({ type: "set_update_policy", chatId: timeline.chatId, mode: "lagged", lagTurns: turns });
+    });
+    const policyGrid = element("div", "lm-settings-grid");
+    policyGrid.append(field("Update mode", mode), field("Pending turns", lag, "The newest completed turns held back from automatic analysis."));
+    updatePolicy.appendChild(policyGrid);
+    container.appendChild(updatePolicy);
     const feed = element("div", "lm-change-feed");
     const records = timeline.records.slice().reverse();
     for (const record of records.slice(0, 200)) {
@@ -2045,6 +2351,33 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       npcCoreDraftRequests.delete(message.requestId);
       if (message.type === "npc_core_draft") pending.resolve(message.core);
       else pending.reject(new Error(message.message));
+    } else if (message.type === "npc_created" || message.type === "npc_create_error") {
+      const pending = npcCreateRequests.get(message.requestId);
+      if (!pending) return;
+      clearTimeout(pending.timeout);
+      npcCreateRequests.delete(message.requestId);
+      if (message.type === "npc_created") pending.resolve(message.actorId);
+      else pending.reject(new Error(message.message));
+    } else if (message.type === "tidy_progress") {
+      if (tidyRunning?.requestId !== message.requestId) return;
+      tidyRunning = { requestId: message.requestId, completed: message.completed, total: message.total };
+      render();
+    } else if (message.type === "tidy_result") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      render();
+      showTidyReview(message.requestId, message.proposals, message.errors);
+    } else if (message.type === "tidy_cancelled") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      render();
+      showNotice("info", "Mind Tidy was cancelled. No changes were applied.");
+    } else if (message.type === "tidy_applied") {
+      if (tidyReviewRequestId === message.requestId) tidyReviewModal?.dismiss();
+      showNotice("success", `Applied ${message.applied} tidy ${message.applied === 1 ? "change" : "changes"}.`);
+    } else if (message.type === "tidy_error") {
+      if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
+      if (tidyReviewRequestId === message.requestId) tidyReviewModal?.dismiss();
+      render();
+      showNotice("error", message.message);
     } else if (message.type === "seed_draft") {
       if (message.characterId === seedCharacterId) {
         const next = normalizeMindSeed(message.seed);
@@ -2103,6 +2436,15 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       pending.reject(new Error("LumiMind closed before the NPC core draft completed."));
     }
     npcCoreDraftRequests.clear();
+    for (const pending of npcCreateRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("LumiMind closed before the NPC was saved."));
+    }
+    npcCreateRequests.clear();
+    if (tidyRunning && currentState?.timeline) {
+      send({ type: "cancel_tidy", chatId: currentState.timeline.chatId, requestId: tidyRunning.requestId });
+    }
+    tidyReviewModal?.dismiss();
     npcCoreGenerating.clear();
     destroySeedTab();
     while (cleanups.length) {

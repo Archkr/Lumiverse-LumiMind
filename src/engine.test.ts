@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
+  applyMindTidyProposals,
   analysisPolicyHash,
   buildDirectorMindInjection,
   buildMindInjection,
@@ -11,6 +12,7 @@ import {
   compactStateForController,
   confirmActor,
   createCheckpointTimeline,
+  createOrUpdateNpc,
   createTimeline,
   limitChatHistoryMessages,
   makeBaseMind,
@@ -29,7 +31,9 @@ import {
   reconcileCortexIdentities,
   removeActor,
   resolveActorId,
+  countPendingCompletedTurns,
   selectCompletedAssistantTranscript,
+  selectTranscriptBeforeTurnLag,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
   splitActor,
@@ -951,5 +955,113 @@ describe("hashing, settings, and compaction", () => {
     expect(injection).toContain("Mira");
     expect(injection).not.toContain("A wary scout who watches every doorway");
     expect(injection).not.toContain("The Director (character");
+  });
+});
+
+describe("0.2.0 timeline controls and maintenance", () => {
+  it("holds complete turns for lagged updates and counts the pending suffix", () => {
+    const messages = [
+      message("u1", 0, "First user"),
+      message("a1", 1, "First assistant"),
+      message("u2", 2, "Second user"),
+      message("a2", 3, "Second assistant"),
+      message("u3", 4, "Third user"),
+      message("a3", 5, "Third assistant"),
+    ];
+    expect(selectTranscriptBeforeTurnLag(messages, 1).map((entry) => entry.id)).toEqual(["u1", "a1", "u2", "a2"]);
+    expect(selectTranscriptBeforeTurnLag(messages, 2).map((entry) => entry.id)).toEqual(["u1", "a1"]);
+    expect(selectTranscriptBeforeTurnLag(messages, 8)).toEqual([]);
+    expect(countPendingCompletedTurns(messages, 2)).toBe(2);
+  });
+
+  it("keeps paused timelines paused while still reporting completed pending turns", () => {
+    const timeline = createTimeline("paused");
+    timeline.active = true;
+    timeline.paused = true;
+    rebuildTimeline(timeline, [
+      { id: "u1", role: "user", content: "Hello" },
+      { id: "a1", role: "assistant", content: "Welcome" },
+      { id: "u2", role: "user", content: "Wait" },
+    ]);
+    expect(timeline.health).toBe("paused");
+    expect(timeline.pendingTurnCount).toBe(1);
+  });
+
+  it("migrates legacy timelines to immediate updates and preserves policy in checkpoints", () => {
+    const source = createTimeline("source");
+    const legacy = JSON.parse(JSON.stringify(source)) as Record<string, unknown>;
+    delete legacy.updateMode;
+    delete legacy.updateLagTurns;
+    delete legacy.pendingTurnCount;
+    expect(normalizeTimeline(legacy, "source")).toMatchObject({ updateMode: "immediate", updateLagTurns: 0, pendingTurnCount: 0 });
+    expect(normalizeTimeline({ ...legacy, updateMode: "lagged", updateLagTurns: 0 }, "source"))
+      .toMatchObject({ updateMode: "lagged", updateLagTurns: 1 });
+
+    source.updateMode = "lagged";
+    source.updateLagTurns = 4;
+    const checkpoint = createCheckpointTimeline(source, "sequel");
+    expect(checkpoint).toMatchObject({ updateMode: "lagged", updateLagTurns: 4, pendingTurnCount: 0 });
+  });
+
+  it("creates staged NPCs only once and rejects ambiguous identity collisions", () => {
+    const timeline = createTimeline("chat");
+    const core = makeEmptySeed({ selfConcept: "A cautious courier" }).core;
+    const created = createOrUpdateNpc(timeline, { name: "Mira", aliases: ["Scout"], core });
+    expect(created).toMatchObject({ kind: "npc", canonicalName: "Mira", confirmed: true, present: false });
+    expect(timeline.baseMinds[created.id].core.selfConcept).toBe("A cautious courier");
+
+    const updated = createOrUpdateNpc(timeline, { name: "Mira", aliases: ["Captain"], core: { ...core, selfConcept: "A veteran courier" } });
+    expect(updated.id).toBe(created.id);
+    expect(Object.keys(timeline.actors)).toHaveLength(1);
+    expect(updated.aliases).toEqual(["Scout", "Captain"]);
+
+    upsertActor(timeline, { kind: "npc", name: "Rin", aliases: ["Shared"] });
+    created.aliases.push("Shared");
+    expect(() => createOrUpdateNpc(timeline, { name: "Shared", core })).toThrow("matches multiple existing actors");
+  });
+
+  it("applies every accepted tidy operation as protected user-owned state", () => {
+    const timeline = createTimeline("tidy");
+    timeline.active = true;
+    const actor = upsertActor(timeline, { kind: "npc", name: "Mira" });
+    addManualItem(timeline, actor.id, "goal", "Reach the city");
+    addManualItem(timeline, actor.id, "emotion", "Uneasy about the road");
+    addManualItem(timeline, actor.id, "belief", "The bridge is unsafe");
+    addManualItem(timeline, actor.id, "belief", "The old bridge is dangerous");
+    timeline.manualOverrides[0].item!.pinned = false;
+    timeline.manualOverrides[2].item!.pinned = false;
+    timeline.manualOverrides[3].item!.pinned = false;
+    rebuildTimeline(timeline, []);
+    const [goal, emotion, duplicateOne, duplicateTwo] = timeline.minds[actor.id].items;
+    const item = (category: typeof goal.category, text: string) => ({
+      category,
+      text,
+      status: "active" as const,
+      targetActorIds: [],
+      concealedFromActorIds: [],
+      intensity: null,
+      dimensions: {},
+    });
+    const common = { actorId: actor.id, rationale: "Reviewed cleanup", confidence: 0.9 };
+    const applied = applyMindTidyProposals(timeline, [
+      { ...common, id: "core", finding: "missing", operation: "replace_core", targetItemIds: [], core: makeEmptySeed({ selfConcept: "A determined courier" }).core, item: null },
+      { ...common, id: "add", finding: "missing", operation: "add_item", targetItemIds: [], core: null, item: item("plan", "Take the eastern road") },
+      { ...common, id: "update", finding: "mislabeled", operation: "update_item", targetItemIds: [goal.id], core: null, item: item("plan", "Travel to the city by dawn") },
+      { ...common, id: "merge", finding: "duplicate", operation: "merge_items", targetItemIds: [duplicateOne.id, duplicateTwo.id], core: null, item: item("belief", "The old bridge is unsafe") },
+      { ...common, id: "remove", finding: "outdated", operation: "remove_items", targetItemIds: [emotion.id], core: null, item: null },
+    ]);
+    expect(applied).toBe(5);
+    rebuildTimeline(timeline, []);
+    expect(timeline.minds[actor.id].core.selfConcept).toBe("A determined courier");
+    expect(timeline.minds[actor.id].items.map((entry) => entry.text)).toEqual(expect.arrayContaining([
+      "Take the eastern road",
+      "Travel to the city by dawn",
+      "The old bridge is unsafe",
+    ]));
+    expect(timeline.minds[actor.id].items.some((entry) => entry.text === "Uneasy about the road")).toBe(false);
+    expect(timeline.minds[actor.id].items.filter((entry) => entry.text === "The old bridge is unsafe")).toHaveLength(1);
+    expect(timeline.minds[actor.id].items.every((entry) => entry.locked && entry.source === "manual")).toBe(true);
+    expect(timeline.minds[actor.id].items.find((entry) => entry.text === "Travel to the city by dawn")?.pinned).toBe(false);
+    expect(timeline.minds[actor.id].items.find((entry) => entry.text === "The old bridge is unsafe")?.pinned).toBe(true);
   });
 });

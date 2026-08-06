@@ -13,6 +13,8 @@ import {
   type TokenMeasurement,
 } from "./engine";
 import type {
+  ActorMind,
+  ActorRecord,
   ChatMessageLike,
   ControllerBatchTelemetry,
   ControllerActorMention,
@@ -27,6 +29,8 @@ import type {
   MindCore,
   MindOperation,
   MindSeedV1,
+  MindTidyItemDraft,
+  MindTidyProposal,
 } from "./types";
 
 const THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
@@ -588,6 +592,47 @@ const SEED_SCHEMA: Record<string, unknown> = {
   required: ["schemaVersion", "core", "startingBeliefs", "startingSecrets", "startingGoals", "relationshipPriors", "updatedAt"],
 };
 
+const TIDY_ITEM_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    category: { type: "string", enum: [...MIND_CATEGORIES] },
+    text: { type: "string" },
+    status: { type: "string", enum: ["active", "resolved", "abandoned", "uncertain"] },
+    targetActorIds: { type: "array", items: { type: "string" } },
+    concealedFromActorIds: { type: "array", items: { type: "string" } },
+    intensity: { anyOf: [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }] },
+    dimensions: { type: "object", additionalProperties: { type: "number", minimum: -1, maximum: 1 } },
+  },
+  required: ["category", "text", "status", "targetActorIds", "concealedFromActorIds", "intensity", "dimensions"],
+};
+
+const TIDY_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    proposals: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          actorId: { type: "string" },
+          finding: { type: "string", enum: ["missing", "mislabeled", "outdated", "duplicate", "inconsistent"] },
+          operation: { type: "string", enum: ["replace_core", "add_item", "update_item", "merge_items", "remove_items"] },
+          rationale: { type: "string" },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          targetItemIds: { type: "array", items: { type: "string" } },
+          core: { anyOf: [CORE_SCHEMA, { type: "null" }] },
+          item: { anyOf: [TIDY_ITEM_SCHEMA, { type: "null" }] },
+        },
+        required: ["actorId", "finding", "operation", "rationale", "confidence", "targetItemIds", "core", "item"],
+      },
+    },
+  },
+  required: ["proposals"],
+};
+
 function toolChoiceParameters(provider: string | null): Record<string, unknown> {
   const normalized = provider?.trim().toLocaleLowerCase() ?? "";
   if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
@@ -1036,4 +1081,147 @@ export async function generateNpcCoreDraft(input: {
     throw new Error("The LumiMind controller returned an empty NPC core draft.");
   }
   return core;
+}
+
+export function composeNpcCoreLore(description: string, facts: string[], notes = ""): string {
+  const sections: string[] = [];
+  const cleanDescription = description.trim();
+  const cleanFacts = uniqueStrings(facts);
+  const cleanNotes = notes.trim();
+  if (cleanDescription) sections.push(`Cortex description:\n${cleanDescription}`);
+  if (cleanFacts.length) sections.push(`Cortex facts:\n${cleanFacts.map((fact) => `- ${fact}`).join("\n")}`);
+  if (cleanNotes) sections.push(`${sections.length ? "User-provided supplemental lore" : "User-provided lore"}:\n${cleanNotes}`);
+  return sections.join("\n\n");
+}
+
+const TIDY_SYSTEM_PROMPT = [
+  "You review one actor's complete current LumiMind checkpoint and return optional cleanup proposals for explicit human approval.",
+  "Call the required result tool exactly once. Do not directly rewrite state and do not propose identity, alias, actor-merge, or Cortex-link changes.",
+  "Use replace_core only for a complete improved enduring core; do not place temporary scene state in the core.",
+  "Use add_item for strongly supported missing state, update_item for one existing entry, merge_items for two or more semantic duplicates, and remove_items only for entries that should not remain in the ledger.",
+  "A status change or category correction is an update_item. Copy actor and item IDs exactly. Preserve target, concealment, intensity, and dimensions unless the evidence supports changing them.",
+  "Locked, manual, seed, and pinned entries may be flagged because a human will review every proposal, but explain clearly why changing protected material is warranted.",
+  "Use the stored evidence and recent context only. Do not infer unsupported events or claim that this is a full-history audit.",
+].join("\n");
+
+function normalizeTidyItem(value: unknown, knownActorIds: Set<string>): MindTidyItemDraft | null {
+  const raw = asObject(value);
+  const normalizedCategory = category(raw.category);
+  const normalizedText = text(raw.text);
+  const normalizedStatus = raw.status === "active" || raw.status === "resolved" || raw.status === "abandoned" || raw.status === "uncertain"
+    ? raw.status
+    : null;
+  if (!normalizedCategory || !normalizedText || !normalizedStatus) return null;
+  const dimensions: Record<string, number> = {};
+  for (const [key, entry] of Object.entries(asObject(raw.dimensions))) {
+    dimensions[key] = Math.min(1, Math.max(-1, numberValue(entry, 0)));
+  }
+  const targetActorIds = uniqueStrings(stringArray(raw.targetActorIds));
+  const concealedFromActorIds = uniqueStrings(stringArray(raw.concealedFromActorIds));
+  if (targetActorIds.some((id) => !knownActorIds.has(id)) || concealedFromActorIds.some((id) => !knownActorIds.has(id))) return null;
+  return {
+    category: normalizedCategory,
+    text: normalizedText,
+    status: normalizedStatus,
+    targetActorIds,
+    concealedFromActorIds,
+    intensity: raw.intensity === null || raw.intensity === undefined ? null : Math.min(1, Math.max(0, numberValue(raw.intensity, 0.5))),
+    dimensions,
+  };
+}
+
+export async function generateMindTidyProposals(input: {
+  actor: ActorRecord;
+  mind: ActorMind;
+  knownActors: ActorRecord[];
+  recentContext: ChatMessageLike[];
+  settings: LumiMindSettings;
+  userId: string;
+  fallbackConnectionId?: string | null;
+  signal?: AbortSignal;
+}): Promise<MindTidyProposal[]> {
+  const knownActorIds = new Set(input.knownActors.map((actor) => actor.id));
+  const itemIds = new Set(input.mind.items.map((item) => item.id));
+  const statePayload = {
+    actor: {
+      id: input.actor.id,
+      name: input.actor.canonicalName,
+      aliases: input.actor.aliases,
+      kind: input.actor.kind,
+      confirmed: input.actor.confirmed,
+    },
+    core: input.mind.core,
+    items: input.mind.items,
+    knownActors: input.knownActors.map((actor) => ({ id: actor.id, name: actor.canonicalName, aliases: actor.aliases })),
+  };
+  const stateJson = JSON.stringify(statePayload);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
+  const stateMeasurement = await countTextTokens(stateJson, connection, input.userId);
+  if (input.settings.analysisStateTokenBudget > 0 && stateMeasurement.totalTokens > input.settings.analysisStateTokenBudget) {
+    throw new Error(
+      `This actor needs ${stateMeasurement.totalTokens.toLocaleString()} state tokens, above the ${input.settings.analysisStateTokenBudget.toLocaleString()} tidy limit. Increase Analysis state tokens or set it to 0.`,
+    );
+  }
+  const prompt = [
+    "Actor registry and complete current checkpoint:",
+    `<tidy_state>\n${stateJson}\n</tidy_state>`,
+    "Recent committed context (supporting context only):",
+    `<recent_context>\n${renderMessages(input.recentContext)}\n</recent_context>`,
+    "Return only meaningful proposals. An empty proposals array is correct when the checkpoint is already coherent.",
+  ].join("\n\n");
+  const result = await quietJson(
+    prompt,
+    TIDY_SYSTEM_PROMPT,
+    "lumi_mind_tidy_v1",
+    TIDY_SCHEMA,
+    input.settings,
+    input.userId,
+    input.fallbackConnectionId,
+    connection,
+    input.signal,
+  );
+  input.signal?.throwIfAborted();
+  const raw = asObject(result.parsed);
+  if (!Array.isArray(raw.proposals)) throw new Error("The LumiMind controller returned an invalid tidy result.");
+  return raw.proposals.flatMap((entry) => {
+    const proposal = asObject(entry);
+    if (text(proposal.actorId) !== input.actor.id) return [];
+    const finding = proposal.finding === "missing" || proposal.finding === "mislabeled" || proposal.finding === "outdated" || proposal.finding === "duplicate" || proposal.finding === "inconsistent"
+      ? proposal.finding
+      : null;
+    const operation = proposal.operation === "replace_core" || proposal.operation === "add_item" || proposal.operation === "update_item" || proposal.operation === "merge_items" || proposal.operation === "remove_items"
+      ? proposal.operation
+      : null;
+    const rationale = text(proposal.rationale);
+    if (!finding || !operation || !rationale) return [];
+    const rawTargetItemIds = uniqueStrings(stringArray(proposal.targetItemIds));
+    if (rawTargetItemIds.some((id) => !itemIds.has(id))) return [];
+    const targetItemIds = rawTargetItemIds;
+    const rawCore = asObject(proposal.core);
+    const core = operation === "replace_core" && Object.keys(rawCore).length ? normalizeCore(rawCore) : null;
+    const item = operation === "add_item" || operation === "update_item" || operation === "merge_items"
+      ? normalizeTidyItem(proposal.item, knownActorIds)
+      : null;
+    const valid = operation === "replace_core"
+      ? !!core && targetItemIds.length === 0
+      : operation === "add_item"
+        ? !!item && targetItemIds.length === 0
+        : operation === "update_item"
+          ? !!item && targetItemIds.length === 1
+          : operation === "merge_items"
+            ? !!item && targetItemIds.length >= 2
+            : targetItemIds.length > 0;
+    if (!valid) return [];
+    return [{
+      id: `tidy:${crypto.randomUUID()}`,
+      actorId: input.actor.id,
+      finding,
+      operation,
+      rationale,
+      confidence: Math.min(1, Math.max(0, numberValue(proposal.confidence, 0.75))),
+      targetItemIds,
+      core,
+      item,
+    } satisfies MindTidyProposal];
+  });
 }

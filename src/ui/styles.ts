@@ -140,7 +140,7 @@ export const LUMI_MIND_CSS = `
 .lm-quality-marker { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border:1px solid color-mix(in srgb,var(--lm-warning) 45%,var(--lm-line)); border-radius:50%; color:var(--lm-warning); background:color-mix(in srgb,var(--lm-warning) 10%,transparent); font-size:10px; font-weight:850; }
 .lm-quality-dismiss { position:absolute; top:5px; right:5px; }
 
-.lm-section-heading { display:flex; align-items:center; gap:6px; margin-bottom:7px; }
+.lm-section-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
 .lm-section-title { color:var(--lm-muted); font-size:10px; font-weight:750; letter-spacing:.09em; text-transform:uppercase; }
 .lm-count { min-width:18px; padding:1px 5px; border-radius:999px; color:var(--lm-dim); background:var(--lm-fill); text-align:center; font-size:9px; }
 .lm-actor-rail { display:flex; gap:7px; overflow-x:auto; scrollbar-width:none; padding-bottom:2px; }
@@ -270,6 +270,15 @@ export const LUMI_MIND_CSS = `
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
 .lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
 .lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
+.lm-tidy-review { gap:9px; }
+.lm-tidy-proposal { display:grid; grid-template-columns:auto minmax(0,1fr); gap:9px; align-items:start; padding:10px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); cursor:pointer; }
+.lm-tidy-proposal input { margin-top:3px; accent-color:var(--lm-accent); }
+.lm-tidy-proposal-copy { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.lm-tidy-proposal-copy strong { font-size:10px; text-transform:capitalize; }
+.lm-tidy-proposal-copy p { color:var(--lm-text); font-size:10px; line-height:1.45; overflow-wrap:anywhere; }
+.lm-tidy-proposal-copy small { color:var(--lm-muted); font-size:9px; line-height:1.4; }
+.lm-tidy-value { white-space:pre-line; }
+.lm-tidy-affected { color:var(--lm-accent) !important; }
 
 .lm-diagnostics { display:flex; flex-direction:column; gap:12px; color:var(--lm-text); }
 .lm-diagnostics-intro { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:linear-gradient(135deg,var(--lm-accent-muted),var(--lm-fill)); }

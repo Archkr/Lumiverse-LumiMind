@@ -21,6 +21,8 @@ import {
   type MindItemStatus,
   type MindReductionTelemetry,
   type MindSeedV1,
+  type MindTidyItemDraft,
+  type MindTidyProposal,
   type PrivateSceneSnapshotV1,
   type PublicSceneSnapshotV1,
   type TimelineView,
@@ -263,6 +265,23 @@ export function selectCompletedAssistantTranscript(messages: ChatMessageLike[]):
   return lastAssistantIndex < 0 ? [] : sorted.slice(0, lastAssistantIndex + 1);
 }
 
+/** Hold back the newest completed assistant turns without splitting a turn. */
+export function selectTranscriptBeforeTurnLag(messages: ChatMessageLike[], lagTurns: number): ChatMessageLike[] {
+  const completed = selectCompletedAssistantTranscript(messages);
+  const lag = Number.isFinite(lagTurns) ? Math.max(0, Math.floor(lagTurns)) : 0;
+  if (lag === 0) return completed;
+  const assistantIndexes = completed.flatMap((message, index) => message.role === "assistant" ? [index] : []);
+  const eligibleAssistantCount = assistantIndexes.length - lag;
+  if (eligibleAssistantCount <= 0) return [];
+  return completed.slice(0, assistantIndexes[eligibleAssistantCount - 1] + 1);
+}
+
+export function countPendingCompletedTurns(messages: ChatMessageLike[], firstMissingIndex: number): number {
+  const completed = selectCompletedAssistantTranscript(messages);
+  const start = Math.min(completed.length, Math.max(0, Math.floor(firstMissingIndex)));
+  return completed.slice(start).filter((message) => message.role === "assistant").length;
+}
+
 export function selectAnalysisWorkBatch(
   messages: ChatMessageLike[],
   start: number,
@@ -402,6 +421,9 @@ export function createTimeline(chatId: string): ChatTimelineV1 {
     analysisPolicyHash: analysisPolicyHash(DEFAULT_SETTINGS),
     active: false,
     paused: false,
+    updateMode: "immediate",
+    updateLagTurns: 0,
+    pendingTurnCount: 0,
     revision: 0,
     health: "inactive",
     error: null,
@@ -431,7 +453,7 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
     return [id, actor];
   }));
-  return {
+  const normalized: ChatTimelineV1 = {
     ...fallback,
     ...(raw as unknown as Partial<ChatTimelineV1>),
     schemaVersion: MIND_SCHEMA_VERSION,
@@ -439,6 +461,9 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     analysisPolicyHash: stringValue(raw.analysisPolicyHash, analysisPolicyHash(DEFAULT_SETTINGS)),
     active: raw.active === true,
     paused: raw.paused === true,
+    updateMode: raw.updateMode === "lagged" || raw.updateMode === "manual" ? raw.updateMode : "immediate",
+    updateLagTurns: Math.round(clamp(raw.updateLagTurns, 0, Number.MAX_SAFE_INTEGER, 0)),
+    pendingTurnCount: Math.round(clamp(raw.pendingTurnCount, 0, Number.MAX_SAFE_INTEGER, 0)),
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
     actors,
     suppressedCortexEntityIds: uniqueStrings(
@@ -453,6 +478,8 @@ export function normalizeTimeline(value: unknown, chatId: string): ChatTimelineV
     lastValidMessageIndex: Math.round(clamp(raw.lastValidMessageIndex, -1, Number.MAX_SAFE_INTEGER, -1)),
     updatedAt: Math.round(clamp(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, Date.now())),
   };
+  if (normalized.updateMode === "lagged") normalized.updateLagTurns = Math.max(1, normalized.updateLagTurns);
+  return normalized;
 }
 
 function actorNames(actor: ActorRecord): string[] {
@@ -511,6 +538,48 @@ export function upsertActor(
   }
   timeline.actors[actor.id] = actor;
   timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  return actor;
+}
+
+export function createOrUpdateNpc(timeline: ChatTimelineV1, input: {
+  name: string;
+  aliases?: string[];
+  cortexEntityId?: string | null;
+  core: MindCore;
+}): ActorRecord {
+  const name = input.name.trim();
+  if (!name) throw new Error("NPC name is required.");
+  const aliases = uniqueStrings(input.aliases ?? []).filter((alias) => alias.toLocaleLowerCase() !== name.toLocaleLowerCase());
+  const references = new Set([name, ...aliases].map((value) => value.toLocaleLowerCase()));
+  const matches = Object.values(timeline.actors).filter((actor) =>
+    (input.cortexEntityId && actor.cortexEntityId === input.cortexEntityId) || actorNames(actor).some((value) => references.has(value)),
+  );
+  const uniqueMatches = [...new Map(matches.map((actor) => [actor.id, actor])).values()];
+  if (uniqueMatches.length > 1) throw new Error("That NPC name or alias matches multiple existing actors. Resolve the identity conflict first.");
+  let actor = uniqueMatches[0] ?? null;
+  if (actor && actor.kind !== "npc") throw new Error("That identity already belongs to a character card or persona.");
+  if (actor?.cortexEntityId && input.cortexEntityId && actor.cortexEntityId !== input.cortexEntityId) {
+    throw new Error("That NPC is already linked to a different Cortex identity.");
+  }
+  if (!actor) {
+    actor = createActor({
+      kind: "npc",
+      name,
+      aliases,
+      cortexEntityId: input.cortexEntityId ?? null,
+      confidence: 1,
+      confirmed: true,
+    });
+    timeline.actors[actor.id] = actor;
+  } else {
+    actor.aliases = uniqueStrings([...actor.aliases, ...aliases, ...(actor.canonicalName.toLocaleLowerCase() !== name.toLocaleLowerCase() ? [name] : [])]);
+    actor.cortexEntityId ??= input.cortexEntityId ?? null;
+    actor.confirmed = true;
+    actor.confidence = 1;
+    actor.updatedAt = Date.now();
+  }
+  timeline.baseMinds[actor.id] ??= makeBaseMind(actor.id);
+  timeline.baseMinds[actor.id].core = normalizeCore(input.core);
   return actor;
 }
 
@@ -630,6 +699,9 @@ export function createCheckpointTimeline(source: ChatTimelineV1, targetChatId: s
   checkpoint.analysisPolicyHash = source.analysisPolicyHash;
   checkpoint.active = true;
   checkpoint.paused = false;
+  checkpoint.updateMode = source.updateMode;
+  checkpoint.updateLagTurns = source.updateLagTurns;
+  checkpoint.pendingTurnCount = 0;
   checkpoint.health = "ready";
   checkpoint.actors = Object.fromEntries(Object.entries(source.actors).map(([actorId, actor]) => [actorId, {
     ...actor,
@@ -910,6 +982,7 @@ export function rebuildTimeline(timeline: ChatTimelineV1, rawMessages: ChatMessa
   applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : (messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1);
+  timeline.pendingTurnCount = countPendingCompletedTurns(messages, firstMissingIndex);
   if (!timeline.active) timeline.health = "inactive";
   else if (timeline.paused) timeline.health = "paused";
   else if (firstMissingIndex < messages.length) timeline.health = "stale";
@@ -1083,26 +1156,43 @@ export function materializeSkippedAnalysisRecords(
   ).map((record) => ({ ...record, skipReason }));
 }
 
-export function addManualItem(timeline: ChatTimelineV1, actorId: string, category: MindCategory, text: string): void {
+function manualItemFromDraft(actorId: string, draft: MindTidyItemDraft, pinned = true): MindItem {
   const now = Date.now();
-  const item: MindItem = {
+  return {
     id: `manual:${crypto.randomUUID()}`,
-    category,
-    text: text.trim(),
-    status: "active",
+    category: draft.category,
+    text: draft.text.trim(),
+    status: draft.status,
     confidence: 1,
-    targetActorIds: [],
-    concealedFromActorIds: [],
-    intensity: category === "emotion" ? 0.7 : null,
-    dimensions: {},
+    targetActorIds: uniqueStrings(draft.targetActorIds),
+    concealedFromActorIds: uniqueStrings(draft.concealedFromActorIds),
+    intensity: draft.intensity,
+    dimensions: { ...draft.dimensions },
     evidence: { messageId: "manual", swipeId: 0, excerpt: "User-authored", messageIndex: -1 },
     locked: true,
-    pinned: true,
+    pinned,
     source: "manual",
     createdAt: now,
     updatedAt: now,
   };
+}
+
+export function addManualItemDraft(timeline: ChatTimelineV1, actorId: string, draft: MindTidyItemDraft): void {
+  const item = manualItemFromDraft(actorId, draft);
+  const now = item.createdAt;
   timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "upsert", item, targetItemId: null, createdAt: now });
+}
+
+export function addManualItem(timeline: ChatTimelineV1, actorId: string, category: MindCategory, text: string): void {
+  addManualItemDraft(timeline, actorId, {
+    category,
+    text,
+    status: "active",
+    targetActorIds: [],
+    concealedFromActorIds: [],
+    intensity: category === "emotion" ? 0.7 : null,
+    dimensions: {},
+  });
 }
 
 export function overrideItem(
@@ -1122,6 +1212,66 @@ export function overrideItem(
 
 export function removeManualItem(timeline: ChatTimelineV1, actorId: string, itemId: string): void {
   timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "remove", item: null, targetItemId: itemId, createdAt: Date.now() });
+}
+
+export function applyMindTidyProposals(timeline: ChatTimelineV1, proposals: MindTidyProposal[]): number {
+  let applied = 0;
+  for (const proposal of proposals) {
+    const actor = timeline.actors[proposal.actorId];
+    const mind = timeline.minds[proposal.actorId];
+    const baseMind = timeline.baseMinds[proposal.actorId];
+    if (!actor || !mind || !baseMind) continue;
+    if (proposal.operation === "replace_core" && proposal.core) {
+      baseMind.core = normalizeCore(proposal.core);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "add_item" && proposal.item?.text.trim()) {
+      addManualItemDraft(timeline, proposal.actorId, proposal.item);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "update_item" && proposal.item && proposal.targetItemIds.length === 1) {
+      const targetId = proposal.targetItemIds[0];
+      if (overrideItem(timeline, proposal.actorId, targetId, (item) => ({
+        ...item,
+        ...proposal.item!,
+        text: proposal.item!.text.trim(),
+        targetActorIds: uniqueStrings(proposal.item!.targetActorIds),
+        concealedFromActorIds: uniqueStrings(proposal.item!.concealedFromActorIds),
+        dimensions: { ...proposal.item!.dimensions },
+        locked: true,
+      }))) applied += 1;
+      continue;
+    }
+    if (proposal.operation === "merge_items" && proposal.item && proposal.targetItemIds.length >= 2) {
+      const targets = proposal.targetItemIds
+        .map((id) => mind.items.find((item) => item.id === id))
+        .filter((item): item is MindItem => !!item);
+      if (targets.length !== proposal.targetItemIds.length) continue;
+      const [kept, ...removed] = targets;
+      if (!overrideItem(timeline, proposal.actorId, kept.id, (item) => ({
+        ...item,
+        ...proposal.item!,
+        text: proposal.item!.text.trim(),
+        targetActorIds: uniqueStrings(proposal.item!.targetActorIds),
+        concealedFromActorIds: uniqueStrings(proposal.item!.concealedFromActorIds),
+        dimensions: { ...proposal.item!.dimensions },
+        locked: true,
+        pinned: true,
+      }))) continue;
+      for (const item of removed) removeManualItem(timeline, proposal.actorId, item.id);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "remove_items" && proposal.targetItemIds.length > 0) {
+      const targetIds = proposal.targetItemIds.filter((id) => mind.items.some((item) => item.id === id));
+      if (targetIds.length !== proposal.targetItemIds.length) continue;
+      for (const itemId of targetIds) removeManualItem(timeline, proposal.actorId, itemId);
+      applied += 1;
+    }
+  }
+  return applied;
 }
 
 export function mergeActors(
@@ -1379,6 +1529,9 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
     chatId: timeline.chatId,
     active: timeline.active,
     paused: timeline.paused,
+    updateMode: timeline.updateMode,
+    updateLagTurns: timeline.updateLagTurns,
+    pendingTurnCount: timeline.pendingTurnCount,
     revision: timeline.revision,
     health: timeline.health,
     error: timeline.error,

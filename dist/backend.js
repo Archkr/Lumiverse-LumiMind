@@ -188,6 +188,20 @@ function selectCompletedAssistantTranscript(messages) {
   }
   return lastAssistantIndex < 0 ? [] : sorted.slice(0, lastAssistantIndex + 1);
 }
+function selectTranscriptBeforeTurnLag(messages, lagTurns) {
+  const completed = selectCompletedAssistantTranscript(messages);
+  const lag = Number.isFinite(lagTurns) ? Math.max(0, Math.floor(lagTurns)) : 0;
+  if (lag === 0) return completed;
+  const assistantIndexes = completed.flatMap((message, index) => message.role === "assistant" ? [index] : []);
+  const eligibleAssistantCount = assistantIndexes.length - lag;
+  if (eligibleAssistantCount <= 0) return [];
+  return completed.slice(0, assistantIndexes[eligibleAssistantCount - 1] + 1);
+}
+function countPendingCompletedTurns(messages, firstMissingIndex) {
+  const completed = selectCompletedAssistantTranscript(messages);
+  const start = Math.min(completed.length, Math.max(0, Math.floor(firstMissingIndex)));
+  return completed.slice(start).filter((message) => message.role === "assistant").length;
+}
 function selectAnalysisWorkBatch(messages, start, maxMessages, settings) {
   const first = messages[start];
   if (!first) return { messages: [], skipReason: null };
@@ -298,6 +312,9 @@ function createTimeline(chatId) {
     analysisPolicyHash: analysisPolicyHash(DEFAULT_SETTINGS),
     active: false,
     paused: false,
+    updateMode: "immediate",
+    updateLagTurns: 0,
+    pendingTurnCount: 0,
     revision: 0,
     health: "inactive",
     error: null,
@@ -325,7 +342,7 @@ function normalizeTimeline(value, chatId) {
     if (actor.kind === "persona" && !actor.personaId) actor.kind = "npc";
     return [id, actor];
   }));
-  return {
+  const normalized = {
     ...fallback,
     ...raw,
     schemaVersion: MIND_SCHEMA_VERSION,
@@ -333,6 +350,9 @@ function normalizeTimeline(value, chatId) {
     analysisPolicyHash: stringValue(raw.analysisPolicyHash, analysisPolicyHash(DEFAULT_SETTINGS)),
     active: raw.active === true,
     paused: raw.paused === true,
+    updateMode: raw.updateMode === "lagged" || raw.updateMode === "manual" ? raw.updateMode : "immediate",
+    updateLagTurns: Math.round(clamp(raw.updateLagTurns, 0, Number.MAX_SAFE_INTEGER, 0)),
+    pendingTurnCount: Math.round(clamp(raw.pendingTurnCount, 0, Number.MAX_SAFE_INTEGER, 0)),
     revision: Math.round(clamp(raw.revision, 0, Number.MAX_SAFE_INTEGER, 0)),
     actors,
     suppressedCortexEntityIds: uniqueStrings(
@@ -345,6 +365,8 @@ function normalizeTimeline(value, chatId) {
     lastValidMessageIndex: Math.round(clamp(raw.lastValidMessageIndex, -1, Number.MAX_SAFE_INTEGER, -1)),
     updatedAt: Math.round(clamp(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, Date.now()))
   };
+  if (normalized.updateMode === "lagged") normalized.updateLagTurns = Math.max(1, normalized.updateLagTurns);
+  return normalized;
 }
 function actorNames(actor) {
   return [actor.canonicalName, ...actor.aliases].map((name) => name.trim().toLocaleLowerCase()).filter(Boolean);
@@ -390,6 +412,42 @@ function upsertActor(timeline, input, evidence) {
   }
   timeline.actors[actor.id] = actor;
   timeline.baseMinds[actor.id] = makeBaseMind(actor.id);
+  return actor;
+}
+function createOrUpdateNpc(timeline, input) {
+  const name = input.name.trim();
+  if (!name) throw new Error("NPC name is required.");
+  const aliases = uniqueStrings(input.aliases ?? []).filter((alias) => alias.toLocaleLowerCase() !== name.toLocaleLowerCase());
+  const references = new Set([name, ...aliases].map((value) => value.toLocaleLowerCase()));
+  const matches = Object.values(timeline.actors).filter(
+    (actor2) => input.cortexEntityId && actor2.cortexEntityId === input.cortexEntityId || actorNames(actor2).some((value) => references.has(value))
+  );
+  const uniqueMatches = [...new Map(matches.map((actor2) => [actor2.id, actor2])).values()];
+  if (uniqueMatches.length > 1) throw new Error("That NPC name or alias matches multiple existing actors. Resolve the identity conflict first.");
+  let actor = uniqueMatches[0] ?? null;
+  if (actor && actor.kind !== "npc") throw new Error("That identity already belongs to a character card or persona.");
+  if (actor?.cortexEntityId && input.cortexEntityId && actor.cortexEntityId !== input.cortexEntityId) {
+    throw new Error("That NPC is already linked to a different Cortex identity.");
+  }
+  if (!actor) {
+    actor = createActor({
+      kind: "npc",
+      name,
+      aliases,
+      cortexEntityId: input.cortexEntityId ?? null,
+      confidence: 1,
+      confirmed: true
+    });
+    timeline.actors[actor.id] = actor;
+  } else {
+    actor.aliases = uniqueStrings([...actor.aliases, ...aliases, ...actor.canonicalName.toLocaleLowerCase() !== name.toLocaleLowerCase() ? [name] : []]);
+    actor.cortexEntityId ??= input.cortexEntityId ?? null;
+    actor.confirmed = true;
+    actor.confidence = 1;
+    actor.updatedAt = Date.now();
+  }
+  timeline.baseMinds[actor.id] ??= makeBaseMind(actor.id);
+  timeline.baseMinds[actor.id].core = normalizeCore(input.core);
   return actor;
 }
 function attachCortexIdentity(actor, identity) {
@@ -486,6 +544,9 @@ function createCheckpointTimeline(source, targetChatId) {
   checkpoint.analysisPolicyHash = source.analysisPolicyHash;
   checkpoint.active = true;
   checkpoint.paused = false;
+  checkpoint.updateMode = source.updateMode;
+  checkpoint.updateLagTurns = source.updateLagTurns;
+  checkpoint.pendingTurnCount = 0;
   checkpoint.health = "ready";
   checkpoint.actors = Object.fromEntries(Object.entries(source.actors).map(([actorId, actor]) => [actorId, {
     ...actor,
@@ -723,6 +784,7 @@ function rebuildTimeline(timeline, rawMessages) {
   applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1;
+  timeline.pendingTurnCount = countPendingCompletedTurns(messages, firstMissingIndex);
   if (!timeline.active) timeline.health = "inactive";
   else if (timeline.paused) timeline.health = "paused";
   else if (firstMissingIndex < messages.length) timeline.health = "stale";
@@ -870,26 +932,41 @@ function materializeSkippedAnalysisRecords(timeline, batchMessages, startingPref
     { connectionId: null, provider: null, model: null }
   ).map((record) => ({ ...record, skipReason }));
 }
-function addManualItem(timeline, actorId, category2, text2) {
+function manualItemFromDraft(actorId, draft, pinned = true) {
   const now = Date.now();
-  const item = {
+  return {
     id: `manual:${crypto.randomUUID()}`,
-    category: category2,
-    text: text2.trim(),
-    status: "active",
+    category: draft.category,
+    text: draft.text.trim(),
+    status: draft.status,
     confidence: 1,
-    targetActorIds: [],
-    concealedFromActorIds: [],
-    intensity: category2 === "emotion" ? 0.7 : null,
-    dimensions: {},
+    targetActorIds: uniqueStrings(draft.targetActorIds),
+    concealedFromActorIds: uniqueStrings(draft.concealedFromActorIds),
+    intensity: draft.intensity,
+    dimensions: { ...draft.dimensions },
     evidence: { messageId: "manual", swipeId: 0, excerpt: "User-authored", messageIndex: -1 },
     locked: true,
-    pinned: true,
+    pinned,
     source: "manual",
     createdAt: now,
     updatedAt: now
   };
+}
+function addManualItemDraft(timeline, actorId, draft) {
+  const item = manualItemFromDraft(actorId, draft);
+  const now = item.createdAt;
   timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "upsert", item, targetItemId: null, createdAt: now });
+}
+function addManualItem(timeline, actorId, category2, text2) {
+  addManualItemDraft(timeline, actorId, {
+    category: category2,
+    text: text2,
+    status: "active",
+    targetActorIds: [],
+    concealedFromActorIds: [],
+    intensity: category2 === "emotion" ? 0.7 : null,
+    dimensions: {}
+  });
 }
 function overrideItem(timeline, actorId, itemId, mutate) {
   const current = timeline.minds[actorId]?.items.find((item2) => item2.id === itemId);
@@ -902,6 +979,63 @@ function overrideItem(timeline, actorId, itemId, mutate) {
 }
 function removeManualItem(timeline, actorId, itemId) {
   timeline.manualOverrides.push({ id: `override:${crypto.randomUUID()}`, actorId, operation: "remove", item: null, targetItemId: itemId, createdAt: Date.now() });
+}
+function applyMindTidyProposals(timeline, proposals) {
+  let applied = 0;
+  for (const proposal of proposals) {
+    const actor = timeline.actors[proposal.actorId];
+    const mind = timeline.minds[proposal.actorId];
+    const baseMind = timeline.baseMinds[proposal.actorId];
+    if (!actor || !mind || !baseMind) continue;
+    if (proposal.operation === "replace_core" && proposal.core) {
+      baseMind.core = normalizeCore(proposal.core);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "add_item" && proposal.item?.text.trim()) {
+      addManualItemDraft(timeline, proposal.actorId, proposal.item);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "update_item" && proposal.item && proposal.targetItemIds.length === 1) {
+      const targetId = proposal.targetItemIds[0];
+      if (overrideItem(timeline, proposal.actorId, targetId, (item) => ({
+        ...item,
+        ...proposal.item,
+        text: proposal.item.text.trim(),
+        targetActorIds: uniqueStrings(proposal.item.targetActorIds),
+        concealedFromActorIds: uniqueStrings(proposal.item.concealedFromActorIds),
+        dimensions: { ...proposal.item.dimensions },
+        locked: true
+      }))) applied += 1;
+      continue;
+    }
+    if (proposal.operation === "merge_items" && proposal.item && proposal.targetItemIds.length >= 2) {
+      const targets = proposal.targetItemIds.map((id) => mind.items.find((item) => item.id === id)).filter((item) => !!item);
+      if (targets.length !== proposal.targetItemIds.length) continue;
+      const [kept, ...removed] = targets;
+      if (!overrideItem(timeline, proposal.actorId, kept.id, (item) => ({
+        ...item,
+        ...proposal.item,
+        text: proposal.item.text.trim(),
+        targetActorIds: uniqueStrings(proposal.item.targetActorIds),
+        concealedFromActorIds: uniqueStrings(proposal.item.concealedFromActorIds),
+        dimensions: { ...proposal.item.dimensions },
+        locked: true,
+        pinned: true
+      }))) continue;
+      for (const item of removed) removeManualItem(timeline, proposal.actorId, item.id);
+      applied += 1;
+      continue;
+    }
+    if (proposal.operation === "remove_items" && proposal.targetItemIds.length > 0) {
+      const targetIds = proposal.targetItemIds.filter((id) => mind.items.some((item) => item.id === id));
+      if (targetIds.length !== proposal.targetItemIds.length) continue;
+      for (const itemId of targetIds) removeManualItem(timeline, proposal.actorId, itemId);
+      applied += 1;
+    }
+  }
+  return applied;
 }
 function mergeActors(timeline, sourceActorId, targetActorId, cortexLink) {
   const source = timeline.actors[sourceActorId];
@@ -1079,6 +1213,9 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
     chatId: timeline.chatId,
     active: timeline.active,
     paused: timeline.paused,
+    updateMode: timeline.updateMode,
+    updateLagTurns: timeline.updateLagTurns,
+    pendingTurnCount: timeline.pendingTurnCount,
     revision: timeline.revision,
     health: timeline.health,
     error: timeline.error,
@@ -1811,6 +1948,45 @@ var SEED_SCHEMA = {
   },
   required: ["schemaVersion", "core", "startingBeliefs", "startingSecrets", "startingGoals", "relationshipPriors", "updatedAt"]
 };
+var TIDY_ITEM_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    category: { type: "string", enum: [...MIND_CATEGORIES] },
+    text: { type: "string" },
+    status: { type: "string", enum: ["active", "resolved", "abandoned", "uncertain"] },
+    targetActorIds: { type: "array", items: { type: "string" } },
+    concealedFromActorIds: { type: "array", items: { type: "string" } },
+    intensity: { anyOf: [{ type: "number", minimum: 0, maximum: 1 }, { type: "null" }] },
+    dimensions: { type: "object", additionalProperties: { type: "number", minimum: -1, maximum: 1 } }
+  },
+  required: ["category", "text", "status", "targetActorIds", "concealedFromActorIds", "intensity", "dimensions"]
+};
+var TIDY_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    proposals: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          actorId: { type: "string" },
+          finding: { type: "string", enum: ["missing", "mislabeled", "outdated", "duplicate", "inconsistent"] },
+          operation: { type: "string", enum: ["replace_core", "add_item", "update_item", "merge_items", "remove_items"] },
+          rationale: { type: "string" },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          targetItemIds: { type: "array", items: { type: "string" } },
+          core: { anyOf: [CORE_SCHEMA, { type: "null" }] },
+          item: { anyOf: [TIDY_ITEM_SCHEMA, { type: "null" }] }
+        },
+        required: ["actorId", "finding", "operation", "rationale", "confidence", "targetItemIds", "core", "item"]
+      }
+    }
+  },
+  required: ["proposals"]
+};
 function toolChoiceParameters(provider) {
   const normalized = provider?.trim().toLocaleLowerCase() ?? "";
   if (normalized === "google" || normalized === "gemini" || normalized === "google_vertex") {
@@ -2180,6 +2356,127 @@ ${boundedLore}
   }
   return core;
 }
+function composeNpcCoreLore(description, facts, notes = "") {
+  const sections = [];
+  const cleanDescription = description.trim();
+  const cleanFacts = uniqueStrings(facts);
+  const cleanNotes = notes.trim();
+  if (cleanDescription) sections.push(`Cortex description:
+${cleanDescription}`);
+  if (cleanFacts.length) sections.push(`Cortex facts:
+${cleanFacts.map((fact) => `- ${fact}`).join("\n")}`);
+  if (cleanNotes) sections.push(`${sections.length ? "User-provided supplemental lore" : "User-provided lore"}:
+${cleanNotes}`);
+  return sections.join("\n\n");
+}
+var TIDY_SYSTEM_PROMPT = [
+  "You review one actor's complete current LumiMind checkpoint and return optional cleanup proposals for explicit human approval.",
+  "Call the required result tool exactly once. Do not directly rewrite state and do not propose identity, alias, actor-merge, or Cortex-link changes.",
+  "Use replace_core only for a complete improved enduring core; do not place temporary scene state in the core.",
+  "Use add_item for strongly supported missing state, update_item for one existing entry, merge_items for two or more semantic duplicates, and remove_items only for entries that should not remain in the ledger.",
+  "A status change or category correction is an update_item. Copy actor and item IDs exactly. Preserve target, concealment, intensity, and dimensions unless the evidence supports changing them.",
+  "Locked, manual, seed, and pinned entries may be flagged because a human will review every proposal, but explain clearly why changing protected material is warranted.",
+  "Use the stored evidence and recent context only. Do not infer unsupported events or claim that this is a full-history audit."
+].join("\n");
+function normalizeTidyItem(value, knownActorIds) {
+  const raw = asObject2(value);
+  const normalizedCategory = category(raw.category);
+  const normalizedText = text(raw.text);
+  const normalizedStatus = raw.status === "active" || raw.status === "resolved" || raw.status === "abandoned" || raw.status === "uncertain" ? raw.status : null;
+  if (!normalizedCategory || !normalizedText || !normalizedStatus) return null;
+  const dimensions = {};
+  for (const [key, entry] of Object.entries(asObject2(raw.dimensions))) {
+    dimensions[key] = Math.min(1, Math.max(-1, numberValue(entry, 0)));
+  }
+  const targetActorIds = uniqueStrings(stringArray(raw.targetActorIds));
+  const concealedFromActorIds = uniqueStrings(stringArray(raw.concealedFromActorIds));
+  if (targetActorIds.some((id) => !knownActorIds.has(id)) || concealedFromActorIds.some((id) => !knownActorIds.has(id))) return null;
+  return {
+    category: normalizedCategory,
+    text: normalizedText,
+    status: normalizedStatus,
+    targetActorIds,
+    concealedFromActorIds,
+    intensity: raw.intensity === null || raw.intensity === void 0 ? null : Math.min(1, Math.max(0, numberValue(raw.intensity, 0.5))),
+    dimensions
+  };
+}
+async function generateMindTidyProposals(input) {
+  const knownActorIds = new Set(input.knownActors.map((actor) => actor.id));
+  const itemIds = new Set(input.mind.items.map((item) => item.id));
+  const statePayload = {
+    actor: {
+      id: input.actor.id,
+      name: input.actor.canonicalName,
+      aliases: input.actor.aliases,
+      kind: input.actor.kind,
+      confirmed: input.actor.confirmed
+    },
+    core: input.mind.core,
+    items: input.mind.items,
+    knownActors: input.knownActors.map((actor) => ({ id: actor.id, name: actor.canonicalName, aliases: actor.aliases }))
+  };
+  const stateJson = JSON.stringify(statePayload);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
+  const stateMeasurement = await countTextTokens(stateJson, connection, input.userId);
+  if (input.settings.analysisStateTokenBudget > 0 && stateMeasurement.totalTokens > input.settings.analysisStateTokenBudget) {
+    throw new Error(
+      `This actor needs ${stateMeasurement.totalTokens.toLocaleString()} state tokens, above the ${input.settings.analysisStateTokenBudget.toLocaleString()} tidy limit. Increase Analysis state tokens or set it to 0.`
+    );
+  }
+  const prompt = [
+    "Actor registry and complete current checkpoint:",
+    `<tidy_state>
+${stateJson}
+</tidy_state>`,
+    "Recent committed context (supporting context only):",
+    `<recent_context>
+${renderMessages(input.recentContext)}
+</recent_context>`,
+    "Return only meaningful proposals. An empty proposals array is correct when the checkpoint is already coherent."
+  ].join("\n\n");
+  const result = await quietJson(
+    prompt,
+    TIDY_SYSTEM_PROMPT,
+    "lumi_mind_tidy_v1",
+    TIDY_SCHEMA,
+    input.settings,
+    input.userId,
+    input.fallbackConnectionId,
+    connection,
+    input.signal
+  );
+  input.signal?.throwIfAborted();
+  const raw = asObject2(result.parsed);
+  if (!Array.isArray(raw.proposals)) throw new Error("The LumiMind controller returned an invalid tidy result.");
+  return raw.proposals.flatMap((entry) => {
+    const proposal = asObject2(entry);
+    if (text(proposal.actorId) !== input.actor.id) return [];
+    const finding = proposal.finding === "missing" || proposal.finding === "mislabeled" || proposal.finding === "outdated" || proposal.finding === "duplicate" || proposal.finding === "inconsistent" ? proposal.finding : null;
+    const operation2 = proposal.operation === "replace_core" || proposal.operation === "add_item" || proposal.operation === "update_item" || proposal.operation === "merge_items" || proposal.operation === "remove_items" ? proposal.operation : null;
+    const rationale = text(proposal.rationale);
+    if (!finding || !operation2 || !rationale) return [];
+    const rawTargetItemIds = uniqueStrings(stringArray(proposal.targetItemIds));
+    if (rawTargetItemIds.some((id) => !itemIds.has(id))) return [];
+    const targetItemIds = rawTargetItemIds;
+    const rawCore = asObject2(proposal.core);
+    const core = operation2 === "replace_core" && Object.keys(rawCore).length ? normalizeCore(rawCore) : null;
+    const item = operation2 === "add_item" || operation2 === "update_item" || operation2 === "merge_items" ? normalizeTidyItem(proposal.item, knownActorIds) : null;
+    const valid = operation2 === "replace_core" ? !!core && targetItemIds.length === 0 : operation2 === "add_item" ? !!item && targetItemIds.length === 0 : operation2 === "update_item" ? !!item && targetItemIds.length === 1 : operation2 === "merge_items" ? !!item && targetItemIds.length >= 2 : targetItemIds.length > 0;
+    if (!valid) return [];
+    return [{
+      id: `tidy:${crypto.randomUUID()}`,
+      actorId: input.actor.id,
+      finding,
+      operation: operation2,
+      rationale,
+      confidence: Math.min(1, Math.max(0, numberValue(proposal.confidence, 0.75))),
+      targetItemIds,
+      core,
+      item
+    }];
+  });
+}
 
 // src/storage.ts
 var SETTINGS_PATH = "global/settings.json";
@@ -2273,7 +2570,7 @@ function redactDiagnosticCredentials(value) {
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECONCILE_DEBOUNCE_MS = 650;
-var EXTENSION_VERSION = "0.1.1";
+var EXTENSION_VERSION = "0.2.0";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
@@ -2281,8 +2578,11 @@ var chatUsers = /* @__PURE__ */ new Map();
 var operations = /* @__PURE__ */ new Map();
 var reconcileTimers = /* @__PURE__ */ new Map();
 var analysisAbortControllers = /* @__PURE__ */ new Map();
+var tidyAbortControllers = /* @__PURE__ */ new Map();
+var tidyResults = /* @__PURE__ */ new Map();
 var pauseRequests = /* @__PURE__ */ new Set();
 var rebuildRequests = /* @__PURE__ */ new Set();
+var updateNowRequests = /* @__PURE__ */ new Set();
 var generationContexts = /* @__PURE__ */ new Map();
 var latestGenerationByChat = /* @__PURE__ */ new Map();
 var connectionByChat = /* @__PURE__ */ new Map();
@@ -2291,6 +2591,9 @@ var lastInjectionProjections = /* @__PURE__ */ new Map();
 var lastFrontendUserId = null;
 function cacheKey(userId, chatId) {
   return `${userId}:${chatId}`;
+}
+function tidyRequestKey(userId, requestId) {
+  return `${userId}:${requestId}`;
 }
 function asObject3(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -2346,7 +2649,7 @@ function remapImportedTimeline(source, targetChatId, targetMessages) {
   imported.health = imported.paused ? "paused" : "ready";
   imported.error = null;
   if (crossChat) clearCortexBindings(imported);
-  rebuildTimeline(imported, targetMessages);
+  rebuildTimeline(imported, selectCompletedAssistantTranscript(targetMessages));
   return imported;
 }
 function readString(value, keys) {
@@ -2628,6 +2931,12 @@ async function refreshCortexBridge(timeline, userId) {
   }
   reconcileCortexIdentities(timeline, identities);
 }
+async function cortexCoreSource(timeline, userId, cortexEntityId) {
+  if (!cortexEntityId || !hasPermission("memories")) return null;
+  const entity = await spindle.memories.entities.get(cortexEntityId, userId).catch(() => null);
+  if (!entity || entity.chatId !== timeline.chatId || entity.entityType !== "character") return null;
+  return { name: entity.name, aliases: entity.aliases, description: entity.description, facts: entity.facts };
+}
 async function ensurePersonaActor(timeline, personaId, userId) {
   const existing = timeline.actors[`persona:${personaId}`];
   if (existing) return existing;
@@ -2690,9 +2999,13 @@ async function persistAndPublish(timeline, userId, announce = true) {
   await publishScene(userId, timeline);
   if (announce && activeChats.get(userId)?.chatId === timeline.chatId) await sendState(userId, timeline.chatId);
 }
-async function reconcileChat(userId, chatId, force = false) {
+async function reconcileChat(userId, chatId, force = false, updateNow = false) {
   const key = cacheKey(userId, chatId);
-  if (latestGenerationByChat.has(key)) return;
+  if (latestGenerationByChat.has(key)) {
+    if (updateNow) updateNowRequests.add(key);
+    return;
+  }
+  if (updateNow) updateNowRequests.delete(key);
   if (force) rebuildRequests.delete(key);
   if (pauseRequests.has(key) || !force && rebuildRequests.has(key)) return;
   const timeline = await getTimeline(chatId, userId);
@@ -2702,7 +3015,7 @@ async function reconcileChat(userId, chatId, force = false) {
   const policyChanged = timeline.analysisPolicyHash !== policyHash;
   if (!timeline.active || timeline.paused) {
     const messages2 = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
-    rebuildTimeline(timeline, messages2);
+    rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages2));
     await persistAndPublish(timeline, userId);
     return;
   }
@@ -2719,15 +3032,43 @@ async function reconcileChat(userId, chatId, force = false) {
     timeline.error = null;
   }
   if (force) timeline.records = [];
-  const messages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
-  if (latestGenerationByChat.has(key)) return;
-  let derivation = rebuildTimeline(timeline, messages);
-  if (derivation.firstMissingIndex >= derivation.messages.length) {
+  const fullMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+  if (latestGenerationByChat.has(key)) {
+    if (updateNow) updateNowRequests.add(key);
+    return;
+  }
+  let fullDerivation = rebuildTimeline(timeline, fullMessages);
+  if (fullDerivation.firstMissingIndex >= fullDerivation.messages.length) {
     timeline.health = "ready";
     timeline.error = null;
     await persistAndPublish(timeline, userId);
     return;
   }
+  const bypassUpdatePolicy = force || updateNow;
+  let messages = fullMessages;
+  if (!bypassUpdatePolicy && timeline.updateMode === "manual") {
+    timeline.health = "waiting";
+    timeline.error = null;
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+  if (!bypassUpdatePolicy && timeline.updateMode === "lagged") {
+    messages = selectTranscriptBeforeTurnLag(fullMessages, Math.max(1, timeline.updateLagTurns));
+    if (fullDerivation.firstMissingIndex >= messages.length) {
+      timeline.health = "waiting";
+      timeline.error = null;
+      await persistAndPublish(timeline, userId);
+      return;
+    }
+  }
+  let derivation = rebuildTimeline(timeline, messages);
+  const finishAnalysisView = () => {
+    fullDerivation = rebuildTimeline(timeline, fullMessages);
+    const current = fullDerivation.firstMissingIndex >= fullDerivation.messages.length;
+    timeline.health = current ? "ready" : "waiting";
+    timeline.error = null;
+    return current;
+  };
   const commitSkippedWork = (batch) => {
     if (!batch.skipReason || batch.messages.length === 0) return false;
     timeline.records.push(...materializeSkippedAnalysisRecords(
@@ -2749,8 +3090,7 @@ async function reconcileChat(userId, chatId, force = false) {
     if (!commitSkippedWork(batch)) break;
   }
   if (derivation.firstMissingIndex >= derivation.messages.length) {
-    timeline.health = "ready";
-    timeline.error = null;
+    finishAnalysisView();
     await persistAndPublish(timeline, userId);
     return;
   }
@@ -2766,8 +3106,12 @@ async function reconcileChat(userId, chatId, force = false) {
       const start = derivation.firstMissingIndex;
       const work = selectAnalysisWorkBatch(derivation.messages, start, ANALYSIS_BATCH_SIZE, settings);
       if (commitSkippedWork(work)) {
-        timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
-        timeline.error = null;
+        if (derivation.firstMissingIndex < derivation.messages.length) {
+          timeline.health = "pending";
+          timeline.error = null;
+        } else {
+          finishAnalysisView();
+        }
         await persistAndPublish(timeline, userId);
         continue;
       }
@@ -2811,8 +3155,12 @@ async function reconcileChat(userId, chatId, force = false) {
       }
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);
-      timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
-      timeline.error = null;
+      if (derivation.firstMissingIndex < derivation.messages.length) {
+        timeline.health = "pending";
+        timeline.error = null;
+      } else {
+        finishAnalysisView();
+      }
       await persistAndPublish(timeline, userId);
     }
   } catch (error) {
@@ -2825,13 +3173,14 @@ async function reconcileChat(userId, chatId, force = false) {
     if (analysisAbortControllers.get(key) === abortController) analysisAbortControllers.delete(key);
   }
 }
-function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS, force = false) {
+function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS, force = false, updateNow = false) {
   const key = cacheKey(userId, chatId);
+  const processUpdateNow = updateNow || updateNowRequests.has(key);
   const existing = reconcileTimers.get(key);
   if (existing) clearTimeout(existing);
   reconcileTimers.set(key, setTimeout(() => {
     reconcileTimers.delete(key);
-    void enqueue(userId, chatId, () => reconcileChat(userId, chatId, force));
+    void enqueue(userId, chatId, () => reconcileChat(userId, chatId, force, processUpdateNow));
   }, delay));
 }
 async function activateChat(userId, chatId, historyMode = "full", recentMessageLimit = 0) {
@@ -2867,6 +3216,71 @@ async function writeActorToCortex(userId, timeline, actor) {
   timeline.suppressedCortexEntityIds = (timeline.suppressedCortexEntityIds ?? []).filter((id) => id !== entity.id);
   actor.updatedAt = Date.now();
 }
+async function runTidy(userId, chatId, requestId, requestedActorIds) {
+  if (!hasPermission("generation") || !hasPermission("chat_mutation")) {
+    throw new Error("Generation and chat history permissions are required to tidy minds.");
+  }
+  const requestKey = tidyRequestKey(userId, requestId);
+  if (tidyAbortControllers.has(requestKey)) throw new Error("That tidy request is already running.");
+  for (const [key, value] of tidyResults) if (value.expiresAt <= Date.now()) tidyResults.delete(key);
+  const timeline = await getTimeline(chatId, userId);
+  if (!timeline.active) throw new Error("Activate this LumiMind timeline before tidying it.");
+  const settings = await getSettings(userId);
+  const actorIds = uniqueStrings(requestedActorIds);
+  const actors = actorIds.map((actorId) => timeline.actors[actorId]).filter((actor) => !!actor && actorMindEnabled(actor, settings));
+  if (!actors.length || actors.length !== actorIds.length) throw new Error("One or more tidy actors are unavailable or unmanaged.");
+  const baseRevision = timeline.revision;
+  const knownActors = JSON.parse(JSON.stringify(Object.values(timeline.actors)));
+  const actorSnapshots = /* @__PURE__ */ new Map();
+  for (const actor of actors) {
+    const mind = timeline.minds[actor.id];
+    if (!mind) throw new Error(`The mind for ${actor.canonicalName} is unavailable.`);
+    actorSnapshots.set(actor.id, {
+      actor: JSON.parse(JSON.stringify(actor)),
+      mind: JSON.parse(JSON.stringify(mind))
+    });
+  }
+  const completedMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+  const recentLimit = Math.max(0, Math.floor(settings.analysisContextMessageLimit));
+  const recentContext = recentLimit > 0 ? completedMessages.slice(-recentLimit) : [];
+  const abortController = new AbortController();
+  tidyAbortControllers.set(requestKey, { chatId, controller: abortController });
+  const proposals = [];
+  const errors = [];
+  try {
+    for (let index = 0; index < actors.length; index += 1) {
+      abortController.signal.throwIfAborted();
+      const actor = actors[index];
+      const snapshot = actorSnapshots.get(actor.id);
+      try {
+        proposals.push(...await generateMindTidyProposals({
+          actor: snapshot.actor,
+          mind: snapshot.mind,
+          knownActors,
+          recentContext,
+          settings,
+          userId,
+          fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+          signal: abortController.signal
+        }));
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        errors.push({ actorId: actor.id, message: error instanceof Error ? error.message : String(error) });
+      }
+      send({ type: "tidy_progress", requestId, chatId, completed: index + 1, total: actors.length, actorId: actor.id }, userId);
+    }
+    tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, expiresAt: Date.now() + 15 * 6e4 });
+    send({ type: "tidy_result", requestId, chatId, baseRevision, proposals, errors }, userId);
+  } catch (error) {
+    if (isAbortError(error)) {
+      send({ type: "tidy_cancelled", requestId, chatId }, userId);
+      return;
+    }
+    throw error;
+  } finally {
+    if (tidyAbortControllers.get(requestKey)?.controller === abortController) tidyAbortControllers.delete(requestKey);
+  }
+}
 async function publishScene(userId, timeline) {
   const activeChatId = activeChats.get(userId)?.chatId ?? null;
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
@@ -2892,7 +3306,7 @@ async function mutateTimeline(userId, chatId, mutate) {
     const timeline = await getTimeline(chatId, userId);
     await mutate(timeline);
     const messages = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
-    rebuildTimeline(timeline, messages);
+    rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
     await persistAndPublish(timeline, userId);
   });
 }
@@ -2931,7 +3345,7 @@ async function cloneFork(payload, eventUserId) {
     serialized.error = null;
     clearCortexBindings(serialized);
     await refreshCortexBridge(serialized, userId);
-    rebuildTimeline(serialized, forkMessages);
+    rebuildTimeline(serialized, selectCompletedAssistantTranscript(forkMessages));
     timelines.set(storageTimelineKey(userId, forkedChatId), serialized);
     await persistAndPublish(serialized, userId, false);
     spindle.log.info(`LumiMind inherited ${serialized.records.length} analysis records into fork ${forkedChatId}.`);
@@ -3045,8 +3459,12 @@ onEvent("GENERATION_ENDED", (payload, eventUserId) => {
   }
   const error = readString(payload, ["error"]);
   const messageId = readString(payload, ["messageId", "message_id"]);
-  if (!error && messageId) scheduleReconcile(userId, chatId, 100, rebuildRequests.has(key));
-  else queueCompletedCheckpointRefresh(userId, chatId, null);
+  const updateNow = updateNowRequests.has(key);
+  if (!error && messageId) scheduleReconcile(userId, chatId, 100, rebuildRequests.has(key), updateNow);
+  else {
+    queueCompletedCheckpointRefresh(userId, chatId, null);
+    if (updateNow) scheduleReconcile(userId, chatId, 0, false, true);
+  }
 });
 onEvent("GENERATION_STOPPED", (payload, eventUserId) => {
   const generationId = readString(payload, ["generationId", "generation_id"]);
@@ -3061,6 +3479,7 @@ onEvent("GENERATION_STOPPED", (payload, eventUserId) => {
   }
   queueCompletedCheckpointRefresh(userId, chatId, null);
   if (rebuildRequests.has(key)) scheduleReconcile(userId, chatId, 0, true);
+  else if (updateNowRequests.has(key)) scheduleReconcile(userId, chatId, 0, false, true);
 });
 for (const event of ["MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED"]) {
   onEvent(event, (payload, eventUserId) => {
@@ -3091,8 +3510,15 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   if (!chatId || !userId) return;
   cancelScheduledReconcile(userId, chatId);
   cancelActiveAnalysis(userId, chatId);
+  for (const [requestKey, running] of tidyAbortControllers) {
+    if (requestKey.startsWith(`${userId}:`) && running.chatId === chatId) running.controller.abort();
+  }
+  for (const [requestKey, cached] of tidyResults) {
+    if (cached.userId === userId && cached.chatId === chatId) tidyResults.delete(requestKey);
+  }
   pauseRequests.delete(cacheKey(userId, chatId));
   rebuildRequests.delete(cacheKey(userId, chatId));
+  updateNowRequests.delete(cacheKey(userId, chatId));
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
@@ -3183,6 +3609,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const key = cacheKey(userId, message.chatId);
       if (message.paused) {
         pauseRequests.add(key);
+        updateNowRequests.delete(key);
         cancelScheduledReconcile(userId, message.chatId);
         cancelActiveAnalysis(userId, message.chatId);
       } else {
@@ -3193,6 +3620,26 @@ spindle.onFrontendMessage(async (payload, userId) => {
         timeline.health = message.paused ? "paused" : "pending";
       });
       if (!message.paused) scheduleReconcile(userId, message.chatId, 0);
+      return;
+    }
+    if (message.type === "set_update_policy") {
+      if (message.mode !== "immediate" && message.mode !== "lagged" && message.mode !== "manual") throw new Error("Unknown timeline update mode.");
+      const lagTurns = Number.isFinite(message.lagTurns) ? Math.max(1, Math.floor(message.lagTurns)) : 1;
+      updateNowRequests.delete(cacheKey(userId, message.chatId));
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await mutateTimeline(userId, message.chatId, (timeline) => {
+        timeline.updateMode = message.mode;
+        timeline.updateLagTurns = message.mode === "lagged" ? lagTurns : 0;
+        if (!timeline.paused) timeline.health = timeline.pendingTurnCount > 0 ? "waiting" : "ready";
+      });
+      scheduleReconcile(userId, message.chatId, 0);
+      return;
+    }
+    if (message.type === "update_now") {
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId, false, true));
       return;
     }
     if (message.type === "rebuild") {
@@ -3236,15 +3683,74 @@ spindle.onFrontendMessage(async (payload, userId) => {
     if (message.type === "generate_npc_core") {
       if (!hasPermission("generation")) throw new Error("Generation permission is required to draft an NPC core.");
       const timeline = await getTimeline(message.chatId, userId);
-      const actor = timeline.actors[message.actorId];
-      if (!timeline.active || !actor || actor.kind !== "npc") throw new Error("An active timeline NPC is required to generate a core draft.");
+      if (!timeline.active) throw new Error("Activate this LumiMind timeline before generating an NPC core.");
+      const actor = message.actorId ? timeline.actors[message.actorId] : null;
+      if (message.actorId && (!actor || actor.kind !== "npc")) throw new Error("Timeline NPC not found.");
+      const cortexEntityId = actor?.cortexEntityId ?? message.cortexEntityId ?? null;
+      const cortexSource = await cortexCoreSource(timeline, userId, cortexEntityId);
+      const actorName = actor?.canonicalName ?? message.name?.trim() ?? cortexSource?.name ?? "";
+      if (!actorName) throw new Error("NPC name is required to generate a core draft.");
+      const lore = cortexSource ? composeNpcCoreLore(cortexSource.description, cortexSource.facts, message.lore ?? "") : composeNpcCoreLore("", [], message.lore ?? "");
+      if (!lore) throw new Error("Provide NPC lore, or choose a Cortex character with a description or facts.");
       const core = await generateNpcCoreDraft({
-        actorName: actor.canonicalName,
-        lore: message.lore,
+        actorName,
+        lore,
         settings: await getSettings(userId),
         userId
       });
-      send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, actorId: actor.id, core }, userId);
+      send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, ...actor ? { actorId: actor.id } : {}, core }, userId);
+      return;
+    }
+    if (message.type === "create_npc") {
+      let actorId = "";
+      await enqueue(userId, message.chatId, async () => {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (!timeline.active) throw new Error("Activate this LumiMind timeline before adding an NPC.");
+        if (message.cortexEntityId) {
+          const source = await cortexCoreSource(timeline, userId, message.cortexEntityId);
+          if (!source) throw new Error("That Cortex character is unavailable in this chat.");
+        }
+        const actor = createOrUpdateNpc(timeline, {
+          name: message.name,
+          aliases: message.aliases,
+          cortexEntityId: message.cortexEntityId ?? null,
+          core: message.core
+        });
+        actorId = actor.id;
+        const messages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
+        await persistAndPublish(timeline, userId);
+      });
+      send({ type: "npc_created", requestId: message.requestId, chatId: message.chatId, actorId }, userId);
+      return;
+    }
+    if (message.type === "start_tidy") {
+      await runTidy(userId, message.chatId, message.requestId, message.actorIds);
+      return;
+    }
+    if (message.type === "cancel_tidy") {
+      tidyAbortControllers.get(tidyRequestKey(userId, message.requestId))?.controller.abort();
+      return;
+    }
+    if (message.type === "apply_tidy") {
+      const requestKey = tidyRequestKey(userId, message.requestId);
+      const cached = tidyResults.get(requestKey);
+      if (!cached || cached.chatId !== message.chatId || cached.expiresAt <= Date.now()) {
+        tidyResults.delete(requestKey);
+        throw new Error("That tidy review expired. Run tidy again.");
+      }
+      let applied = 0;
+      await enqueue(userId, message.chatId, async () => {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (timeline.revision !== cached.baseRevision) throw new Error("This timeline changed after the tidy scan. Run tidy again before applying changes.");
+        const selected = new Set(message.proposalIds);
+        applied = applyMindTidyProposals(timeline, cached.proposals.filter((proposal) => selected.has(proposal.id)));
+        const messages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
+        await persistAndPublish(timeline, userId);
+      });
+      tidyResults.delete(requestKey);
+      send({ type: "tidy_applied", requestId: message.requestId, chatId: message.chatId, applied }, userId);
       return;
     }
     if (!chatId) throw new Error("This LumiMind action requires an active chat.");
@@ -3332,8 +3838,16 @@ spindle.onFrontendMessage(async (payload, userId) => {
       }, userId);
       return;
     }
+    if (message.type === "create_npc") {
+      send({ type: "npc_create_error", requestId: message.requestId, chatId: message.chatId, message: detail }, userId);
+      return;
+    }
+    if (message.type === "start_tidy" || message.type === "apply_tidy") {
+      send({ type: "tidy_error", requestId: message.requestId, chatId: message.chatId, message: detail }, userId);
+      return;
+    }
     send({ type: "error", message: detail }, userId);
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.1.1 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.2.0 loaded \u2014 subjective timeline engine ready.");

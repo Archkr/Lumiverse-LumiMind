@@ -1,17 +1,20 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
 import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
-import { analyzeMessages, generateNpcCoreDraft, generateSeedDraft, isAbortError } from "./controller";
+import { analyzeMessages, composeNpcCoreLore, generateMindTidyProposals, generateNpcCoreDraft, generateSeedDraft, isAbortError } from "./controller";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
+  applyMindTidyProposals,
   analysisPolicyHash,
+  actorMindEnabled,
   buildProjectedDirectorMindInjection,
   buildProjectedMindInjection,
   clearCortexBindings,
   compactStateForController,
   confirmActor,
   createCheckpointTimeline,
+  createOrUpdateNpc,
   createTimeline,
   limitChatHistoryMessages,
   makeBaseMind,
@@ -31,6 +34,7 @@ import {
   removeManualItem,
   resolveActorId,
   selectCompletedAssistantTranscript,
+  selectTranscriptBeforeTurnLag,
   splitActor,
   selectAnalysisRecentContext,
   selectAnalysisWorkBatch,
@@ -46,6 +50,7 @@ import { makeMindLumiStateSnapshot } from "./lumi-state";
 import { redactDiagnosticCredentials } from "./diagnostics";
 import {
   EXTENSION_KEY,
+  type ActorMind,
   type ActorRecord,
   type BackendToFrontend,
   type ChatMessageLike,
@@ -55,6 +60,8 @@ import {
   type FrontendToBackend,
   type LumiMindSettings,
   type MindSeedV1,
+  type MindTidyActorError,
+  type MindTidyProposal,
   type PermissionState,
   type TimelineDatabaseArchiveV1,
 } from "./types";
@@ -62,7 +69,7 @@ import {
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
 const RECONCILE_DEBOUNCE_MS = 650;
-const EXTENSION_VERSION = "0.1.1";
+const EXTENSION_VERSION = "0.2.0";
 
 type GenerationContext = {
   generationId: string;
@@ -80,8 +87,17 @@ const chatUsers = new Map<string, string>();
 const operations = new Map<string, Promise<void>>();
 const reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const analysisAbortControllers = new Map<string, AbortController>();
+const tidyAbortControllers = new Map<string, { chatId: string; controller: AbortController }>();
+const tidyResults = new Map<string, {
+  userId: string;
+  chatId: string;
+  baseRevision: number;
+  proposals: MindTidyProposal[];
+  expiresAt: number;
+}>();
 const pauseRequests = new Set<string>();
 const rebuildRequests = new Set<string>();
+const updateNowRequests = new Set<string>();
 const generationContexts = new Map<string, GenerationContext>();
 const latestGenerationByChat = new Map<string, GenerationContext>();
 const connectionByChat = new Map<string, string>();
@@ -96,6 +112,10 @@ let lastFrontendUserId: string | null = null;
 
 function cacheKey(userId: string, chatId: string): string {
   return `${userId}:${chatId}`;
+}
+
+function tidyRequestKey(userId: string, requestId: string): string {
+  return `${userId}:${requestId}`;
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -156,7 +176,7 @@ function remapImportedTimeline(source: ChatTimelineV1, targetChatId: string, tar
   imported.health = imported.paused ? "paused" : "ready";
   imported.error = null;
   if (crossChat) clearCortexBindings(imported);
-  rebuildTimeline(imported, targetMessages);
+  rebuildTimeline(imported, selectCompletedAssistantTranscript(targetMessages));
   return imported;
 }
 
@@ -481,6 +501,17 @@ async function refreshCortexBridge(timeline: ChatTimelineV1, userId: string): Pr
   reconcileCortexIdentities(timeline, identities);
 }
 
+async function cortexCoreSource(
+  timeline: ChatTimelineV1,
+  userId: string,
+  cortexEntityId: string | null,
+): Promise<{ name: string; aliases: string[]; description: string; facts: string[] } | null> {
+  if (!cortexEntityId || !hasPermission("memories")) return null;
+  const entity = await spindle.memories.entities.get(cortexEntityId, userId).catch(() => null);
+  if (!entity || entity.chatId !== timeline.chatId || entity.entityType !== "character") return null;
+  return { name: entity.name, aliases: entity.aliases, description: entity.description, facts: entity.facts };
+}
+
 async function ensurePersonaActor(timeline: ChatTimelineV1, personaId: string, userId: string): Promise<ActorRecord> {
   const existing = timeline.actors[`persona:${personaId}`];
   if (existing) return existing;
@@ -552,9 +583,13 @@ async function persistAndPublish(timeline: ChatTimelineV1, userId: string, annou
   if (announce && activeChats.get(userId)?.chatId === timeline.chatId) await sendState(userId, timeline.chatId);
 }
 
-async function reconcileChat(userId: string, chatId: string, force = false): Promise<void> {
+async function reconcileChat(userId: string, chatId: string, force = false, updateNow = false): Promise<void> {
   const key = cacheKey(userId, chatId);
-  if (latestGenerationByChat.has(key)) return;
+  if (latestGenerationByChat.has(key)) {
+    if (updateNow) updateNowRequests.add(key);
+    return;
+  }
+  if (updateNow) updateNowRequests.delete(key);
   if (force) rebuildRequests.delete(key);
   if (pauseRequests.has(key) || (!force && rebuildRequests.has(key))) return;
   const timeline = await getTimeline(chatId, userId);
@@ -564,7 +599,7 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   const policyChanged = timeline.analysisPolicyHash !== policyHash;
   if (!timeline.active || timeline.paused) {
     const messages = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
-    rebuildTimeline(timeline, messages);
+    rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
     await persistAndPublish(timeline, userId);
     return;
   }
@@ -583,15 +618,43 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   // A policy refresh preserves the user's first-activation cutoff. The explicit
   // Rebuild action is the deliberate way to replace it with a full-history replay.
   if (force) timeline.records = [];
-  const messages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
-  if (latestGenerationByChat.has(key)) return;
-  let derivation = rebuildTimeline(timeline, messages);
-  if (derivation.firstMissingIndex >= derivation.messages.length) {
+  const fullMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+  if (latestGenerationByChat.has(key)) {
+    if (updateNow) updateNowRequests.add(key);
+    return;
+  }
+  let fullDerivation = rebuildTimeline(timeline, fullMessages);
+  if (fullDerivation.firstMissingIndex >= fullDerivation.messages.length) {
     timeline.health = "ready";
     timeline.error = null;
     await persistAndPublish(timeline, userId);
     return;
   }
+  const bypassUpdatePolicy = force || updateNow;
+  let messages = fullMessages;
+  if (!bypassUpdatePolicy && timeline.updateMode === "manual") {
+    timeline.health = "waiting";
+    timeline.error = null;
+    await persistAndPublish(timeline, userId);
+    return;
+  }
+  if (!bypassUpdatePolicy && timeline.updateMode === "lagged") {
+    messages = selectTranscriptBeforeTurnLag(fullMessages, Math.max(1, timeline.updateLagTurns));
+    if (fullDerivation.firstMissingIndex >= messages.length) {
+      timeline.health = "waiting";
+      timeline.error = null;
+      await persistAndPublish(timeline, userId);
+      return;
+    }
+  }
+  let derivation = rebuildTimeline(timeline, messages);
+  const finishAnalysisView = (): boolean => {
+    fullDerivation = rebuildTimeline(timeline, fullMessages);
+    const current = fullDerivation.firstMissingIndex >= fullDerivation.messages.length;
+    timeline.health = current ? "ready" : "waiting";
+    timeline.error = null;
+    return current;
+  };
   const commitSkippedWork = (batch: ReturnType<typeof selectAnalysisWorkBatch>): boolean => {
     if (!batch.skipReason || batch.messages.length === 0) return false;
     timeline.records.push(...materializeSkippedAnalysisRecords(
@@ -614,8 +677,7 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
     if (!commitSkippedWork(batch)) break;
   }
   if (derivation.firstMissingIndex >= derivation.messages.length) {
-    timeline.health = "ready";
-    timeline.error = null;
+    finishAnalysisView();
     await persistAndPublish(timeline, userId);
     return;
   }
@@ -632,8 +694,12 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
       const start = derivation.firstMissingIndex;
       const work = selectAnalysisWorkBatch(derivation.messages, start, ANALYSIS_BATCH_SIZE, settings);
       if (commitSkippedWork(work)) {
-        timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
-        timeline.error = null;
+        if (derivation.firstMissingIndex < derivation.messages.length) {
+          timeline.health = "pending";
+          timeline.error = null;
+        } else {
+          finishAnalysisView();
+        }
         await persistAndPublish(timeline, userId);
         continue;
       }
@@ -678,8 +744,12 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
       }
       timeline.lastAnalyzedAt = Date.now();
       derivation = rebuildTimeline(timeline, messages);
-      timeline.health = derivation.firstMissingIndex < derivation.messages.length ? "pending" : "ready";
-      timeline.error = null;
+      if (derivation.firstMissingIndex < derivation.messages.length) {
+        timeline.health = "pending";
+        timeline.error = null;
+      } else {
+        finishAnalysisView();
+      }
       await persistAndPublish(timeline, userId);
     }
   } catch (error) {
@@ -693,13 +763,14 @@ async function reconcileChat(userId: string, chatId: string, force = false): Pro
   }
 }
 
-function scheduleReconcile(userId: string, chatId: string, delay = RECONCILE_DEBOUNCE_MS, force = false): void {
+function scheduleReconcile(userId: string, chatId: string, delay = RECONCILE_DEBOUNCE_MS, force = false, updateNow = false): void {
   const key = cacheKey(userId, chatId);
+  const processUpdateNow = updateNow || updateNowRequests.has(key);
   const existing = reconcileTimers.get(key);
   if (existing) clearTimeout(existing);
   reconcileTimers.set(key, setTimeout(() => {
     reconcileTimers.delete(key);
-    void enqueue(userId, chatId, () => reconcileChat(userId, chatId, force));
+    void enqueue(userId, chatId, () => reconcileChat(userId, chatId, force, processUpdateNow));
   }, delay));
 }
 
@@ -745,6 +816,72 @@ async function writeActorToCortex(userId: string, timeline: ChatTimelineV1, acto
   actor.updatedAt = Date.now();
 }
 
+async function runTidy(userId: string, chatId: string, requestId: string, requestedActorIds: string[]): Promise<void> {
+  if (!hasPermission("generation") || !hasPermission("chat_mutation")) {
+    throw new Error("Generation and chat history permissions are required to tidy minds.");
+  }
+  const requestKey = tidyRequestKey(userId, requestId);
+  if (tidyAbortControllers.has(requestKey)) throw new Error("That tidy request is already running.");
+  for (const [key, value] of tidyResults) if (value.expiresAt <= Date.now()) tidyResults.delete(key);
+  const timeline = await getTimeline(chatId, userId);
+  if (!timeline.active) throw new Error("Activate this LumiMind timeline before tidying it.");
+  const settings = await getSettings(userId);
+  const actorIds = uniqueStrings(requestedActorIds);
+  const actors = actorIds.map((actorId) => timeline.actors[actorId]).filter((actor): actor is ActorRecord => !!actor && actorMindEnabled(actor, settings));
+  if (!actors.length || actors.length !== actorIds.length) throw new Error("One or more tidy actors are unavailable or unmanaged.");
+  const baseRevision = timeline.revision;
+  const knownActors = JSON.parse(JSON.stringify(Object.values(timeline.actors))) as ActorRecord[];
+  const actorSnapshots = new Map<string, { actor: ActorRecord; mind: ActorMind }>();
+  for (const actor of actors) {
+    const mind = timeline.minds[actor.id];
+    if (!mind) throw new Error(`The mind for ${actor.canonicalName} is unavailable.`);
+    actorSnapshots.set(actor.id, {
+      actor: JSON.parse(JSON.stringify(actor)) as ActorRecord,
+      mind: JSON.parse(JSON.stringify(mind)) as ActorMind,
+    });
+  }
+  const completedMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+  const recentLimit = Math.max(0, Math.floor(settings.analysisContextMessageLimit));
+  const recentContext = recentLimit > 0 ? completedMessages.slice(-recentLimit) : [];
+  const abortController = new AbortController();
+  tidyAbortControllers.set(requestKey, { chatId, controller: abortController });
+  const proposals: MindTidyProposal[] = [];
+  const errors: MindTidyActorError[] = [];
+  try {
+    for (let index = 0; index < actors.length; index += 1) {
+      abortController.signal.throwIfAborted();
+      const actor = actors[index];
+      const snapshot = actorSnapshots.get(actor.id)!;
+      try {
+        proposals.push(...await generateMindTidyProposals({
+          actor: snapshot.actor,
+          mind: snapshot.mind,
+          knownActors,
+          recentContext,
+          settings,
+          userId,
+          fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+          signal: abortController.signal,
+        }));
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        errors.push({ actorId: actor.id, message: error instanceof Error ? error.message : String(error) });
+      }
+      send({ type: "tidy_progress", requestId, chatId, completed: index + 1, total: actors.length, actorId: actor.id }, userId);
+    }
+    tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, expiresAt: Date.now() + 15 * 60_000 });
+    send({ type: "tidy_result", requestId, chatId, baseRevision, proposals, errors }, userId);
+  } catch (error) {
+    if (isAbortError(error)) {
+      send({ type: "tidy_cancelled", requestId, chatId }, userId);
+      return;
+    }
+    throw error;
+  } finally {
+    if (tidyAbortControllers.get(requestKey)?.controller === abortController) tidyAbortControllers.delete(requestKey);
+  }
+}
+
 async function publishScene(userId: string, timeline?: ChatTimelineV1 | null): Promise<void> {
   const activeChatId = activeChats.get(userId)?.chatId ?? null;
   const resolved = timeline?.chatId === activeChatId ? timeline : activeChatId ? await getTimeline(activeChatId, userId).catch(() => null) : null;
@@ -775,7 +912,7 @@ async function mutateTimeline(
     const timeline = await getTimeline(chatId, userId);
     await mutate(timeline);
     const messages = hasPermission("chat_mutation") ? await getChatMessages(chatId, userId).catch(() => []) : [];
-    rebuildTimeline(timeline, messages);
+    rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
     await persistAndPublish(timeline, userId);
   });
 }
@@ -815,7 +952,7 @@ async function cloneFork(payload: unknown, eventUserId?: string): Promise<void> 
     serialized.error = null;
     clearCortexBindings(serialized);
     await refreshCortexBridge(serialized, userId);
-    rebuildTimeline(serialized, forkMessages);
+    rebuildTimeline(serialized, selectCompletedAssistantTranscript(forkMessages));
     timelines.set(storageTimelineKey(userId, forkedChatId), serialized);
     await persistAndPublish(serialized, userId, false);
     spindle.log.info(`LumiMind inherited ${serialized.records.length} analysis records into fork ${forkedChatId}.`);
@@ -936,8 +1073,12 @@ onEvent("GENERATION_ENDED", (payload, eventUserId) => {
   }
   const error = readString(payload, ["error"]);
   const messageId = readString(payload, ["messageId", "message_id"]);
-  if (!error && messageId) scheduleReconcile(userId, chatId, 100, rebuildRequests.has(key));
-  else queueCompletedCheckpointRefresh(userId, chatId, null);
+  const updateNow = updateNowRequests.has(key);
+  if (!error && messageId) scheduleReconcile(userId, chatId, 100, rebuildRequests.has(key), updateNow);
+  else {
+    queueCompletedCheckpointRefresh(userId, chatId, null);
+    if (updateNow) scheduleReconcile(userId, chatId, 0, false, true);
+  }
 });
 
 onEvent("GENERATION_STOPPED", (payload, eventUserId) => {
@@ -953,6 +1094,7 @@ onEvent("GENERATION_STOPPED", (payload, eventUserId) => {
   }
   queueCompletedCheckpointRefresh(userId, chatId, null);
   if (rebuildRequests.has(key)) scheduleReconcile(userId, chatId, 0, true);
+  else if (updateNowRequests.has(key)) scheduleReconcile(userId, chatId, 0, false, true);
 });
 
 // New messages are reconciled only after GENERATION_ENDED so the controller never
@@ -987,8 +1129,15 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   if (!chatId || !userId) return;
   cancelScheduledReconcile(userId, chatId);
   cancelActiveAnalysis(userId, chatId);
+  for (const [requestKey, running] of tidyAbortControllers) {
+    if (requestKey.startsWith(`${userId}:`) && running.chatId === chatId) running.controller.abort();
+  }
+  for (const [requestKey, cached] of tidyResults) {
+    if (cached.userId === userId && cached.chatId === chatId) tidyResults.delete(requestKey);
+  }
   pauseRequests.delete(cacheKey(userId, chatId));
   rebuildRequests.delete(cacheKey(userId, chatId));
+  updateNowRequests.delete(cacheKey(userId, chatId));
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
@@ -1085,6 +1234,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const key = cacheKey(userId, message.chatId);
       if (message.paused) {
         pauseRequests.add(key);
+        updateNowRequests.delete(key);
         cancelScheduledReconcile(userId, message.chatId);
         cancelActiveAnalysis(userId, message.chatId);
       } else {
@@ -1095,6 +1245,26 @@ spindle.onFrontendMessage(async (payload, userId) => {
         timeline.health = message.paused ? "paused" : "pending";
       });
       if (!message.paused) scheduleReconcile(userId, message.chatId, 0);
+      return;
+    }
+    if (message.type === "set_update_policy") {
+      if (message.mode !== "immediate" && message.mode !== "lagged" && message.mode !== "manual") throw new Error("Unknown timeline update mode.");
+      const lagTurns = Number.isFinite(message.lagTurns) ? Math.max(1, Math.floor(message.lagTurns)) : 1;
+      updateNowRequests.delete(cacheKey(userId, message.chatId));
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await mutateTimeline(userId, message.chatId, (timeline) => {
+        timeline.updateMode = message.mode;
+        timeline.updateLagTurns = message.mode === "lagged" ? lagTurns : 0;
+        if (!timeline.paused) timeline.health = timeline.pendingTurnCount > 0 ? "waiting" : "ready";
+      });
+      scheduleReconcile(userId, message.chatId, 0);
+      return;
+    }
+    if (message.type === "update_now") {
+      cancelScheduledReconcile(userId, message.chatId);
+      cancelActiveAnalysis(userId, message.chatId);
+      await enqueue(userId, message.chatId, () => reconcileChat(userId, message.chatId, false, true));
       return;
     }
     if (message.type === "rebuild") {
@@ -1141,15 +1311,76 @@ spindle.onFrontendMessage(async (payload, userId) => {
     if (message.type === "generate_npc_core") {
       if (!hasPermission("generation")) throw new Error("Generation permission is required to draft an NPC core.");
       const timeline = await getTimeline(message.chatId, userId);
-      const actor = timeline.actors[message.actorId];
-      if (!timeline.active || !actor || actor.kind !== "npc") throw new Error("An active timeline NPC is required to generate a core draft.");
+      if (!timeline.active) throw new Error("Activate this LumiMind timeline before generating an NPC core.");
+      const actor = message.actorId ? timeline.actors[message.actorId] : null;
+      if (message.actorId && (!actor || actor.kind !== "npc")) throw new Error("Timeline NPC not found.");
+      const cortexEntityId = actor?.cortexEntityId ?? message.cortexEntityId ?? null;
+      const cortexSource = await cortexCoreSource(timeline, userId, cortexEntityId);
+      const actorName = actor?.canonicalName ?? message.name?.trim() ?? cortexSource?.name ?? "";
+      if (!actorName) throw new Error("NPC name is required to generate a core draft.");
+      const lore = cortexSource
+        ? composeNpcCoreLore(cortexSource.description, cortexSource.facts, message.lore ?? "")
+        : composeNpcCoreLore("", [], message.lore ?? "");
+      if (!lore) throw new Error("Provide NPC lore, or choose a Cortex character with a description or facts.");
       const core = await generateNpcCoreDraft({
-        actorName: actor.canonicalName,
-        lore: message.lore,
+        actorName,
+        lore,
         settings: await getSettings(userId),
         userId,
       });
-      send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, actorId: actor.id, core }, userId);
+      send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, ...(actor ? { actorId: actor.id } : {}), core }, userId);
+      return;
+    }
+    if (message.type === "create_npc") {
+      let actorId = "";
+      await enqueue(userId, message.chatId, async () => {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (!timeline.active) throw new Error("Activate this LumiMind timeline before adding an NPC.");
+        if (message.cortexEntityId) {
+          const source = await cortexCoreSource(timeline, userId, message.cortexEntityId);
+          if (!source) throw new Error("That Cortex character is unavailable in this chat.");
+        }
+        const actor = createOrUpdateNpc(timeline, {
+          name: message.name,
+          aliases: message.aliases,
+          cortexEntityId: message.cortexEntityId ?? null,
+          core: message.core,
+        });
+        actorId = actor.id;
+        const messages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
+        await persistAndPublish(timeline, userId);
+      });
+      send({ type: "npc_created", requestId: message.requestId, chatId: message.chatId, actorId }, userId);
+      return;
+    }
+    if (message.type === "start_tidy") {
+      await runTidy(userId, message.chatId, message.requestId, message.actorIds);
+      return;
+    }
+    if (message.type === "cancel_tidy") {
+      tidyAbortControllers.get(tidyRequestKey(userId, message.requestId))?.controller.abort();
+      return;
+    }
+    if (message.type === "apply_tidy") {
+      const requestKey = tidyRequestKey(userId, message.requestId);
+      const cached = tidyResults.get(requestKey);
+      if (!cached || cached.chatId !== message.chatId || cached.expiresAt <= Date.now()) {
+        tidyResults.delete(requestKey);
+        throw new Error("That tidy review expired. Run tidy again.");
+      }
+      let applied = 0;
+      await enqueue(userId, message.chatId, async () => {
+        const timeline = await getTimeline(message.chatId, userId);
+        if (timeline.revision !== cached.baseRevision) throw new Error("This timeline changed after the tidy scan. Run tidy again before applying changes.");
+        const selected = new Set(message.proposalIds);
+        applied = applyMindTidyProposals(timeline, cached.proposals.filter((proposal) => selected.has(proposal.id)));
+        const messages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
+        rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
+        await persistAndPublish(timeline, userId);
+      });
+      tidyResults.delete(requestKey);
+      send({ type: "tidy_applied", requestId: message.requestId, chatId: message.chatId, applied }, userId);
       return;
     }
     if (!chatId) throw new Error("This LumiMind action requires an active chat.");
@@ -1237,9 +1468,17 @@ spindle.onFrontendMessage(async (payload, userId) => {
       }, userId);
       return;
     }
+    if (message.type === "create_npc") {
+      send({ type: "npc_create_error", requestId: message.requestId, chatId: message.chatId, message: detail }, userId);
+      return;
+    }
+    if (message.type === "start_tidy" || message.type === "apply_tidy") {
+      send({ type: "tidy_error", requestId: message.requestId, chatId: message.chatId, message: detail }, userId);
+      return;
+    }
     send({ type: "error", message: detail }, userId);
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
 
-spindle.log.info("LumiMind v0.1.1 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.2.0 loaded — subjective timeline engine ready.");

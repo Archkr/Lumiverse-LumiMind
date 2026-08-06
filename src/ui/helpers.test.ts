@@ -5,6 +5,7 @@ import {
   availableRecentHistoryLimit,
   createRequestId,
   healthLabel,
+  healthTone,
   missingAnalysisPermissions,
   parseRelationshipLines,
   readReviewedSeed,
@@ -99,8 +100,10 @@ describe("UI normalization", () => {
   });
 
   it("exposes user-facing timeline health labels", () => {
+    expect(healthLabel("waiting")).toBe("Waiting to update");
     expect(healthLabel("stale")).toBe("Using checkpoint");
     expect(healthLabel("error")).toBe("Needs attention");
+    expect(healthTone("waiting")).toBe("warning");
   });
 
   it("reports only analysis-blocking permissions", () => {

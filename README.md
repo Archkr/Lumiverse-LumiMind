@@ -6,9 +6,9 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.1.9-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.2.0-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
-[![Status](https://img.shields.io/badge/status-beta-e6a45a)](https://github.com/Archkr/Lumiverse-LumiMind)
+[![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
 
 *Let every character remember the same scene differently.*
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-> **Beta note:** LumiMind `0.1.9` is an early release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
+LumiMind `0.2.0` is the first stable release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -64,7 +64,9 @@ It supports ordinary single-card roleplay, group chats, player personas, and dir
 | **Timeline aware** | Reconciles edits, deletions, swipes, regenerations, and chat forks. |
 | **Spoiler-safe lens** | Beliefs and secrets stay collapsed until you deliberately reveal them. |
 | **Editable state** | Correct, pin, lock, merge, split, rename, or remove inferred information. Split NPCs inherit the source checkpoint instead of starting blank. |
+| **Review-first maintenance** | Tidy one actor or the whole cast, inspect controller proposals, and apply only the corrections you select. |
 | **Background analysis** | Uses a controller after committed turns without blocking normal generation. |
+| **Timeline scheduling** | Keep immediate updates, leave a configurable turn lag, or update a timeline only when requested. |
 | **Private injection** | Adds one cached system message containing the present cast's unresolved state at the configured prompt position; the interceptor makes no model call. |
 | **Portable timelines** | Export a chat's LumiMind database and import it as a sequel checkpoint or matching-history restore. |
 | **Diagnostics** | Produces a privacy-safe report for controller and timeline troubleshooting. |
@@ -125,7 +127,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.1.9` beta |
+| Extension version | `0.2.0` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
@@ -221,7 +223,9 @@ Mind Lens is LumiMind’s main drawer interface.
 
 - Browse every managed card, persona, and discovered NPC.
 - Review core self-concept, values, desires, fears, and boundaries.
-- For timeline NPCs, generate an editable enduring-frame draft from lore you provide. The controller draft opens in the existing Core editor and is never saved automatically.
+- Add local or Cortex-linked NPCs before the story detects them. LumiMind drafts the enduring core first and creates the actor only after you save the reviewed core.
+- Generate an editable core for every timeline NPC, including Cortex imports. Cortex descriptions and facts can supply the source lore, with optional user notes; core changes stay timeline-local.
+- Run **Tidy selected** or **Tidy all** to review missing, mislabeled, outdated, duplicate, or inconsistent state. Tidy proposals show before/after details, rationale, and confidence, and never change anything until you apply selected items.
 - Inspect beliefs, secrets, goals, plans, emotions, relationships, and awareness.
 - See confidence, evidence, source message, and swipe provenance.
 - Add or edit state manually; user-authored entries are locked and pinned by default.
@@ -244,7 +248,9 @@ Mind Lens is LumiMind’s main drawer interface.
 
 - View committed analysis records by message and swipe.
 - See accepted actor mentions, state changes, and quality warnings.
-- Pause or resume automatic analysis. Pausing cancels any controller generation currently in flight.
+- Choose immediate, lagged, or manual analysis separately for each timeline. Lagged mode leaves the newest configured number of completed turns pending; manual mode waits for **Update now**.
+- Use **Update now** to analyze the complete committed suffix once without changing the saved update mode.
+- Pause or resume the timeline. Pause cancels controller work and disables both analysis and private mind injection.
 - Retry a failed or stale suffix.
 - Rebuild committed history under the current rules and roleplay mode. Rebuild cancels the current controller generation before starting over.
 
@@ -318,7 +324,10 @@ LumiMind is designed for conversations that do not stay perfectly linear.
 
 | Event | What LumiMind does |
 |---|---|
-| New committed turn | Analyzes the new suffix in the background. |
+| New committed turn, immediate mode | Analyzes the new suffix in the background. |
+| New committed turn, lagged mode | Keeps the newest configured number of completed turns pending and reports a waiting state. |
+| New committed turn, manual mode | Invalidates edited history and reports pending work without starting a controller request. |
+| Update now | Processes the complete committed suffix once without changing the timeline's saved mode. |
 | First activation with 50+ messages | Asks whether to analyze the full transcript or checkpoint the older prefix and start at the configured recent-history range. |
 | Regeneration or swipe | Restores a compatible cached checkpoint when possible and replays the affected suffix when needed. |
 | Message edit | Invalidates analysis from the earliest changed message forward. |
@@ -387,9 +396,13 @@ Additional calls can occur when:
 - changing Persona or Director policy;
 - retrying transient failures;
 - running one corrective pass after a substantive empty bootstrap result;
-- generating a Mind Seed draft.
+- generating a Mind Seed draft;
+- generating or revising an NPC core;
+- running Mind Tidy.
 
 Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
+
+Mind Tidy is always explicit and review-first. It makes exactly one sequential controller request per selected actor, so **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
 
 The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message at the configured prompt position. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
@@ -431,7 +444,7 @@ LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to 
 
 ### Controller data
 
-The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, all actor registry stubs, and the highest-ranked unresolved state that fits the analysis-state token budget. A budget of `0` sends all unresolved state. Treat that connection with the same privacy expectations as any model connection used for chat.
+The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, all actor registry stubs, and the highest-ranked unresolved state that fits the analysis-state token budget. A budget of `0` sends all unresolved state. A user-started Tidy request instead sends one selected actor's complete folded core and stored state, including evidence, plus only that configured recent context. Treat that connection with the same privacy expectations as any model connection used for chat.
 
 Diagnostics store counts, lengths, hashes, provider metadata, warning codes, and sanitized rejection reason codes—not raw controller responses or private story content.
 
@@ -455,6 +468,8 @@ It uses only:
 This helps LumiMind recognize that “Captain Mira,” “Mira,” and an already-known Cortex character refer to the same actor. Imported identities join the chat-local registry, while unrelated chats still do not automatically share LumiMind’s discovered NPC IDs.
 
 Cortex entity IDs are chat-scoped. Forks and cross-chat timeline imports therefore discard inherited links and match against the destination chat again only when the identity is unambiguous. Removing an imported actor suppresses that Cortex entity locally so it is not immediately re-imported. When two actors with different Cortex links are merged, Mind Lens requires you to choose which local link to keep; Cortex itself is not changed.
+
+When you explicitly generate a core for a Cortex-linked NPC, LumiMind can also read that entity's description and facts and combine them with optional notes you provide. The generated core remains an editable draft; saving it changes only the current LumiMind timeline and never writes to Cortex or a character-card Mind Seed. If Cortex has no usable lore, LumiMind asks for manual lore instead.
 
 ### Identity writeback — off by default
 

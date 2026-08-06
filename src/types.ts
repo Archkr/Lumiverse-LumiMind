@@ -4,6 +4,7 @@ export const EXTENSION_KEY = "lumi_mind" as const;
 
 export type ActorKind = "character" | "persona" | "npc";
 export type CortexLinkResolution = "source" | "target";
+export type TimelineUpdateMode = "immediate" | "lagged" | "manual";
 export type MindCategory = "belief" | "secret" | "goal" | "plan" | "emotion" | "relationship" | "awareness";
 export type MindOperation = "add" | "update" | "resolve" | "abandon" | "remove";
 export type MindItemStatus = "active" | "resolved" | "abandoned" | "uncertain";
@@ -78,6 +79,36 @@ export interface ActorMind {
   attention: string;
   presentActorIds: string[];
   lastUpdatedMessageId: string | null;
+}
+
+export type MindTidyFinding = "missing" | "mislabeled" | "outdated" | "duplicate" | "inconsistent";
+export type MindTidyOperation = "replace_core" | "add_item" | "update_item" | "merge_items" | "remove_items";
+
+export interface MindTidyItemDraft {
+  category: MindCategory;
+  text: string;
+  status: MindItemStatus;
+  targetActorIds: string[];
+  concealedFromActorIds: string[];
+  intensity: number | null;
+  dimensions: Record<string, number>;
+}
+
+export interface MindTidyProposal {
+  id: string;
+  actorId: string;
+  finding: MindTidyFinding;
+  operation: MindTidyOperation;
+  rationale: string;
+  confidence: number;
+  targetItemIds: string[];
+  core: MindCore | null;
+  item: MindTidyItemDraft | null;
+}
+
+export interface MindTidyActorError {
+  actorId: string;
+  message: string;
 }
 
 export interface ActorMentionDelta {
@@ -205,7 +236,7 @@ export interface ManualOverride {
   createdAt: number;
 }
 
-export type TimelineHealth = "inactive" | "initializing" | "ready" | "pending" | "stale" | "paused" | "error";
+export type TimelineHealth = "inactive" | "initializing" | "ready" | "waiting" | "pending" | "stale" | "paused" | "error";
 
 export interface ChatTimelineV1 {
   schemaVersion: 1;
@@ -213,6 +244,9 @@ export interface ChatTimelineV1 {
   analysisPolicyHash: string;
   active: boolean;
   paused: boolean;
+  updateMode: TimelineUpdateMode;
+  updateLagTurns: number;
+  pendingTurnCount: number;
   revision: number;
   health: TimelineHealth;
   error: string | null;
@@ -312,6 +346,9 @@ export interface TimelineView {
   chatId: string;
   active: boolean;
   paused: boolean;
+  updateMode: TimelineUpdateMode;
+  updateLagTurns: number;
+  pendingTurnCount: number;
   revision: number;
   health: TimelineHealth;
   error: string | null;
@@ -352,6 +389,8 @@ export type FrontendToBackend =
   | { type: "activation_preview"; chatId: string; requestId: string }
   | { type: "activate"; chatId: string; historyMode?: "full" | "recent"; recentMessageLimit?: number }
   | { type: "pause"; chatId: string; paused: boolean }
+  | { type: "set_update_policy"; chatId: string; mode: TimelineUpdateMode; lagTurns: number }
+  | { type: "update_now"; chatId: string }
   | { type: "rebuild"; chatId: string }
   | { type: "retry"; chatId: string }
   | { type: "save_settings"; requestId: string; patch: Partial<LumiMindSettings>; chatId?: string | null }
@@ -368,7 +407,11 @@ export type FrontendToBackend =
   | { type: "remove_item"; chatId: string; actorId: string; itemId: string }
   | { type: "toggle_item"; chatId: string; actorId: string; itemId: string; field: "locked" | "pinned" }
   | { type: "generate_seed"; characterId: string }
-  | { type: "generate_npc_core"; chatId: string; actorId: string; lore: string; requestId: string }
+  | { type: "generate_npc_core"; chatId: string; requestId: string; actorId?: string; name?: string; aliases?: string[]; cortexEntityId?: string | null; lore?: string }
+  | { type: "create_npc"; chatId: string; requestId: string; name: string; aliases: string[]; cortexEntityId?: string | null; core: MindCore }
+  | { type: "start_tidy"; chatId: string; requestId: string; actorIds: string[] }
+  | { type: "cancel_tidy"; chatId: string; requestId: string }
+  | { type: "apply_tidy"; chatId: string; requestId: string; proposalIds: string[] }
   | { type: "writeback_actor"; chatId: string; actorId: string };
 
 export type BackendToFrontend =
@@ -381,8 +424,15 @@ export type BackendToFrontend =
   | { type: "settings_saved"; requestId: string; settings: LumiMindSettings }
   | { type: "settings_save_error"; requestId: string; message: string }
   | { type: "seed_draft"; characterId: string; seed: MindSeedV1 }
-  | { type: "npc_core_draft"; requestId: string; chatId: string; actorId: string; core: MindCore }
-  | { type: "npc_core_draft_error"; requestId: string; chatId: string; actorId: string; message: string }
+  | { type: "npc_core_draft"; requestId: string; chatId: string; actorId?: string; core: MindCore }
+  | { type: "npc_core_draft_error"; requestId: string; chatId: string; actorId?: string; message: string }
+  | { type: "npc_created"; requestId: string; chatId: string; actorId: string }
+  | { type: "npc_create_error"; requestId: string; chatId: string; message: string }
+  | { type: "tidy_progress"; requestId: string; chatId: string; completed: number; total: number; actorId: string }
+  | { type: "tidy_result"; requestId: string; chatId: string; baseRevision: number; proposals: MindTidyProposal[]; errors: MindTidyActorError[] }
+  | { type: "tidy_applied"; requestId: string; chatId: string; applied: number }
+  | { type: "tidy_cancelled"; requestId: string; chatId: string }
+  | { type: "tidy_error"; requestId: string; chatId: string; message: string }
   | { type: "notice"; tone: "info" | "success" | "warning" | "error"; message: string }
   | { type: "error"; message: string };
 
