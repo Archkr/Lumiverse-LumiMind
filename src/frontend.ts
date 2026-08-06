@@ -1752,16 +1752,22 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     if (!timeline) return container;
     const heading = element("section", "lm-history-heading");
     const title = element("div");
-    title.append(element("div", "lm-kicker", "Deterministic fold"), element("h2", "lm-view-title", "Change timeline"));
+    title.append(element("div", "lm-kicker", "Timeline"), element("h2", "lm-view-title", "Changes"));
     const actions = element("div", "lm-inline-actions");
     actions.append(
       textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary"),
-      textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
+      textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "secondary"),
       textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
     );
     (actions.firstElementChild as HTMLButtonElement).disabled = timeline.paused || timeline.pendingTurnCount === 0 || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-    heading.append(title, actions);
-    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} · ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} · last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
+    const checkpoint = timeline.lastValidMessageIndex >= 0
+      ? `Analyzed through message ${timeline.lastValidMessageIndex + 1}`
+      : "No analyzed messages";
+    heading.append(
+      title,
+      element("p", "lm-view-copy", `${checkpoint} · ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} · ${formatRelativeTime(timeline.lastAnalyzedAt)}`),
+      actions,
+    );
     container.appendChild(heading);
     const feed = element("div", "lm-change-feed");
     const records = timeline.records.slice().reverse();

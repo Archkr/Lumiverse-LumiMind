@@ -480,8 +480,9 @@ var LUMI_MIND_CSS = `
 .lm-provenance blockquote { margin:4px 0 0; padding:5px 7px; border-left:2px solid var(--lm-line-hover); color:var(--lm-muted); font-size:9px; }
 
 .lm-scene-heading, .lm-history-heading, .lm-settings-heading { padding:5px 2px 2px; }
-.lm-history-heading { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:start; }
-.lm-history-heading > .lm-view-copy { grid-column:1/-1; }
+.lm-history-heading { display:flex; flex-direction:column; align-items:stretch; gap:8px; }
+.lm-history-heading > .lm-view-copy { margin-top:0 !important; }
+.lm-history-heading > .lm-inline-actions { align-self:flex-start; gap:6px; }
 .lm-scene-grid { display:grid; gap:8px; }
 .lm-scene-card { appearance:none; width:100%; padding:11px; border:1px solid var(--lm-line); border-radius:var(--lm-radius-lg); background:var(--lm-panel); text-align:left; cursor:pointer; transition:all var(--lm-transition); }
 .lm-scene-card:hover { border-color:var(--lm-line-hover); background:var(--lm-raised); transform:translateY(-1px); }
@@ -590,8 +591,6 @@ var LUMI_MIND_CSS = `
   .lm-brand-header { grid-template-columns:36px minmax(0,1fr) auto; }
   .lm-core-form, .lm-settings-grid, .lm-seed-grid { grid-template-columns:1fr; }
   .lm-core-form .lm-field:first-child, .lm-core-form .lm-modal-actions { grid-column:auto; }
-  .lm-history-heading { grid-template-columns:1fr; }
-  .lm-history-heading > .lm-view-copy { grid-column:auto; }
   .lm-mind-section-name { flex-direction:column; gap:0; }
   .lm-timeline-status { grid-template-columns:auto minmax(0,1fr); }
   .lm-timeline-status > .lm-inline-actions { grid-column:2; }
@@ -2152,16 +2151,20 @@ function setup(ctx) {
     if (!timeline) return container;
     const heading = element("section", "lm-history-heading");
     const title = element("div");
-    title.append(element("div", "lm-kicker", "Deterministic fold"), element("h2", "lm-view-title", "Change timeline"));
+    title.append(element("div", "lm-kicker", "Timeline"), element("h2", "lm-view-title", "Changes"));
     const actions = element("div", "lm-inline-actions");
     actions.append(
       textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary"),
-      textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "quiet"),
+      textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "secondary"),
       textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary")
     );
     actions.firstElementChild.disabled = timeline.paused || timeline.pendingTurnCount === 0 || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-    heading.append(title, actions);
-    heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} \xB7 ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} \xB7 last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
+    const checkpoint = timeline.lastValidMessageIndex >= 0 ? `Analyzed through message ${timeline.lastValidMessageIndex + 1}` : "No analyzed messages";
+    heading.append(
+      title,
+      element("p", "lm-view-copy", `${checkpoint} \xB7 ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} \xB7 ${formatRelativeTime(timeline.lastAnalyzedAt)}`),
+      actions
+    );
     container.appendChild(heading);
     const feed = element("div", "lm-change-feed");
     const records = timeline.records.slice().reverse();
