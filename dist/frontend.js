@@ -2163,9 +2163,30 @@ function setup(ctx) {
     heading.append(title, actions);
     heading.appendChild(element("p", "lm-view-copy", `Checkpoint through message ${Math.max(0, timeline.lastValidMessageIndex + 1)} \xB7 ${timeline.pendingTurnCount} pending ${timeline.pendingTurnCount === 1 ? "turn" : "turns"} \xB7 last analyzed ${formatRelativeTime(timeline.lastAnalyzedAt)}`));
     container.appendChild(heading);
+    const feed = element("div", "lm-change-feed");
+    const records = timeline.records.slice().reverse();
+    for (const record of records.slice(0, 200)) {
+      const row = element("article", `lm-change-row${record.changeCount ? " changed" : ""}`);
+      const marker = element("span", "lm-change-marker");
+      const copy = element("div", "lm-change-copy");
+      const telemetry = record.controller.telemetry;
+      const qualityNote = telemetry?.warningCodes.length ? ` \xB7 ${telemetry.warningCodes.join(", ")}` : "";
+      copy.append(
+        element("strong", void 0, `Message ${record.messageIndex + 1}`),
+        element("span", void 0, `Swipe ${record.swipeId + 1} \xB7 ${record.mentionCount} ${record.mentionCount === 1 ? "mention" : "mentions"} \xB7 ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}${qualityNote}`)
+      );
+      const time = element("time", void 0, formatRelativeTime(record.createdAt));
+      row.append(marker, copy, time);
+      feed.appendChild(row);
+    }
+    if (!records.length) feed.appendChild(element("div", "lm-empty-inline lm-large-empty", "No controller deltas have been committed to this branch yet."));
+    container.appendChild(feed);
+    return container;
+  }
+  function renderTimelineUpdateSettings(timeline) {
     const updatePolicy = element("section", "lm-settings-card lm-update-policy");
     updatePolicy.appendChild(element("h3", "lm-settings-title", "Timeline updates"));
-    updatePolicy.appendChild(element("p", "lm-settings-description", "Manual mode keeps injecting the last valid checkpoint but never starts background analysis. Update now processes all committed pending turns once."));
+    updatePolicy.appendChild(element("p", "lm-settings-description", "Applies only to the current chat. Manual mode keeps injecting the last valid checkpoint but never starts background analysis; Update now processes all committed pending turns once."));
     const mode = element("select", "lm-select");
     for (const [value, label] of [["immediate", "After every completed turn"], ["lagged", "Keep recent turns pending"], ["manual", "Manual only"]]) {
       const option = element("option", void 0, label);
@@ -2191,26 +2212,7 @@ function setup(ctx) {
     const policyGrid = element("div", "lm-settings-grid");
     policyGrid.append(field("Update mode", mode), field("Pending turns", lag, "The newest completed turns held back from automatic analysis."));
     updatePolicy.appendChild(policyGrid);
-    container.appendChild(updatePolicy);
-    const feed = element("div", "lm-change-feed");
-    const records = timeline.records.slice().reverse();
-    for (const record of records.slice(0, 200)) {
-      const row = element("article", `lm-change-row${record.changeCount ? " changed" : ""}`);
-      const marker = element("span", "lm-change-marker");
-      const copy = element("div", "lm-change-copy");
-      const telemetry = record.controller.telemetry;
-      const qualityNote = telemetry?.warningCodes.length ? ` \xB7 ${telemetry.warningCodes.join(", ")}` : "";
-      copy.append(
-        element("strong", void 0, `Message ${record.messageIndex + 1}`),
-        element("span", void 0, `Swipe ${record.swipeId + 1} \xB7 ${record.mentionCount} ${record.mentionCount === 1 ? "mention" : "mentions"} \xB7 ${record.changeCount} ${record.changeCount === 1 ? "change" : "changes"}${qualityNote}`)
-      );
-      const time = element("time", void 0, formatRelativeTime(record.createdAt));
-      row.append(marker, copy, time);
-      feed.appendChild(row);
-    }
-    if (!records.length) feed.appendChild(element("div", "lm-empty-inline lm-large-empty", "No controller deltas have been committed to this branch yet."));
-    container.appendChild(feed);
-    return container;
+    return updatePolicy;
   }
   function markSettingsDirty(saveButton) {
     settingsDirty = true;
@@ -2237,7 +2239,7 @@ function setup(ctx) {
     if (!currentState || !settingsDraft) return container;
     const heading = element("section", "lm-settings-heading");
     heading.append(element("div", "lm-kicker", "Roleplay, controller & privacy"), element("h2", "lm-view-title", "Mind Lens settings"));
-    heading.appendChild(element("p", "lm-view-copy", "Settings are user-scoped. Roleplay-mode changes rebuild activated timelines when they are opened."));
+    heading.appendChild(element("p", "lm-view-copy", "Most settings are user-scoped. Timeline updates applies only to the current chat."));
     container.appendChild(heading);
     const save = textButton(settingsSaving ? "Saving\u2026" : settingsDirty ? "Save settings" : "Saved", () => {
       void persistSettingsDraft().catch((error) => {
@@ -2245,6 +2247,7 @@ function setup(ctx) {
       });
     }, "primary");
     save.disabled = settingsSaving || !settingsDirty;
+    if (currentState.timeline?.active) container.appendChild(renderTimelineUpdateSettings(currentState.timeline));
     const behavior = element("section", "lm-settings-card");
     behavior.appendChild(element("h3", "lm-settings-title", "Roleplay behavior"));
     behavior.appendChild(element("p", "lm-settings-description", "Choose who LumiMind is allowed to manage. Reviewed seeds and locked manual edits remain stored while disabled actors are excluded from analysis, display, and injection."));
