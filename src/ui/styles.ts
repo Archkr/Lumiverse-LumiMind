@@ -33,7 +33,7 @@ export const LUMI_MIND_CSS = `
 .lm-root h1, .lm-root h2, .lm-root h3, .lm-root p { margin: 0; }
 .lm-root button, .lm-root input, .lm-root select, .lm-root textarea { font: inherit; }
 .lm-root button { color: inherit; }
-.lm-root svg { display: block; width: 100%; height: 100%; }
+.lm-icon > svg, .lm-brand-mark > svg, .lm-empty-icon > svg { display: block; width: 100%; height: 100%; }
 
 .lm-drawer {
   min-height: 100%;
