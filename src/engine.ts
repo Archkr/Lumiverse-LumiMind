@@ -30,7 +30,10 @@ import {
 
 export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerConnectionId: null,
+  controllerModel: null,
   controllerTemperature: 0.1,
+  controllerParallelRequests: 1,
+  controllerRequestsPerMinute: 0,
   analysisStateTokenBudget: 24_000,
   injectionTokenBudget: 8_000,
   injectionPosition: "prompt_start",
@@ -110,9 +113,22 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
   const chatHistoryMessageLimit = typeof raw.chatHistoryMessageLimit === "number"
     ? raw.chatHistoryMessageLimit
     : Number(raw.chatHistoryMessageLimit);
+  const controllerParallelRequests = typeof raw.controllerParallelRequests === "number"
+    ? raw.controllerParallelRequests
+    : Number(raw.controllerParallelRequests);
+  const controllerRequestsPerMinute = typeof raw.controllerRequestsPerMinute === "number"
+    ? raw.controllerRequestsPerMinute
+    : Number(raw.controllerRequestsPerMinute);
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
+    controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
+    controllerParallelRequests: Math.round(Number.isFinite(controllerParallelRequests)
+      ? Math.min(20, Math.max(1, controllerParallelRequests))
+      : DEFAULT_SETTINGS.controllerParallelRequests),
+    controllerRequestsPerMinute: Math.round(Number.isFinite(controllerRequestsPerMinute)
+      ? Math.max(0, controllerRequestsPerMinute)
+      : DEFAULT_SETTINGS.controllerRequestsPerMinute),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget)
       ? Math.max(0, analysisStateTokenBudget)
       : DEFAULT_SETTINGS.analysisStateTokenBudget),

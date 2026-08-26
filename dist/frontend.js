@@ -512,6 +512,7 @@ var LUMI_MIND_CSS = `
 .lm-settings-description { max-width:440px; margin-top:3px !important; color:var(--lm-muted); font-size:9px; }
 .lm-settings-grid, .lm-seed-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .lm-field { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.lm-model-picker { width:100%; min-width:0; }
 .lm-label { color:var(--lm-muted); font-size:10px; font-weight:650; }
 .lm-field-hint { color:var(--lm-dim); font-size:9px; }
 .lm-input, .lm-select, .lm-textarea { appearance:none; width:100%; border:1px solid var(--lm-line); border-radius:8px; outline:none; background:var(--lm-fill); color:var(--lm-text); transition:border-color var(--lm-transition),background var(--lm-transition),box-shadow var(--lm-transition); }
@@ -748,6 +749,8 @@ function setup(ctx) {
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise = null;
+  let settingsModelPicker = null;
+  let pendingSettingsModelMount = null;
   let seedTab = null;
   let seedRoot = null;
   let seedEditorUnsub = null;
@@ -944,6 +947,7 @@ function setup(ctx) {
       permissions: state?.permissions ?? null,
       controller: state ? {
         dedicatedConnectionSelected: !!state.settings.controllerConnectionId,
+        modelOverrideSelected: !!state.settings.controllerModel,
         connectionCount: state.connections.length,
         connections: state.connections.map((connection) => ({
           provider: connection.provider,
@@ -952,6 +956,8 @@ function setup(ctx) {
           credentialConfigured: connection.hasApiKey
         })),
         temperature: state.settings.controllerTemperature,
+        parallelRequests: state.settings.controllerParallelRequests,
+        requestsPerMinute: state.settings.controllerRequestsPerMinute,
         stateTokenBudget: state.settings.analysisStateTokenBudget,
         contextMessageLimit: state.settings.analysisContextMessageLimit
       } : null,
@@ -2225,6 +2231,19 @@ function setup(ctx) {
       saveButton.textContent = "Save settings";
     }
   }
+  function destroySettingsModelPicker() {
+    if (!settingsModelPicker) return;
+    try {
+      settingsModelPicker.destroy();
+    } catch {
+    }
+    settingsModelPicker = null;
+  }
+  function flushSettingsModelMount() {
+    const mount = pendingSettingsModelMount;
+    pendingSettingsModelMount = null;
+    mount?.();
+  }
   function renderToggle(label, description, checked, onChange) {
     const row = element("label", "lm-toggle-row");
     const copy = element("span", "lm-toggle-copy");
@@ -2313,9 +2332,47 @@ function setup(ctx) {
     connection.addEventListener("change", () => {
       if (!settingsDraft) return;
       settingsDraft.controllerConnectionId = connection.value || null;
+      settingsDraft.controllerModel = null;
       markSettingsDirty(save);
+      render();
     });
     controller.appendChild(field("Connection", connection, "Used for background analysis. Defaults to the active chat connection."));
+    const selectedConnection = currentState.connections.find((option) => option.id === settingsDraft?.controllerConnectionId) ?? null;
+    const generationAvailable = currentState.permissions.generation;
+    const modelSlot = element("div", "lm-model-picker");
+    const setControllerModel = (value) => {
+      if (!settingsDraft) return;
+      settingsDraft.controllerModel = value.trim() || null;
+      markSettingsDirty(save);
+    };
+    const renderModelFallback = () => {
+      modelSlot.replaceChildren();
+      const control = input(settingsDraft?.controllerModel ?? "", selectedConnection?.model || "Use connection default");
+      control.disabled = !generationAvailable;
+      control.addEventListener("input", () => setControllerModel(control.value));
+      modelSlot.appendChild(control);
+    };
+    pendingSettingsModelMount = () => {
+      try {
+        settingsModelPicker = ctx.components.mountModelCombobox(modelSlot, {
+          value: settingsDraft?.controllerModel ?? "",
+          connection: settingsDraft?.controllerConnectionId ? { kind: "llm", id: settingsDraft.controllerConnectionId } : { kind: "llm" },
+          appearance: "standard",
+          placeholder: selectedConnection?.model || "Use connection default",
+          emptyMessage: "No models returned by this connection.",
+          browseHint: selectedConnection?.model ? `Connection default: ${selectedConnection.model}` : "Leave blank to use the active connection's default model.",
+          disabled: !generationAvailable,
+          onChange: setControllerModel
+        });
+      } catch {
+        renderModelFallback();
+      }
+    };
+    controller.appendChild(field(
+      "Model",
+      modelSlot,
+      "Optional model override for this controller connection. Leave blank to use its configured default."
+    ));
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (label, key, min, max, step, description) => {
       const control = element("input", "lm-input");
@@ -2336,6 +2393,22 @@ function setup(ctx) {
     };
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
+      numberSetting(
+        "Parallel requests",
+        "controllerParallelRequests",
+        1,
+        20,
+        1,
+        "Maximum controller calls run at once during Mind Tidy. Timeline analysis remains ordered."
+      ),
+      numberSetting(
+        "Requests per minute",
+        "controllerRequestsPerMinute",
+        0,
+        null,
+        1,
+        "Rate cap shared across controller calls for the same provider. 0 disables throttling."
+      ),
       numberSetting(
         "Analysis state tokens",
         "analysisStateTokenBudget",
@@ -2433,6 +2506,8 @@ function setup(ctx) {
     return container;
   }
   function render() {
+    destroySettingsModelPicker();
+    pendingSettingsModelMount = null;
     root.replaceChildren();
     root.appendChild(renderHeader());
     const banner = renderNotice();
@@ -2446,6 +2521,7 @@ function setup(ctx) {
     root.appendChild(renderNav());
     if (activeView === "settings") {
       root.appendChild(renderSettings());
+      flushSettingsModelMount();
       return;
     }
     const missing = missingAnalysisPermissions(currentState);
@@ -2831,6 +2907,7 @@ function setup(ctx) {
     }
     tidyReviewModal?.dismiss();
     npcCoreGenerating.clear();
+    destroySettingsModelPicker();
     destroySeedTab();
     while (cleanups.length) {
       try {

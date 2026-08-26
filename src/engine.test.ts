@@ -560,14 +560,20 @@ describe("hashing, settings, and compaction", () => {
 
   it("normalizes configurable limits without imposing maximum values", () => {
     const settings = normalizeSettings({
+      controllerModel: "  openai/gpt-5-mini  ",
       controllerTemperature: 9,
+      controllerParallelRequests: 99,
+      controllerRequestsPerMinute: 240,
       analysisStateTokenBudget: 240_000,
       injectionTokenBudget: 80_000,
       analysisContextMessageLimit: 99,
       chatHistoryMessageLimit: 1200,
     });
     expect(settings).toMatchObject({
+      controllerModel: "openai/gpt-5-mini",
       controllerTemperature: 2,
+      controllerParallelRequests: 20,
+      controllerRequestsPerMinute: 240,
       analysisStateTokenBudget: 240_000,
       injectionTokenBudget: 80_000,
       analysisContextMessageLimit: 99,
@@ -589,6 +595,9 @@ describe("hashing, settings, and compaction", () => {
     });
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
+    expect(normalizeSettings({ controllerModel: "   " }).controllerModel).toBeNull();
+    expect(normalizeSettings({ controllerParallelRequests: 0 }).controllerParallelRequests).toBe(1);
+    expect(normalizeSettings({ controllerRequestsPerMinute: -4 }).controllerRequestsPerMinute).toBe(0);
     expect(normalizeSettings({ injectionPosition: "before_last_user" }).injectionPosition).toBe("before_last_user");
     expect(normalizeSettings({ injectionPosition: "unsupported" }).injectionPosition).toBe("prompt_start");
     expect(analysisPolicyHash(DEFAULT_SETTINGS)).toBe(stableHash("ledger-policy:1|persona:1|director:0"));

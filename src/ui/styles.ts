@@ -244,6 +244,7 @@ export const LUMI_MIND_CSS = `
 .lm-settings-description { max-width:440px; margin-top:3px !important; color:var(--lm-muted); font-size:9px; }
 .lm-settings-grid, .lm-seed-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
 .lm-field { display:flex; flex-direction:column; gap:5px; min-width:0; }
+.lm-model-picker { width:100%; min-width:0; }
 .lm-label { color:var(--lm-muted); font-size:10px; font-weight:650; }
 .lm-field-hint { color:var(--lm-dim); font-size:9px; }
 .lm-input, .lm-select, .lm-textarea { appearance:none; width:100%; border:1px solid var(--lm-line); border-radius:8px; outline:none; background:var(--lm-fill); color:var(--lm-text); transition:border-color var(--lm-transition),background var(--lm-transition),box-shadow var(--lm-transition); }

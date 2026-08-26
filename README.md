@@ -165,7 +165,7 @@ Use the update action on LumiMind’s entry in Lumiverse’s Extensions panel, t
 | 1 | Open a character or group chat | Lumiverse |
 | 2 | Open **Mind Lens** | Drawer or `Ctrl+K` |
 | 3 | Choose **Activate Mind Lens**; on chats with 50+ messages, choose full or configured-recent history | Mind Lens |
-| 4 | Select a controller connection, or keep the active-connection fallback | Settings |
+| 4 | Select a controller connection and optional model override, or keep the active-connection fallback | Settings |
 | 5 | Choose whether LumiMind may manage your persona | Settings → Roleplay behavior |
 | 6 | Enable Director mode if the card portrays a cast instead of itself | Settings → Roleplay behavior |
 | 7 | Let initialization finish while you continue chatting normally | Changes / status bar |
@@ -358,7 +358,10 @@ LumiMind settings are user-scoped and apply across chats.
 | Setting | Default | What it does |
 |---|---:|---|
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
+| Controller model | Connection default | Uses Lumiverse's connection-aware model catalog to override the selected connection's configured model. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
+| Parallel requests | `1` | Maximum independent controller calls run at once during Mind Tidy. Ordered timeline analysis remains sequential. |
+| Requests per minute | Unlimited | Rolling per-provider controller request cap; `0` disables throttling. |
 | Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |
 | Private injection tokens | `8,000` | Target token budget for state added to a roleplay prompt. All stored state remains in the timeline and Mind Lens; `0` injects all eligible state. |
 | Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
@@ -402,13 +405,13 @@ Additional calls can occur when:
 
 Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
 
-Mind Tidy is always explicit and review-first. It makes exactly one sequential controller request per selected actor, so **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
+Mind Tidy is always explicit and review-first. It makes exactly one controller request per selected actor, with up to **Parallel requests** calls in flight at once and the configured **Requests per minute** cap shared across the provider. **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
 
 The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message at the configured prompt position. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
 Controller analysis uses the selected controller model's tokenizer and always keeps actor identity stubs available. Ranking favors actors named in the current batch, current presence, lexical relevance, protected or pinned state, relationships to relevant actors, and recency, with fair allocation across relevant actors. LumiMind uses Spindle's provider mapping to force one schema-backed tool call and disables inherited reasoning with `reasoning: { source: "off" }`; plain JSON remains a compatibility fallback. If tokenization fails, diagnostics mark the `characters / 4` estimate used for that request.
 
-LumiMind uses the dedicated controller connection selected in Settings. If none is selected, it falls back to the active connection for the chat. It uses Lumiverse connection profiles and does not read or store API credentials.
+LumiMind uses the dedicated controller connection and optional model override selected in Settings. If no connection is selected, it falls back to the active connection for the chat; a blank model override uses that connection's configured default. It uses Lumiverse connection profiles and does not read or store API credentials.
 
 ---
 

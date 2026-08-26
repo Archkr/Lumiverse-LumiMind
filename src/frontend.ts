@@ -1,6 +1,7 @@
 import type {
   SpindleCharacterEditorState,
   SpindleFrontendContext,
+  SpindleModelComboboxHandle,
 } from "lumiverse-spindle-types";
 import type {
   ActorMind,
@@ -221,6 +222,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise: Promise<LumiMindSettings> | null = null;
+  let settingsModelPicker: SpindleModelComboboxHandle | null = null;
+  let pendingSettingsModelMount: (() => void) | null = null;
 
   let seedTab: ReturnType<SpindleFrontendContext["ui"]["registerCharacterEditorTab"]> | null = null;
   let seedRoot: HTMLElement | null = null;
@@ -428,6 +431,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       permissions: state?.permissions ?? null,
       controller: state ? {
         dedicatedConnectionSelected: !!state.settings.controllerConnectionId,
+        modelOverrideSelected: !!state.settings.controllerModel,
         connectionCount: state.connections.length,
         connections: state.connections.map((connection) => ({
           provider: connection.provider,
@@ -436,6 +440,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           credentialConfigured: connection.hasApiKey,
         })),
         temperature: state.settings.controllerTemperature,
+        parallelRequests: state.settings.controllerParallelRequests,
+        requestsPerMinute: state.settings.controllerRequestsPerMinute,
         stateTokenBudget: state.settings.analysisStateTokenBudget,
         contextMessageLimit: state.settings.analysisContextMessageLimit,
       } : null,
@@ -1831,6 +1837,18 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
   }
 
+  function destroySettingsModelPicker(): void {
+    if (!settingsModelPicker) return;
+    try { settingsModelPicker.destroy(); } catch { /* The host may already have detached it. */ }
+    settingsModelPicker = null;
+  }
+
+  function flushSettingsModelMount(): void {
+    const mount = pendingSettingsModelMount;
+    pendingSettingsModelMount = null;
+    mount?.();
+  }
+
   function renderToggle(label: string, description: string, checked: boolean, onChange: (checked: boolean) => void): HTMLElement {
     const row = element("label", "lm-toggle-row");
     const copy = element("span", "lm-toggle-copy");
@@ -1924,13 +1942,55 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     connection.addEventListener("change", () => {
       if (!settingsDraft) return;
       settingsDraft.controllerConnectionId = connection.value || null;
+      settingsDraft.controllerModel = null;
       markSettingsDirty(save);
+      render();
     });
     controller.appendChild(field("Connection", connection, "Used for background analysis. Defaults to the active chat connection."));
+    const selectedConnection = currentState.connections.find((option) => option.id === settingsDraft?.controllerConnectionId) ?? null;
+    const generationAvailable = currentState.permissions.generation;
+    const modelSlot = element("div", "lm-model-picker");
+    const setControllerModel = (value: string): void => {
+      if (!settingsDraft) return;
+      settingsDraft.controllerModel = value.trim() || null;
+      markSettingsDirty(save);
+    };
+    const renderModelFallback = (): void => {
+      modelSlot.replaceChildren();
+      const control = input(settingsDraft?.controllerModel ?? "", selectedConnection?.model || "Use connection default");
+      control.disabled = !generationAvailable;
+      control.addEventListener("input", () => setControllerModel(control.value));
+      modelSlot.appendChild(control);
+    };
+    pendingSettingsModelMount = () => {
+      try {
+        settingsModelPicker = ctx.components.mountModelCombobox(modelSlot, {
+          value: settingsDraft?.controllerModel ?? "",
+          connection: settingsDraft?.controllerConnectionId
+            ? { kind: "llm", id: settingsDraft.controllerConnectionId }
+            : { kind: "llm" },
+          appearance: "standard",
+          placeholder: selectedConnection?.model || "Use connection default",
+          emptyMessage: "No models returned by this connection.",
+          browseHint: selectedConnection?.model
+            ? `Connection default: ${selectedConnection.model}`
+            : "Leave blank to use the active connection's default model.",
+          disabled: !generationAvailable,
+          onChange: setControllerModel,
+        });
+      } catch {
+        renderModelFallback();
+      }
+    };
+    controller.appendChild(field(
+      "Model",
+      modelSlot,
+      "Optional model override for this controller connection. Leave blank to use its configured default.",
+    ));
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
-      key: "controllerTemperature" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
+      key: "controllerTemperature" | "controllerParallelRequests" | "controllerRequestsPerMinute" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
       max: number | null,
       step: number,
@@ -1956,6 +2016,22 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     };
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
+      numberSetting(
+        "Parallel requests",
+        "controllerParallelRequests",
+        1,
+        20,
+        1,
+        "Maximum controller calls run at once during Mind Tidy. Timeline analysis remains ordered.",
+      ),
+      numberSetting(
+        "Requests per minute",
+        "controllerRequestsPerMinute",
+        0,
+        null,
+        1,
+        "Rate cap shared across controller calls for the same provider. 0 disables throttling.",
+      ),
       numberSetting(
         "Analysis state tokens",
         "analysisStateTokenBudget",
@@ -2059,6 +2135,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   }
 
   function render(): void {
+    destroySettingsModelPicker();
+    pendingSettingsModelMount = null;
     root.replaceChildren();
     root.appendChild(renderHeader());
     const banner = renderNotice();
@@ -2072,6 +2150,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     root.appendChild(renderNav());
     if (activeView === "settings") {
       root.appendChild(renderSettings());
+      flushSettingsModelMount();
       return;
     }
     const missing = missingAnalysisPermissions(currentState);
@@ -2457,6 +2536,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
     tidyReviewModal?.dismiss();
     npcCoreGenerating.clear();
+    destroySettingsModelPicker();
     destroySeedTab();
     while (cleanups.length) {
       try { cleanups.pop()?.(); } catch { /* Best-effort teardown. */ }

@@ -6,7 +6,10 @@ var EXTENSION_KEY = "lumi_mind";
 // src/engine.ts
 var DEFAULT_SETTINGS = {
   controllerConnectionId: null,
+  controllerModel: null,
   controllerTemperature: 0.1,
+  controllerParallelRequests: 1,
+  controllerRequestsPerMinute: 0,
   analysisStateTokenBudget: 24e3,
   injectionTokenBudget: 8e3,
   injectionPosition: "prompt_start",
@@ -70,9 +73,14 @@ function normalizeSettings(value) {
   const injectionTokenBudget = typeof raw.injectionTokenBudget === "number" ? raw.injectionTokenBudget : Number(raw.injectionTokenBudget);
   const analysisContextMessageLimit = typeof raw.analysisContextMessageLimit === "number" ? raw.analysisContextMessageLimit : Number(raw.analysisContextMessageLimit);
   const chatHistoryMessageLimit = typeof raw.chatHistoryMessageLimit === "number" ? raw.chatHistoryMessageLimit : Number(raw.chatHistoryMessageLimit);
+  const controllerParallelRequests = typeof raw.controllerParallelRequests === "number" ? raw.controllerParallelRequests : Number(raw.controllerParallelRequests);
+  const controllerRequestsPerMinute = typeof raw.controllerRequestsPerMinute === "number" ? raw.controllerRequestsPerMinute : Number(raw.controllerRequestsPerMinute);
   return {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
+    controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
+    controllerParallelRequests: Math.round(Number.isFinite(controllerParallelRequests) ? Math.min(20, Math.max(1, controllerParallelRequests)) : DEFAULT_SETTINGS.controllerParallelRequests),
+    controllerRequestsPerMinute: Math.round(Number.isFinite(controllerRequestsPerMinute) ? Math.max(0, controllerRequestsPerMinute) : DEFAULT_SETTINGS.controllerRequestsPerMinute),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget) ? Math.max(0, analysisStateTokenBudget) : DEFAULT_SETTINGS.analysisStateTokenBudget),
     injectionTokenBudget: Math.round(Number.isFinite(injectionTokenBudget) ? Math.max(0, injectionTokenBudget) : DEFAULT_SETTINGS.injectionTokenBudget),
     injectionPosition: raw.injectionPosition === "before_last_user" || raw.injectionPosition === "prompt_end" ? raw.injectionPosition : DEFAULT_SETTINGS.injectionPosition,
@@ -1492,6 +1500,105 @@ function buildProjectedDirectorMindInjection(timeline, settings, contextMessages
   return projectMindInjection(timeline, null, settings, contextMessages, countTokens, true);
 }
 
+// src/controller-scheduling.ts
+var DEFAULT_WINDOW_MS = 6e4;
+var STALE_GATE_TTL_MS = 10 * 6e4;
+var rpmGates = /* @__PURE__ */ new Map();
+var sweepTimer = null;
+function abortReason(signal) {
+  return signal?.reason ?? new DOMException("Aborted", "AbortError");
+}
+function pruneExpired(timestamps, now, windowMs) {
+  while (timestamps.length > 0 && now - timestamps[0] >= windowMs) timestamps.shift();
+}
+function startSweep() {
+  if (sweepTimer) return;
+  sweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, gate] of rpmGates) {
+      pruneExpired(gate.timestamps, now, DEFAULT_WINDOW_MS);
+      if (gate.timestamps.length === 0 && now - gate.lastTouchedAt > STALE_GATE_TTL_MS) rpmGates.delete(key);
+    }
+  }, DEFAULT_WINDOW_MS);
+  if (typeof sweepTimer.unref === "function") {
+    sweepTimer.unref();
+  }
+}
+function gateFor(key) {
+  const existing = rpmGates.get(key);
+  if (existing) return existing;
+  const created = {
+    timestamps: [],
+    tail: Promise.resolve(),
+    lastTouchedAt: Date.now()
+  };
+  rpmGates.set(key, created);
+  startSweep();
+  return created;
+}
+function waitForDelay(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+async function waitForControllerRpmSlot(options) {
+  const requestsPerMinute = Number.isFinite(options.requestsPerMinute) ? Math.max(0, Math.floor(options.requestsPerMinute)) : 0;
+  if (requestsPerMinute === 0) return;
+  const windowMs = Math.max(1, Math.floor(options.windowMs ?? DEFAULT_WINDOW_MS));
+  const key = `${options.userId}:${options.provider?.trim().toLocaleLowerCase() || "active"}`;
+  const gate = gateFor(key);
+  let release;
+  const previous = gate.tail;
+  gate.tail = new Promise((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    while (true) {
+      if (options.signal?.aborted) throw abortReason(options.signal);
+      const now = Date.now();
+      pruneExpired(gate.timestamps, now, windowMs);
+      if (gate.timestamps.length < requestsPerMinute) {
+        gate.timestamps.push(now);
+        gate.lastTouchedAt = now;
+        return;
+      }
+      await waitForDelay(Math.max(1, windowMs - (now - gate.timestamps[0])), options.signal);
+    }
+  } finally {
+    gate.lastTouchedAt = Date.now();
+    release();
+  }
+}
+async function mapWithConcurrency(items, limit, mapper) {
+  if (items.length === 0) return [];
+  const results = new Array(items.length);
+  const requestedWorkers = Number.isFinite(limit) ? Math.floor(limit) : 1;
+  const workerCount = Math.min(items.length, Math.max(1, requestedWorkers));
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 // src/controller.ts
 var THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
 var ANALYSIS_TOOL_NAME = "lumi_mind_analysis_v1";
@@ -1997,9 +2104,10 @@ function toolChoiceParameters(provider) {
 }
 async function resolveConnection(settings, userId, fallbackConnectionId) {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
-  if (!id) return { id: null, provider: null, model: null };
+  const configuredModel = settings.controllerModel?.trim() || null;
+  if (!id) return { id: null, provider: null, model: configuredModel };
   const connection = await spindle.connections.get(id, userId).catch(() => null);
-  return { id, provider: connection?.provider ?? null, model: connection?.model ?? null };
+  return { id, provider: connection?.provider ?? null, model: configuredModel ?? connection?.model ?? null };
 }
 function fallbackTokenMeasurement(textValue, model) {
   return {
@@ -2044,6 +2152,12 @@ function controllerTokenCounter(connection, userId) {
 }
 async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal) {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
+  await waitForControllerRpmSlot({
+    userId,
+    provider: connection.provider,
+    requestsPerMinute: settings.controllerRequestsPerMinute,
+    signal
+  });
   const result = await spindle.generate.quiet({
     type: "quiet",
     messages: [
@@ -2052,6 +2166,9 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
     ],
     parameters: {
       temperature: settings.controllerTemperature,
+      // A blank override deliberately selects the connection default and keeps
+      // legacy preset model fields from replacing it inside quiet generation.
+      model: settings.controllerModel?.trim() ?? "",
       ...toolChoiceParameters(connection.provider)
     },
     tools: [{
@@ -3248,12 +3365,12 @@ async function runTidy(userId, chatId, requestId, requestedActorIds) {
   const proposals = [];
   const errors = [];
   try {
-    for (let index = 0; index < actors.length; index += 1) {
+    let completed = 0;
+    const outcomes = await mapWithConcurrency(actors, settings.controllerParallelRequests, async (actor) => {
       abortController.signal.throwIfAborted();
-      const actor = actors[index];
       const snapshot = actorSnapshots.get(actor.id);
       try {
-        proposals.push(...await generateMindTidyProposals({
+        const actorProposals = await generateMindTidyProposals({
           actor: snapshot.actor,
           mind: snapshot.mind,
           knownActors,
@@ -3262,12 +3379,26 @@ async function runTidy(userId, chatId, requestId, requestedActorIds) {
           userId,
           fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
           signal: abortController.signal
-        }));
+        });
+        completed += 1;
+        send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
+        return { proposals: actorProposals, error: null };
       } catch (error) {
-        if (isAbortError(error)) throw error;
-        errors.push({ actorId: actor.id, message: error instanceof Error ? error.message : String(error) });
+        if (isAbortError(error)) {
+          abortController.abort();
+          throw error;
+        }
+        completed += 1;
+        send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
+        return {
+          proposals: [],
+          error: { actorId: actor.id, message: error instanceof Error ? error.message : String(error) }
+        };
       }
-      send({ type: "tidy_progress", requestId, chatId, completed: index + 1, total: actors.length, actorId: actor.id }, userId);
+    });
+    for (const outcome of outcomes) {
+      proposals.push(...outcome.proposals);
+      if (outcome.error) errors.push(outcome.error);
     }
     tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, expiresAt: Date.now() + 15 * 6e4 });
     send({ type: "tidy_result", requestId, chatId, baseRevision, proposals, errors }, userId);

@@ -264,6 +264,7 @@ describe("controller response parsing", () => {
       tools: Array<{ name: string; parameters: Record<string, unknown> }>;
     };
     expect(request.parameters).toMatchObject(expectedChoice);
+    expect(request.parameters.model).toBe("");
     expect(request.parameters).not.toHaveProperty("max_tokens");
     expect(request.reasoning).toEqual({ source: "off" });
     expect(request.tools).toHaveLength(1);
@@ -280,6 +281,34 @@ describe("controller response parsing", () => {
     expect(systemPrompt).toContain("Map a motive, desire, intention, or intended outcome to goal");
     expect(systemPrompt).toContain("Every actor mention must cite one supplied messageId. Every change must cite one supplied messageId and a short evidenceExcerpt.");
     expect(systemPrompt).not.toContain("Every actor mention and change must cite");
+  });
+
+  it("uses the selected controller model for generation and token counting", async () => {
+    const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
+    const countText = vi.fn(async () => ({ total_tokens: 10, model: "override-model", tokenizer_name: "override-tokenizer", approximate: false }));
+    const countMessages = vi.fn(async () => ({ total_tokens: 20, model: "override-model", tokenizer_name: "override-tokenizer", approximate: false }));
+    (globalThis as Record<string, unknown>).spindle = {
+      generate: { quiet },
+      connections: { get: vi.fn().mockResolvedValue({ provider: "openrouter", model: "connection-model" }) },
+      tokens: { countText, countMessages },
+    };
+
+    const result = await analyzeMessages({
+      messages: [{ id: "m1", role: "assistant", content: "A covered scene.", index_in_chat: 0 }],
+      recentContext: [],
+      compactState: [{ ref: "mira", name: "Mira", managed: true, items: [{ id: "belief", category: "belief", text: "The room is safe", controllerWritable: false }] }],
+      settings: { ...DEFAULT_SETTINGS, controllerConnectionId: "connection-1", controllerModel: "override-model" },
+      userId: "user",
+    });
+
+    expect(quiet.mock.calls[0][0]).toMatchObject({
+      connection_id: "connection-1",
+      parameters: { model: "override-model" },
+    });
+    expect(countText).toHaveBeenCalledWith(expect.any(String), { model: "override-model", userId: "user" });
+    expect(countMessages).toHaveBeenCalledWith(expect.any(Array), { model: "override-model", userId: "user" });
+    expect(result.meta.model).toBe("override-model");
+    expect(result.telemetry.tokenModel).toBe("override-model");
   });
 
   it("falls back to plain JSON when a provider does not return tool arguments", async () => {

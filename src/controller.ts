@@ -12,6 +12,7 @@ import {
   type TokenCounter,
   type TokenMeasurement,
 } from "./engine";
+import { waitForControllerRpmSlot } from "./controller-scheduling";
 import type {
   ActorMind,
   ActorRecord,
@@ -644,9 +645,10 @@ function toolChoiceParameters(provider: string | null): Record<string, unknown> 
 
 async function resolveConnection(settings: LumiMindSettings, userId: string, fallbackConnectionId?: string | null): Promise<ResolvedConnection> {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
-  if (!id) return { id: null, provider: null, model: null };
+  const configuredModel = settings.controllerModel?.trim() || null;
+  if (!id) return { id: null, provider: null, model: configuredModel };
   const connection = await spindle.connections.get(id, userId).catch(() => null);
-  return { id, provider: connection?.provider ?? null, model: connection?.model ?? null };
+  return { id, provider: connection?.provider ?? null, model: configuredModel ?? connection?.model ?? null };
 }
 
 function fallbackTokenMeasurement(textValue: string, model: string | null): TokenMeasurement {
@@ -723,6 +725,12 @@ async function quietJson(
   providerInputTokens: number | null;
 }> {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
+  await waitForControllerRpmSlot({
+    userId,
+    provider: connection.provider,
+    requestsPerMinute: settings.controllerRequestsPerMinute,
+    signal,
+  });
   const result = await spindle.generate.quiet({
     type: "quiet",
     messages: [
@@ -731,6 +739,9 @@ async function quietJson(
     ],
     parameters: {
       temperature: settings.controllerTemperature,
+      // A blank override deliberately selects the connection default and keeps
+      // legacy preset model fields from replacing it inside quiet generation.
+      model: settings.controllerModel?.trim() ?? "",
       ...toolChoiceParameters(connection.provider),
     },
     tools: [{

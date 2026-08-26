@@ -2,6 +2,7 @@ declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
 import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
 import { analyzeMessages, composeNpcCoreLore, generateMindTidyProposals, generateNpcCoreDraft, generateSeedDraft, isAbortError } from "./controller";
+import { mapWithConcurrency } from "./controller-scheduling";
 import {
   DEFAULT_SETTINGS,
   addManualItem,
@@ -848,12 +849,15 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
   const proposals: MindTidyProposal[] = [];
   const errors: MindTidyActorError[] = [];
   try {
-    for (let index = 0; index < actors.length; index += 1) {
+    let completed = 0;
+    const outcomes = await mapWithConcurrency(actors, settings.controllerParallelRequests, async (actor): Promise<{
+      proposals: MindTidyProposal[];
+      error: MindTidyActorError | null;
+    }> => {
       abortController.signal.throwIfAborted();
-      const actor = actors[index];
       const snapshot = actorSnapshots.get(actor.id)!;
       try {
-        proposals.push(...await generateMindTidyProposals({
+        const actorProposals = await generateMindTidyProposals({
           actor: snapshot.actor,
           mind: snapshot.mind,
           knownActors,
@@ -862,12 +866,26 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
           userId,
           fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
           signal: abortController.signal,
-        }));
+        });
+        completed += 1;
+        send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
+        return { proposals: actorProposals, error: null };
       } catch (error) {
-        if (isAbortError(error)) throw error;
-        errors.push({ actorId: actor.id, message: error instanceof Error ? error.message : String(error) });
+        if (isAbortError(error)) {
+          abortController.abort();
+          throw error;
+        }
+        completed += 1;
+        send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
+        return {
+          proposals: [],
+          error: { actorId: actor.id, message: error instanceof Error ? error.message : String(error) },
+        };
       }
-      send({ type: "tidy_progress", requestId, chatId, completed: index + 1, total: actors.length, actorId: actor.id }, userId);
+    });
+    for (const outcome of outcomes) {
+      proposals.push(...outcome.proposals);
+      if (outcome.error) errors.push(outcome.error);
     }
     tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, expiresAt: Date.now() + 15 * 60_000 });
     send({ type: "tidy_result", requestId, chatId, baseRevision, proposals, errors }, userId);

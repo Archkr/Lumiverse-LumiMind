@@ -273,7 +273,10 @@ export interface TimelineDatabaseArchiveV1 {
 
 export interface LumiMindSettings {
   controllerConnectionId: string | null;
+  controllerModel: string | null;
   controllerTemperature: number;
+  controllerParallelRequests: number;
+  controllerRequestsPerMinute: number;
   analysisStateTokenBudget: number;
   injectionTokenBudget: number;
   injectionPosition: "prompt_start" | "before_last_user" | "prompt_end";
