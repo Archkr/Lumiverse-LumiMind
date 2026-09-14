@@ -599,7 +599,6 @@ var LUMI_MIND_CSS = `
 
 @media (max-width: 520px) {
   .lm-drawer { padding-left:10px; padding-right:10px; }
-  .lm-status { display:none; }
   .lm-brand-header { grid-template-columns:36px minmax(0,1fr) auto; }
   .lm-core-form, .lm-settings-grid, .lm-seed-grid { grid-template-columns:1fr; }
   .lm-core-form .lm-field:first-child, .lm-core-form .lm-modal-actions { grid-column:auto; }
