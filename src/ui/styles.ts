@@ -31,11 +31,12 @@ export const LUMI_MIND_CSS = `
 
 .lm-root *, .lm-root *::before, .lm-root *::after { box-sizing: border-box; }
 .lm-root h1, .lm-root h2, .lm-root h3, .lm-root p { margin: 0; }
-.lm-root button, .lm-root input, .lm-root select, .lm-root textarea { font: inherit; }
-.lm-root button { color: inherit; }
+.lm-root :where(button, input, select, textarea) { font: inherit; }
+.lm-root :where(button) { color: inherit; }
 .lm-icon > svg, .lm-brand-mark > svg, .lm-empty-icon > svg { display: block; width: 100%; height: 100%; }
 
 .lm-drawer {
+  container-type: inline-size;
   min-height: 100%;
   padding: 15px 14px 28px;
   display: flex;
@@ -56,9 +57,11 @@ export const LUMI_MIND_CSS = `
   box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 8px 25px rgba(0,0,0,.15);
 }
 .lm-brand-copy { min-width: 0; }
+.lm-brand-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.lm-brand-line .lm-status { padding:2px 6px; font-size:9px; }
 .lm-eyebrow, .lm-kicker { color: var(--lm-accent); font-size: 10px; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
-.lm-brand-title { color: var(--lm-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-.lm-header-actions { display: flex; align-items: center; gap: 5px; }
+.lm-brand-title { color: var(--lm-muted); font-size: 11px; margin-top: 3px; }
+.lm-header-actions { flex-shrink:0; }
 .lm-status { padding: 4px 7px; border: 1px solid var(--lm-line); border-radius: 999px; color: var(--lm-muted); font-size: 10px; font-weight: 700; white-space: nowrap; background: var(--lm-fill); }
 .lm-status-good { color: var(--lm-success); border-color: color-mix(in srgb, var(--lm-success) 35%, var(--lm-line)); background: color-mix(in srgb, var(--lm-success) 9%, transparent); }
 .lm-status-working { color: var(--lm-accent); border-color: color-mix(in srgb, var(--lm-accent) 35%, var(--lm-line)); background: var(--lm-accent-muted); }
@@ -68,17 +71,25 @@ export const LUMI_MIND_CSS = `
 .lm-icon { width: 15px; height: 15px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
 .lm-icon-btn {
   appearance: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; padding: 6px; border: 1px solid transparent; border-radius: 8px;
+  flex:0 0 auto; width: 30px; height: 30px; padding: 6px; border: 1px solid transparent; border-radius: 8px;
   color: var(--lm-muted); background: transparent; cursor: pointer; transition: all var(--lm-transition);
 }
-.lm-icon-btn:hover { color: var(--lm-text); background: var(--lm-fill-hover); border-color: var(--lm-line); }
+.lm-icon-btn:hover:not(:disabled) { color: var(--lm-text); background: var(--lm-fill-hover); border-color: var(--lm-line); }
 .lm-icon-btn.active { color: var(--lm-accent); background: var(--lm-accent-muted); border-color: color-mix(in srgb, var(--lm-accent) 25%, var(--lm-line)); }
-.lm-icon-btn.danger:hover { color: var(--lm-danger); background: color-mix(in srgb, var(--lm-danger) 10%, transparent); }
+.lm-icon-btn.danger:hover:not(:disabled) { color: var(--lm-danger); background: color-mix(in srgb, var(--lm-danger) 10%, transparent); }
+
+.lm-icon-btn:disabled { opacity:.35; cursor:not-allowed; }
+.lm-icon-btn-primary { width:36px; height:36px; color:var(--lm-accent-fg); background:var(--lm-accent); border-color:var(--lm-accent); box-shadow:0 2px 8px color-mix(in srgb,var(--lm-accent) 15%,transparent); }
+.lm-icon-btn-primary:hover:not(:disabled) { color:var(--lm-accent-fg); background:var(--lm-accent-hover); border-color:var(--lm-accent-hover); }
+.lm-root :is(.lm-icon-btn, .lm-nav-item, .lm-button):focus-visible { outline:2px solid var(--lm-accent); outline-offset:3px; }
+.lm-tool-group { display:inline-flex; align-items:center; gap:2px; padding:2px; border:1px solid var(--lm-line); border-radius:10px; background:var(--lm-fill); }
+.lm-cast-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+.lm-tidy-progress { color:var(--lm-accent); font-size:11px; font-variant-numeric:tabular-nums; }
 
 .lm-nav { display: grid; grid-template-columns: repeat(4,1fr); gap: 3px; padding: 3px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-fill); }
-.lm-nav-item { appearance: none; border: 0; border-radius: 7px; padding: 7px 4px; background: transparent; color: var(--lm-muted); font-size: 11px; font-weight: 650; cursor: pointer; transition: all var(--lm-transition); }
+.lm-nav-item { appearance: none; display:flex; align-items:center; justify-content:center; gap:6px; min-width:0; min-height:34px; border: 0; border-radius: 7px; padding: 7px 4px; background: transparent; color: var(--lm-muted); font-size: 11px; font-weight: 650; cursor: pointer; transition: all var(--lm-transition); }
 .lm-nav-item:hover { color: var(--lm-text); background: var(--lm-fill-hover); }
-.lm-nav-item.active { color: var(--lm-text); background: var(--lm-raised); box-shadow: 0 1px 4px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.04); }
+.lm-nav-item.active { color: var(--lm-accent); background: var(--lm-raised); box-shadow: 0 1px 4px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.04); }
 
 .lm-notice { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; border: 1px solid var(--lm-line); border-radius: var(--lm-radius); background: var(--lm-panel); color: var(--lm-muted); font-size: 11px; }
 .lm-notice-dot { width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; flex: 0 0 auto; background: var(--lm-accent); box-shadow: 0 0 0 3px var(--lm-accent-muted); }
@@ -346,7 +357,10 @@ export const LUMI_MIND_CSS = `
 .lm-controller-backups { margin-top:20px; }
 .lm-backup-row { padding:14px 0; border-bottom:1px solid var(--lm-line); }
 .lm-backup-row .lm-inline-actions { flex-wrap:wrap; margin-bottom:12px; }
-.lm-header-actions { flex-wrap:wrap; }
+@container (max-width: 320px) {
+  .lm-nav-item { flex-direction:column; gap:4px; padding:7px 3px; font-size:10px; }
+  .lm-brand-line { gap:4px 6px; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .lm-root *, .lm-root *::before, .lm-root *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }

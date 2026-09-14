@@ -299,11 +299,12 @@ var LUMI_MIND_CSS = `
 
 .lm-root *, .lm-root *::before, .lm-root *::after { box-sizing: border-box; }
 .lm-root h1, .lm-root h2, .lm-root h3, .lm-root p { margin: 0; }
-.lm-root button, .lm-root input, .lm-root select, .lm-root textarea { font: inherit; }
-.lm-root button { color: inherit; }
+.lm-root :where(button, input, select, textarea) { font: inherit; }
+.lm-root :where(button) { color: inherit; }
 .lm-icon > svg, .lm-brand-mark > svg, .lm-empty-icon > svg { display: block; width: 100%; height: 100%; }
 
 .lm-drawer {
+  container-type: inline-size;
   min-height: 100%;
   padding: 15px 14px 28px;
   display: flex;
@@ -324,9 +325,11 @@ var LUMI_MIND_CSS = `
   box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 8px 25px rgba(0,0,0,.15);
 }
 .lm-brand-copy { min-width: 0; }
+.lm-brand-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.lm-brand-line .lm-status { padding:2px 6px; font-size:9px; }
 .lm-eyebrow, .lm-kicker { color: var(--lm-accent); font-size: 10px; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
-.lm-brand-title { color: var(--lm-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
-.lm-header-actions { display: flex; align-items: center; gap: 5px; }
+.lm-brand-title { color: var(--lm-muted); font-size: 11px; margin-top: 3px; }
+.lm-header-actions { flex-shrink:0; }
 .lm-status { padding: 4px 7px; border: 1px solid var(--lm-line); border-radius: 999px; color: var(--lm-muted); font-size: 10px; font-weight: 700; white-space: nowrap; background: var(--lm-fill); }
 .lm-status-good { color: var(--lm-success); border-color: color-mix(in srgb, var(--lm-success) 35%, var(--lm-line)); background: color-mix(in srgb, var(--lm-success) 9%, transparent); }
 .lm-status-working { color: var(--lm-accent); border-color: color-mix(in srgb, var(--lm-accent) 35%, var(--lm-line)); background: var(--lm-accent-muted); }
@@ -336,17 +339,25 @@ var LUMI_MIND_CSS = `
 .lm-icon { width: 15px; height: 15px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
 .lm-icon-btn {
   appearance: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 28px; height: 28px; padding: 6px; border: 1px solid transparent; border-radius: 8px;
+  flex:0 0 auto; width: 30px; height: 30px; padding: 6px; border: 1px solid transparent; border-radius: 8px;
   color: var(--lm-muted); background: transparent; cursor: pointer; transition: all var(--lm-transition);
 }
-.lm-icon-btn:hover { color: var(--lm-text); background: var(--lm-fill-hover); border-color: var(--lm-line); }
+.lm-icon-btn:hover:not(:disabled) { color: var(--lm-text); background: var(--lm-fill-hover); border-color: var(--lm-line); }
 .lm-icon-btn.active { color: var(--lm-accent); background: var(--lm-accent-muted); border-color: color-mix(in srgb, var(--lm-accent) 25%, var(--lm-line)); }
-.lm-icon-btn.danger:hover { color: var(--lm-danger); background: color-mix(in srgb, var(--lm-danger) 10%, transparent); }
+.lm-icon-btn.danger:hover:not(:disabled) { color: var(--lm-danger); background: color-mix(in srgb, var(--lm-danger) 10%, transparent); }
+
+.lm-icon-btn:disabled { opacity:.35; cursor:not-allowed; }
+.lm-icon-btn-primary { width:36px; height:36px; color:var(--lm-accent-fg); background:var(--lm-accent); border-color:var(--lm-accent); box-shadow:0 2px 8px color-mix(in srgb,var(--lm-accent) 15%,transparent); }
+.lm-icon-btn-primary:hover:not(:disabled) { color:var(--lm-accent-fg); background:var(--lm-accent-hover); border-color:var(--lm-accent-hover); }
+.lm-root :is(.lm-icon-btn, .lm-nav-item, .lm-button):focus-visible { outline:2px solid var(--lm-accent); outline-offset:3px; }
+.lm-tool-group { display:inline-flex; align-items:center; gap:2px; padding:2px; border:1px solid var(--lm-line); border-radius:10px; background:var(--lm-fill); }
+.lm-cast-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+.lm-tidy-progress { color:var(--lm-accent); font-size:11px; font-variant-numeric:tabular-nums; }
 
 .lm-nav { display: grid; grid-template-columns: repeat(4,1fr); gap: 3px; padding: 3px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-fill); }
-.lm-nav-item { appearance: none; border: 0; border-radius: 7px; padding: 7px 4px; background: transparent; color: var(--lm-muted); font-size: 11px; font-weight: 650; cursor: pointer; transition: all var(--lm-transition); }
+.lm-nav-item { appearance: none; display:flex; align-items:center; justify-content:center; gap:6px; min-width:0; min-height:34px; border: 0; border-radius: 7px; padding: 7px 4px; background: transparent; color: var(--lm-muted); font-size: 11px; font-weight: 650; cursor: pointer; transition: all var(--lm-transition); }
 .lm-nav-item:hover { color: var(--lm-text); background: var(--lm-fill-hover); }
-.lm-nav-item.active { color: var(--lm-text); background: var(--lm-raised); box-shadow: 0 1px 4px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.04); }
+.lm-nav-item.active { color: var(--lm-accent); background: var(--lm-raised); box-shadow: 0 1px 4px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.04); }
 
 .lm-notice { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; border: 1px solid var(--lm-line); border-radius: var(--lm-radius); background: var(--lm-panel); color: var(--lm-muted); font-size: 11px; }
 .lm-notice-dot { width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; flex: 0 0 auto; background: var(--lm-accent); box-shadow: 0 0 0 3px var(--lm-accent-muted); }
@@ -614,7 +625,10 @@ var LUMI_MIND_CSS = `
 .lm-controller-backups { margin-top:20px; }
 .lm-backup-row { padding:14px 0; border-bottom:1px solid var(--lm-line); }
 .lm-backup-row .lm-inline-actions { flex-wrap:wrap; margin-bottom:12px; }
-.lm-header-actions { flex-wrap:wrap; }
+@container (max-width: 320px) {
+  .lm-nav-item { flex-direction:column; gap:4px; padding:7px 3px; font-size:10px; }
+  .lm-brand-line { gap:4px 6px; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .lm-root *, .lm-root *::before, .lm-root *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
@@ -639,6 +653,12 @@ function redactDiagnosticCredentials(value) {
 var MIND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.2 4.2a6.7 6.7 0 0 1 8.4 6.5c0 1.8-.7 3.2-1.8 4.3-.8.8-1.2 1.6-1.2 2.7v.6H8.8v-.9c0-1.2-.5-2-1.4-2.9a5.8 5.8 0 0 1-1.8-4.2c0-1.3.4-2.6 1.1-3.6"/><path d="M9.4 21h4.5"/><path d="M8.4 7.8c1.7-1.6 4.8-1.4 6.2.5"/><path d="M9 11.1c1.2-1.1 3.3-1 4.3.3"/><circle cx="6.5" cy="4.3" r="1.5" fill="currentColor" stroke="none"/></svg>`;
 var ICONS = {
   refresh: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>`,
+  cast: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.25"/><path d="M1.8 13v-1a4.2 4.2 0 0 1 8.4 0v1M10.5 3a2.3 2.3 0 0 1 0 4.4M12 9a3.3 3.3 0 0 1 2.2 3.1V13"/></svg>`,
+  scene: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.8H1.8V5M13 1.8h1.2V5M1.8 11v3.2H5M14.2 11v3.2H11"/><circle cx="8" cy="7" r="2.3"/><path d="M4.6 12a3.5 3.5 0 0 1 6.8 0"/></svg>`,
+  history: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5A5.7 5.7 0 1 1 2.3 10M1.5 2v3.5H5M8 4.5V8l2.3 1.5"/></svg>`,
+  settings: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h3M8 4h6M2 12h6M11 12h3"/><circle cx="6.5" cy="4" r="1.5"/><circle cx="9.5" cy="12" r="1.5"/></svg>`,
+  tidy_all: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 1.5c.3 2 1.3 3 3.3 3.3-2 .3-3 1.3-3.3 3.3-.3-2-1.3-3-3.3-3.3 2-.3 3-1.3 3.3-3.3zM2 4h2M2 8h4M2 12h8M13 10v4M11 12h4"/></svg>`,
+  add_actor: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="4.5" r="2.3"/><path d="M1.7 13v-1a4.3 4.3 0 0 1 6.8-3.5M12 8v6M9 11h6"/></svg>`,
   more: `<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>`,
   edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.8V14h2.2L13 6.2 9.8 3 2 10.8z"/><path d="M8.8 4l3.2 3.2"/></svg>`,
   plus: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>`,
@@ -670,6 +690,7 @@ function element(tag, className, text) {
 }
 function svgIcon(name) {
   const node = element("span", "lm-icon");
+  node.setAttribute("aria-hidden", "true");
   node.innerHTML = ICONS[name] ?? "";
   return node;
 }
@@ -1492,14 +1513,15 @@ function setup(ctx) {
     const mark = element("div", "lm-brand-mark");
     mark.innerHTML = MIND_ICON;
     const identity = element("div", "lm-brand-copy");
-    identity.append(element("div", "lm-eyebrow", "LumiMind"), element("div", "lm-brand-title", "Private continuity, in character"));
     const health = currentState?.timeline?.health ?? "inactive";
-    const actions = element("div", "lm-header-actions");
-    actions.append(
-      element("span", `lm-status lm-status-${healthTone(health)}`, healthLabel(health)),
-      iconButton("refresh", "Refresh Mind Lens", syncContext)
-    );
-    if (currentState?.timeline) actions.append(textButton("Preview injected minds", openInjectionPreview, "quiet"));
+    const brandLine = element("div", "lm-brand-line");
+    brandLine.append(element("div", "lm-eyebrow", "LumiMind"), element("span", `lm-status lm-status-${healthTone(health)}`, healthLabel(health)));
+    identity.append(brandLine, element("div", "lm-brand-title", "Private continuity"));
+    const actions = element("div", "lm-header-actions lm-tool-group");
+    actions.setAttribute("role", "group");
+    actions.setAttribute("aria-label", "Mind Lens tools");
+    if (currentState?.timeline) actions.append(iconButton("eye", "Preview injected minds", openInjectionPreview));
+    actions.append(iconButton("refresh", "Refresh Mind Lens", syncContext));
     header.append(mark, identity, actions);
     return header;
   }
@@ -1511,6 +1533,7 @@ function setup(ctx) {
   }
   function renderNav() {
     const nav = element("nav", "lm-nav");
+    nav.setAttribute("aria-label", "Mind Lens views");
     const entries = [
       ["cast", "Cast"],
       ["scene", "Scene"],
@@ -1518,8 +1541,10 @@ function setup(ctx) {
       ["settings", "Settings"]
     ];
     for (const [id, label] of entries) {
-      const button = element("button", `lm-nav-item${activeView === id ? " active" : ""}`, label);
+      const button = element("button", `lm-nav-item${activeView === id ? " active" : ""}`);
       button.type = "button";
+      button.append(svgIcon(id), element("span", void 0, label));
+      if (activeView === id) button.setAttribute("aria-current", "page");
       button.addEventListener("click", () => {
         activeView = id;
         render();
@@ -1836,21 +1861,28 @@ function setup(ctx) {
     const heading = element("div", "lm-section-heading");
     const title = element("div", "lm-inline-actions");
     title.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
-    const actions = element("div", "lm-inline-actions");
+    const actions = element("div", "lm-cast-actions");
+    actions.setAttribute("role", "group");
+    actions.setAttribute("aria-label", "Cast tools");
     if (tidyRunning) {
-      actions.appendChild(textButton(`Cancel tidy ${tidyRunning.completed}/${tidyRunning.total}`, () => {
+      const progress = element("span", "lm-tidy-progress", `${tidyRunning.completed}/${tidyRunning.total}`);
+      progress.setAttribute("role", "status");
+      progress.setAttribute("aria-label", `Tidy progress: ${tidyRunning.completed} of ${tidyRunning.total} actors`);
+      actions.append(progress, iconButton("close", "Cancel tidy", () => {
         const timeline = currentState?.timeline;
         if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: timeline.chatId, requestId: tidyRunning.requestId });
-      }, "quiet"));
+      }));
     } else {
       const selected = actors.find((actor) => actor.id === selectedActorId) ?? null;
-      const tidySelected = textButton("Tidy selected", () => selected && void startTidy([selected.id], false), "quiet");
+      const maintenance = element("div", "lm-tool-group");
+      const tidySelected = iconButton("spark", "Tidy selected", () => selected && void startTidy([selected.id], false));
       tidySelected.disabled = !selected || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-      const tidyAll = textButton("Tidy all", () => void startTidy(actors.map((actor) => actor.id), true), "quiet");
+      const tidyAll = iconButton("tidy_all", "Tidy all", () => void startTidy(actors.map((actor) => actor.id), true));
       tidyAll.disabled = !actors.length || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-      const addNpc = textButton("Add NPC", () => void addNpcWizard(), "primary");
+      maintenance.append(tidySelected, tidyAll);
+      const addNpc = iconButton("add_actor", "Add NPC", () => void addNpcWizard(), "lm-icon-btn-primary");
       addNpc.disabled = !currentState?.permissions.generation;
-      actions.append(tidySelected, tidyAll, addNpc);
+      actions.append(maintenance, addNpc);
     }
     heading.append(title, actions);
     section.appendChild(heading);

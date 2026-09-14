@@ -64,6 +64,12 @@ const MIND_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 
 const ICONS: Record<string, string> = {
   refresh: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>`,
+  cast: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.25"/><path d="M1.8 13v-1a4.2 4.2 0 0 1 8.4 0v1M10.5 3a2.3 2.3 0 0 1 0 4.4M12 9a3.3 3.3 0 0 1 2.2 3.1V13"/></svg>`,
+  scene: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.8H1.8V5M13 1.8h1.2V5M1.8 11v3.2H5M14.2 11v3.2H11"/><circle cx="8" cy="7" r="2.3"/><path d="M4.6 12a3.5 3.5 0 0 1 6.8 0"/></svg>`,
+  history: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5A5.7 5.7 0 1 1 2.3 10M1.5 2v3.5H5M8 4.5V8l2.3 1.5"/></svg>`,
+  settings: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h3M8 4h6M2 12h6M11 12h3"/><circle cx="6.5" cy="4" r="1.5"/><circle cx="9.5" cy="12" r="1.5"/></svg>`,
+  tidy_all: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 1.5c.3 2 1.3 3 3.3 3.3-2 .3-3 1.3-3.3 3.3-.3-2-1.3-3-3.3-3.3 2-.3 3-1.3 3.3-3.3zM2 4h2M2 8h4M2 12h8M13 10v4M11 12h4"/></svg>`,
+  add_actor: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="4.5" r="2.3"/><path d="M1.7 13v-1a4.3 4.3 0 0 1 6.8-3.5M12 8v6M9 11h6"/></svg>`,
   more: `<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="3" cy="8" r="1.25"/><circle cx="8" cy="8" r="1.25"/><circle cx="13" cy="8" r="1.25"/></svg>`,
   edit: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.8V14h2.2L13 6.2 9.8 3 2 10.8z"/><path d="M8.8 4l3.2 3.2"/></svg>`,
   plus: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>`,
@@ -102,6 +108,7 @@ function element<K extends keyof HTMLElementTagNameMap>(
 
 function svgIcon(name: string): HTMLSpanElement {
   const node = element("span", "lm-icon");
+  node.setAttribute("aria-hidden", "true");
   node.innerHTML = ICONS[name] ?? "";
   return node;
 }
@@ -983,14 +990,15 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const mark = element("div", "lm-brand-mark");
     mark.innerHTML = MIND_ICON;
     const identity = element("div", "lm-brand-copy");
-    identity.append(element("div", "lm-eyebrow", "LumiMind"), element("div", "lm-brand-title", "Private continuity, in character"));
     const health = currentState?.timeline?.health ?? "inactive";
-    const actions = element("div", "lm-header-actions");
-    actions.append(
-      element("span", `lm-status lm-status-${healthTone(health)}`, healthLabel(health)),
-      iconButton("refresh", "Refresh Mind Lens", syncContext),
-    );
-    if (currentState?.timeline) actions.append(textButton("Preview injected minds", openInjectionPreview, "quiet"));
+    const brandLine = element("div", "lm-brand-line");
+    brandLine.append(element("div", "lm-eyebrow", "LumiMind"), element("span", `lm-status lm-status-${healthTone(health)}`, healthLabel(health)));
+    identity.append(brandLine, element("div", "lm-brand-title", "Private continuity"));
+    const actions = element("div", "lm-header-actions lm-tool-group");
+    actions.setAttribute("role", "group");
+    actions.setAttribute("aria-label", "Mind Lens tools");
+    if (currentState?.timeline) actions.append(iconButton("eye", "Preview injected minds", openInjectionPreview));
+    actions.append(iconButton("refresh", "Refresh Mind Lens", syncContext));
     header.append(mark, identity, actions);
     return header;
   }
@@ -1004,6 +1012,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   function renderNav(): HTMLElement {
     const nav = element("nav", "lm-nav");
+    nav.setAttribute("aria-label", "Mind Lens views");
     const entries: Array<[LensView, string]> = [
       ["cast", "Cast"],
       ["scene", "Scene"],
@@ -1011,8 +1020,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       ["settings", "Settings"],
     ];
     for (const [id, label] of entries) {
-      const button = element("button", `lm-nav-item${activeView === id ? " active" : ""}`, label);
+      const button = element("button", `lm-nav-item${activeView === id ? " active" : ""}`);
       button.type = "button";
+      button.append(svgIcon(id), element("span", undefined, label));
+      if (activeView === id) button.setAttribute("aria-current", "page");
       button.addEventListener("click", () => {
         activeView = id;
         render();
@@ -1360,21 +1371,28 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const heading = element("div", "lm-section-heading");
     const title = element("div", "lm-inline-actions");
     title.append(element("div", "lm-section-title", "Cast"), element("span", "lm-count", String(actors.length)));
-    const actions = element("div", "lm-inline-actions");
+    const actions = element("div", "lm-cast-actions");
+    actions.setAttribute("role", "group");
+    actions.setAttribute("aria-label", "Cast tools");
     if (tidyRunning) {
-      actions.appendChild(textButton(`Cancel tidy ${tidyRunning.completed}/${tidyRunning.total}`, () => {
+      const progress = element("span", "lm-tidy-progress", `${tidyRunning.completed}/${tidyRunning.total}`);
+      progress.setAttribute("role", "status");
+      progress.setAttribute("aria-label", `Tidy progress: ${tidyRunning.completed} of ${tidyRunning.total} actors`);
+      actions.append(progress, iconButton("close", "Cancel tidy", () => {
         const timeline = currentState?.timeline;
         if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: timeline.chatId, requestId: tidyRunning.requestId });
-      }, "quiet"));
+      }));
     } else {
       const selected = actors.find((actor) => actor.id === selectedActorId) ?? null;
-      const tidySelected = textButton("Tidy selected", () => selected && void startTidy([selected.id], false), "quiet");
+      const maintenance = element("div", "lm-tool-group");
+      const tidySelected = iconButton("spark", "Tidy selected", () => selected && void startTidy([selected.id], false));
       tidySelected.disabled = !selected || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-      const tidyAll = textButton("Tidy all", () => void startTidy(actors.map((actor) => actor.id), true), "quiet");
+      const tidyAll = iconButton("tidy_all", "Tidy all", () => void startTidy(actors.map((actor) => actor.id), true));
       tidyAll.disabled = !actors.length || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
-      const addNpc = textButton("Add NPC", () => void addNpcWizard(), "primary");
+      maintenance.append(tidySelected, tidyAll);
+      const addNpc = iconButton("add_actor", "Add NPC", () => void addNpcWizard(), "lm-icon-btn-primary");
       addNpc.disabled = !currentState?.permissions.generation;
-      actions.append(tidySelected, tidyAll, addNpc);
+      actions.append(maintenance, addNpc);
     }
     heading.append(title, actions);
     section.appendChild(heading);
