@@ -12,12 +12,16 @@ import {
   type TokenCounter,
   type TokenMeasurement,
 } from "./engine";
-import { waitForControllerRpmSlot } from "./controller-scheduling";
+import { waitForControllerRpmSlot, withControllerSlot } from "./controller-scheduling";
 import type {
   ActorMind,
   ActorRecord,
   ChatMessageLike,
   ControllerBatchTelemetry,
+  ControllerAttempt,
+  ControllerRun,
+  ControllerTarget,
+  ControllerTestResult,
   ControllerActorMention,
   ControllerAnalysis,
   ControllerChange,
@@ -646,6 +650,11 @@ function toolChoiceParameters(provider: string | null): Record<string, unknown> 
 async function resolveConnection(settings: LumiMindSettings, userId: string, fallbackConnectionId?: string | null): Promise<ResolvedConnection> {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
   const configuredModel = settings.controllerModel?.trim() || null;
+  if (!id && typeof spindle.connections?.list === "function") {
+    const profiles = await spindle.connections.list(userId).catch(() => []);
+    const defaultProfile = profiles.find((profile) => profile.is_default);
+    if (defaultProfile) return { id: defaultProfile.id, provider: defaultProfile.provider, model: configuredModel ?? defaultProfile.model };
+  }
   if (!id) return { id: null, provider: null, model: configuredModel };
   const connection = await spindle.connections.get(id, userId).catch(() => null);
   return { id, provider: connection?.provider ?? null, model: configuredModel ?? connection?.model ?? null };
@@ -725,35 +734,38 @@ async function quietJson(
   providerInputTokens: number | null;
 }> {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
-  await waitForControllerRpmSlot({
-    userId,
-    provider: connection.provider,
-    requestsPerMinute: settings.controllerRequestsPerMinute,
-    signal,
+  const result = await withControllerSlot(userId, settings.controllerParallelRequests, signal, async () => {
+    if (spindle.permissions && !spindle.permissions.has("generation")) throw new LocalControllerError("Generation permission is required to use the controller.");
+    await waitForControllerRpmSlot({
+      userId,
+      provider: connection.provider,
+      requestsPerMinute: settings.controllerRequestsPerMinute,
+      signal,
+    });
+    return spindle.generate.quiet({
+      type: "quiet",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: prompt },
+      ],
+      parameters: {
+        temperature: settings.controllerTemperature,
+        // A blank override deliberately selects the connection default and keeps
+        // legacy preset model fields from replacing it inside quiet generation.
+        model: settings.controllerModel?.trim() ?? "",
+        ...toolChoiceParameters(connection.provider),
+      },
+      tools: [{
+        name: schemaName,
+        description: "Submit the complete structured LumiMind result exactly once.",
+        parameters: schema,
+      }],
+      reasoning: { source: "off" },
+      ...(connection.id ? { connection_id: connection.id } : {}),
+      userId,
+      signal,
+    } as unknown as Parameters<typeof spindle.generate.quiet>[0]);
   });
-  const result = await spindle.generate.quiet({
-    type: "quiet",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: prompt },
-    ],
-    parameters: {
-      temperature: settings.controllerTemperature,
-      // A blank override deliberately selects the connection default and keeps
-      // legacy preset model fields from replacing it inside quiet generation.
-      model: settings.controllerModel?.trim() ?? "",
-      ...toolChoiceParameters(connection.provider),
-    },
-    tools: [{
-      name: schemaName,
-      description: "Submit the complete structured LumiMind result exactly once.",
-      parameters: schema,
-    }],
-    reasoning: { source: "off" },
-    ...(connection.id ? { connection_id: connection.id } : {}),
-    userId,
-    signal,
-  } as unknown as Parameters<typeof spindle.generate.quiet>[0]);
   const object = asObject(result);
   const content = sanitizeControllerText(text(object.content));
   const reasoning = sanitizeControllerText(text(object.reasoning));
@@ -902,7 +914,7 @@ export function buildAnalysisPrompt(input: Pick<Parameters<typeof analyzeMessage
   ].join("\n\n");
 }
 
-export async function analyzeMessages(input: {
+async function analyzeMessagesOnce(input: {
   messages: ChatMessageLike[];
   recentContext: ChatMessageLike[];
   compactState: unknown;
@@ -937,7 +949,9 @@ export async function analyzeMessages(input: {
     input.signal,
   );
   input.signal?.throwIfAborted();
-  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
+  if (!result.parsed) throw new UnusableControllerOutput("The LumiMind controller returned no parseable structured result.");
+  const shape = asObject(result.parsed);
+  if (!Array.isArray(shape.actorMentions) || !Array.isArray(shape.changes)) throw new UnusableControllerOutput("The LumiMind controller returned an invalid analysis result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
   const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
@@ -990,11 +1004,11 @@ export async function analyzeMessages(input: {
         matchingToolCalls: corrective.matchingToolCalls,
         usableToolCalls: corrective.usableToolCalls,
       });
-      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
+      if (!corrective.parsed) throw new UnusableControllerOutput("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
-      if (isAbortError(error)) throw error;
-      retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
+      if (input.signal?.aborted || isAbortError(error) || error instanceof LocalControllerError || permissionFailure(error)) throw error;
+      retryError = error instanceof UnusableControllerOutput ? error.message : "Corrective controller request failed.";
     }
   }
 
@@ -1048,7 +1062,7 @@ const SEED_SYSTEM_PROMPT = [
   "The seed must be concise, portable across new chats, and written as private subjective state rather than visible roleplay prose.",
 ].join("\n");
 
-export async function generateSeedDraft(input: {
+async function generateSeedDraftOnce(input: ControllerHooks & {
   character: unknown;
   settings: LumiMindSettings;
   userId: string;
@@ -1058,9 +1072,13 @@ export async function generateSeedDraft(input: {
     `<character_card>\n${JSON.stringify(input.character)}\n</character_card>`,
     "Use schemaVersion 1 and updatedAt equal to the current Unix time in milliseconds.",
   ].join("\n\n").slice(0, 80_000);
-  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId);
+  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal);
   const normalized = normalizeSeed(result.parsed);
-  if (!normalized) throw new Error("The LumiMind controller returned an invalid mind seed.");
+  if (!normalized || !Object.keys(asObject(asObject(result.parsed).core)).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid mind seed.");
+  if (!normalized.core.selfConcept && ![...normalized.core.values, ...normalized.core.desires, ...normalized.core.fears, ...normalized.core.boundaries, ...normalized.core.notes,
+    ...normalized.startingBeliefs, ...normalized.startingSecrets, ...normalized.startingGoals, ...normalized.relationshipPriors].length) {
+    throw new UnusableControllerOutput("The LumiMind controller returned an empty mind seed.");
+  }
   return { ...makeEmptySeed(), ...normalized, schemaVersion: 1, updatedAt: Date.now() };
 }
 
@@ -1070,26 +1088,26 @@ const NPC_CORE_SYSTEM_PROMPT = [
   "Write a concise private subjective frame covering stable self-concept, values, desires, fears, boundaries, and other enduring notes.",
 ].join("\n");
 
-export async function generateNpcCoreDraft(input: {
+async function generateNpcCoreDraftOnce(input: ControllerHooks & {
   actorName: string;
   lore: string;
   settings: LumiMindSettings;
   userId: string;
 }): Promise<MindCore> {
   const lore = input.lore.trim();
-  if (!lore) throw new Error("NPC lore is required to generate a core draft.");
+  if (!lore) throw new LocalControllerError("NPC lore is required to generate a core draft.");
   const boundedLore = lore.slice(0, 75_000);
   const prompt = [
     `Draft an enduring frame for the timeline NPC named ${JSON.stringify(input.actorName.trim() || "Unnamed NPC")}.`,
     `<npc_lore>\n${boundedLore}\n</npc_lore>`,
     "Return only characterization supported by this lore.",
   ].join("\n\n");
-  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId);
+  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal);
   const raw = asObject(result.parsed);
-  if (!Object.keys(raw).length) throw new Error("The LumiMind controller returned an invalid NPC core draft.");
+  if (!Object.keys(raw).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid NPC core draft.");
   const core = normalizeCore(raw);
   if (!core.selfConcept && !core.values.length && !core.desires.length && !core.fears.length && !core.boundaries.length && !core.notes.length) {
-    throw new Error("The LumiMind controller returned an empty NPC core draft.");
+    throw new UnusableControllerOutput("The LumiMind controller returned an empty NPC core draft.");
   }
   return core;
 }
@@ -1141,7 +1159,7 @@ function normalizeTidyItem(value: unknown, knownActorIds: Set<string>): MindTidy
   };
 }
 
-export async function generateMindTidyProposals(input: {
+async function generateMindTidyProposalsOnce(input: {
   actor: ActorRecord;
   mind: ActorMind;
   knownActors: ActorRecord[];
@@ -1169,7 +1187,7 @@ export async function generateMindTidyProposals(input: {
   const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
   const stateMeasurement = await countTextTokens(stateJson, connection, input.userId);
   if (input.settings.analysisStateTokenBudget > 0 && stateMeasurement.totalTokens > input.settings.analysisStateTokenBudget) {
-    throw new Error(
+    throw new LocalControllerError(
       `This actor needs ${stateMeasurement.totalTokens.toLocaleString()} state tokens, above the ${input.settings.analysisStateTokenBudget.toLocaleString()} tidy limit. Increase Analysis state tokens or set it to 0.`,
     );
   }
@@ -1193,8 +1211,8 @@ export async function generateMindTidyProposals(input: {
   );
   input.signal?.throwIfAborted();
   const raw = asObject(result.parsed);
-  if (!Array.isArray(raw.proposals)) throw new Error("The LumiMind controller returned an invalid tidy result.");
-  return raw.proposals.flatMap((entry) => {
+  if (!Array.isArray(raw.proposals)) throw new UnusableControllerOutput("The LumiMind controller returned an invalid tidy result.");
+  const proposals = raw.proposals.flatMap((entry) => {
     const proposal = asObject(entry);
     if (text(proposal.actorId) !== input.actor.id) return [];
     const finding = proposal.finding === "missing" || proposal.finding === "mislabeled" || proposal.finding === "outdated" || proposal.finding === "duplicate" || proposal.finding === "inconsistent"
@@ -1235,4 +1253,121 @@ export async function generateMindTidyProposals(input: {
       item,
     } satisfies MindTidyProposal];
   });
+  if (raw.proposals.length && !proposals.length) throw new UnusableControllerOutput("The LumiMind controller returned no valid tidy proposals.");
+  return proposals;
+}
+
+interface ControllerHooks {
+  onRun?: (run: ControllerRun) => void;
+  fallbackConnectionId?: string | null;
+  signal?: AbortSignal;
+}
+
+class UnusableControllerOutput extends Error {}
+class LocalControllerError extends Error {}
+const lastControllerRuns = new Map<string, ControllerRun>();
+export function getLastControllerRun(userId: string): ControllerRun | null {
+  return lastControllerRuns.get(userId) ?? null;
+}
+
+function permissionFailure(error: unknown): boolean {
+  const value = asObject(error);
+  const message = error instanceof Error ? error.message : "";
+  return value.code === "PERMISSION_DENIED" || /permission (?:denied|required|not granted)|missing .*permission/i.test(message);
+}
+
+async function withFallbacks<T>(input: {
+  settings: LumiMindSettings; userId: string; fallbackConnectionId?: string | null; signal?: AbortSignal; onRun?: (run: ControllerRun) => void;
+}, operation: string, run: (settings: LumiMindSettings) => Promise<T>, usable: (result: T) => boolean = () => true): Promise<T> {
+  const targets: ControllerTarget[] = [
+    { connectionId: input.settings.controllerConnectionId ?? input.fallbackConnectionId ?? null, model: input.settings.controllerModel },
+    ...(input.settings.controllerFallbacks ?? []).slice(0, 3),
+  ].filter((entry, index, entries) => entries.findIndex((other) => other.connectionId === entry.connectionId && other.model === entry.model) === index);
+  const attempts: ControllerAttempt[] = [];
+  const attemptedTargets = new Set<string>();
+  let partial: { result: T; target: ControllerTarget } | null = null;
+  let lastError: unknown;
+  const finish = (result: T, selected: ControllerTarget): T => {
+    const report = { operation, attempts, selected };
+    lastControllerRuns.set(input.userId, report);
+    input.onRun?.(report);
+    if (operation === "Analysis") (result as AnalysisControllerResult).telemetry.connectionAttempts = attempts;
+    return result;
+  };
+  for (const target of targets) {
+    input.signal?.throwIfAborted();
+    const settings = { ...input.settings, controllerConnectionId: target.connectionId, controllerModel: target.model, controllerFallbacks: [] };
+    let connection: ResolvedConnection = { id: target.connectionId, provider: null, model: target.model };
+    try {
+      connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId);
+      const targetKey = JSON.stringify([connection.id, connection.model]);
+      if (attemptedTargets.has(targetKey)) continue;
+      attemptedTargets.add(targetKey);
+      const result = await run(settings);
+      input.signal?.throwIfAborted();
+      const accepted = usable(result);
+      const resolved = { connectionId: connection.id, model: connection.model };
+      attempts.push({ ...resolved, provider: connection.provider, outcome: accepted ? "success" : "unusable_output" });
+      if (accepted) return finish(result, resolved);
+      const analysis = operation === "Analysis" ? (result as AnalysisControllerResult).analysis : null;
+      // Preserve the original warning behavior when no backups were configured.
+      if (targets.length === 1 || !analysis || analysis.actorMentions.length || analysis.changes.length) partial ??= { result, target: resolved };
+      lastError = new UnusableControllerOutput("The configured controllers returned no usable analysis. Try Test controller or choose another connection.");
+    } catch (error) {
+      if (input.signal?.aborted || isAbortError(error) || error instanceof LocalControllerError || permissionFailure(error)) throw error;
+      attempts.push({ connectionId: connection.id, model: connection.model, provider: connection.provider, outcome: error instanceof UnusableControllerOutput ? "unusable_output" : "request_failed" });
+      lastError = error;
+    }
+  }
+  if (partial) return finish(partial.result, partial.target);
+  const report = { operation, attempts, selected: null };
+  lastControllerRuns.set(input.userId, report);
+  input.onRun?.(report);
+  // Provider exceptions can contain request bodies and credentials. Keep details out of UI/diagnostics.
+  throw new Error(lastError instanceof UnusableControllerOutput ? lastError.message : "All configured LumiMind controllers failed. Check the connections and try Test controller.");
+}
+
+export function analyzeMessages(input: Parameters<typeof analyzeMessagesOnce>[0] & ControllerHooks): Promise<AnalysisControllerResult> {
+  return withFallbacks(input, "Analysis", (settings) => analyzeMessagesOnce({ ...input, settings }), (result) => {
+    if (result.telemetry.warningCodes.includes("empty_nontrivial_batch")) return false;
+    const rejectedAllChanges = result.telemetry.first.rawChanges > 0 && result.telemetry.finalChanges === 0 && result.telemetry.first.invalidChangesRejected > 0;
+    const rejectedAllMentions = result.telemetry.first.rawActorMentions > 0 && result.telemetry.first.acceptedActorMentions === 0 && result.telemetry.finalActorMentions === 0;
+    return !rejectedAllChanges && !rejectedAllMentions;
+  });
+}
+
+export function generateSeedDraft(input: Parameters<typeof generateSeedDraftOnce>[0] & ControllerHooks): Promise<MindSeedV1> {
+  return withFallbacks(input, "Mind Seed", (settings) => generateSeedDraftOnce({ ...input, settings }));
+}
+
+export function generateNpcCoreDraft(input: Parameters<typeof generateNpcCoreDraftOnce>[0] & ControllerHooks): Promise<MindCore> {
+  if (!input.lore.trim()) return Promise.reject(new LocalControllerError("NPC lore is required to generate a core draft."));
+  return withFallbacks(input, "NPC core", (settings) => generateNpcCoreDraftOnce({ ...input, settings }));
+}
+
+export function generateMindTidyProposals(input: Parameters<typeof generateMindTidyProposalsOnce>[0] & ControllerHooks): Promise<MindTidyProposal[]> {
+  return withFallbacks(input, "Tidy", (settings) => generateMindTidyProposalsOnce({ ...input, settings }));
+}
+
+export async function testController(input: {
+  target: ControllerTarget; settings: LumiMindSettings; userId: string; fallbackConnectionId?: string | null;
+}): Promise<ControllerTestResult> {
+  const started = Date.now();
+  const settings = { ...input.settings, controllerConnectionId: input.target.connectionId, controllerModel: input.target.model, controllerFallbacks: [], personaMindEnabled: true, characterCardDirectorMode: false };
+  const connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId);
+  const meta = { connectionId: connection.id, provider: connection.provider, model: connection.model };
+  try {
+    const result = await analyzeMessagesOnce({
+      settings, userId: input.userId, fallbackConnectionId: input.fallbackConnectionId,
+      messages: [{ id: "controller-test-scene", role: "assistant", index_in_chat: 0, content: "Mira stands alone outside a locked observatory. She believes her missing notebook is inside because she saw it through the window. She wants to retrieve it before the rain begins. Mira feels worried about the approaching storm and plans to ask the caretaker for a key. No other person is present." }],
+      recentContext: [], compactState: [],
+    });
+    const passed = result.analysis.changes.length > 0;
+    const response = result.telemetry.retry?.acceptedChanges ? result.telemetry.retry : result.telemetry.first;
+    return { ...meta, passed, elapsedMs: Date.now() - started, outputMode: response.structuredSource ?? response.outputMode,
+      message: passed ? "The controller returned usable, evidence-linked analysis for the test scene." : "The controller returned no usable mental-state changes for the test scene." };
+  } catch (error) {
+    return { ...meta, passed: false, elapsedMs: Date.now() - started, outputMode: null,
+      message: error instanceof UnusableControllerOutput ? error.message : "The test request failed. Check connection access, model availability, and provider limits." };
+  }
 }

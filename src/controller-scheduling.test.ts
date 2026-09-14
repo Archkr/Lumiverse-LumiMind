@@ -49,3 +49,21 @@ describe("controller scheduling", () => {
     })));
   });
 });
+
+// A separate queue is shared by all controller operations, including tests.
+describe("shared controller request slots", () => {
+  it("bounds concurrent requests and lets cancelled waiters leave the queue", async () => {
+    const { withControllerSlot } = await import("./controller-scheduling");
+    let release!: () => void;
+    const running = withControllerSlot("slot-user", 1, undefined, () => new Promise<void>((resolve) => { release = resolve; }));
+    const abort = new AbortController();
+    let calls = 0;
+    const waiting = withControllerSlot("slot-user", 1, abort.signal, async () => { calls++; });
+    const cancelled = expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+    abort.abort(); await cancelled;
+    const next = withControllerSlot("slot-user", 1, undefined, async () => { calls++; });
+    expect(calls).toBe(0);
+    release(); await running; await next;
+    expect(calls).toBe(1);
+  });
+});

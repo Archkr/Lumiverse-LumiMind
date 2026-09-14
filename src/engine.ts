@@ -29,6 +29,7 @@ import {
 } from "./types";
 
 export const DEFAULT_SETTINGS: LumiMindSettings = {
+  controllerFallbacks: [],
   controllerConnectionId: null,
   controllerModel: null,
   controllerTemperature: 0.1,
@@ -120,6 +121,10 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
     ? raw.controllerRequestsPerMinute
     : Number(raw.controllerRequestsPerMinute);
   return {
+    controllerFallbacks: (Array.isArray(raw.controllerFallbacks) ? raw.controllerFallbacks : [])
+      .map((entry) => ({ connectionId: stringValue(asObject(entry).connectionId), model: stringValue(asObject(entry).model) || null }))
+      .filter((entry, index, entries) => entry.connectionId && entries.findIndex((other) => other.connectionId === entry.connectionId && other.model === entry.model) === index)
+      .slice(0, 3),
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
@@ -997,6 +1002,7 @@ export function rebuildTimeline(timeline: ChatTimelineV1, rawMessages: ChatMessa
   }
   applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
+  timeline.activeRecordIds = matchedRecords.map((record) => record.id);
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : (messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1);
   timeline.pendingTurnCount = countPendingCompletedTurns(messages, firstMissingIndex);
   if (!timeline.active) timeline.health = "inactive";
@@ -1555,7 +1561,7 @@ export function toTimelineView(timeline: ChatTimelineV1, settings: LumiMindSetti
     minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
     records: timeline.records
       .slice()
-      .filter((record) => !record.skipReason)
+      .filter((record) => !record.skipReason && (!timeline.activeRecordIds || timeline.activeRecordIds.includes(record.id)))
       .sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt)
       .map((record) => ({
         id: record.id,
@@ -1648,6 +1654,7 @@ export interface ControllerStateProjection {
 }
 
 export interface MindInjectionProjection {
+  selection: import("./types").InjectionSelection;
   content: string | null;
   telemetry: ProjectionTelemetry;
 }
@@ -1930,13 +1937,19 @@ async function projectMindInjection(
     .filter((item) => item.status === "active" || item.status === "uncertain")
   );
   const allItemIds = new Set(allItems.map((item) => item.id));
+  const selection = (included: Set<string>): import("./types").InjectionSelection => ({
+    actors: actors.map((actor) => ({ id: actor.id, name: actor.canonicalName })),
+    entries: actors.flatMap((actor) => (timeline.minds[actor.id]?.items ?? [])
+      .filter((item) => item.status === "active" || item.status === "uncertain")
+      .map((item) => ({ id: item.id, actorId: actor.id, category: item.category, text: item.text, included: included.has(item.id) }))),
+  });
   const available = allItems.length;
   const fullContent = director
     ? renderDirectorMindInjection(timeline, settings, allItemIds)
     : renderMindInjection(timeline, targetActorId, settings, allItemIds);
   const emptyMeasurement = await countTokens(fullContent ?? "");
   if (!fullContent) {
-    return { content: null, telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
+    return { content: null, selection: selection(new Set()), telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
   }
   const orderedCandidates = orderedInjectionCandidates(timeline, actors, targetActorId, contextMessages);
   const render = (includedIds: Set<string>) => (
@@ -1954,6 +1967,7 @@ async function projectMindInjection(
   );
   const fullIncluded = settings.injectionTokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
   return {
+    selection: selection(fullIncluded ? allItemIds : fitted.includedIds),
     content: fullIncluded ? fullContent : fitted.text,
     telemetry: projectionTelemetry(settings.injectionTokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length),
   };

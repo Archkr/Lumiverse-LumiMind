@@ -337,6 +337,17 @@ export const LUMI_MIND_CSS = `
   .lm-diagnostics-generated { width:100%; margin-right:0; }
 }
 
+.lm-feature-modal { padding:20px; overflow:auto; }
+.lm-feature-modal .lm-inline-actions { flex-wrap:wrap; margin-bottom:16px; }
+.lm-feature-modal .lm-select { width:auto; max-width:100%; }
+.lm-preview-private { margin-top:16px; }
+.lm-preview-private summary { cursor:pointer; padding:12px 0; font-weight:600; }
+.lm-preview-entry { padding:8px 0; line-height:1.5; overflow-wrap:anywhere; }
+.lm-controller-backups { margin-top:20px; }
+.lm-backup-row { padding:14px 0; border-bottom:1px solid var(--lm-line); }
+.lm-backup-row .lm-inline-actions { flex-wrap:wrap; margin-bottom:12px; }
+.lm-header-actions { flex-wrap:wrap; }
+
 @media (prefers-reduced-motion: reduce) {
   .lm-root *, .lm-root *::before, .lm-root *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }

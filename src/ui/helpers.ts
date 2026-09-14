@@ -162,7 +162,7 @@ export function cloneSeed(seed: MindSeedV1): MindSeedV1 {
 }
 
 export function cloneSettings(settings: LumiMindSettings): LumiMindSettings {
-  return { ...settings };
+  return { ...settings, controllerFallbacks: (settings.controllerFallbacks ?? []).map((entry) => ({ ...entry })) };
 }
 
 export function availableRecentHistoryLimit(messageCount: number, configuredLimit: number): number | null {

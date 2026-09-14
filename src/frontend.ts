@@ -5,6 +5,8 @@ import type {
 } from "lumiverse-spindle-types";
 import type {
   ActorMind,
+  ControllerTarget,
+  InjectionSnapshot,
   ActorRecord,
   BackendToFrontend,
   FrontendState,
@@ -190,6 +192,13 @@ export function setup(ctx: SpindleFrontendContext): () => void {
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
   let diagnosticsModal: ReturnType<SpindleFrontendContext["ui"]["showModal"]> | null = null;
   let diagnosticsRefresh: (() => void) | null = null;
+  const featureRequests = new Map<string, {
+    resolve: (response: BackendToFrontend) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
+  const featureModals = new Set<ReturnType<typeof ctx.ui.showModal>>();
+  let closeInjectionPreview: (() => void) | null = null;
   const developerReportRequests = new Map<string, {
     resolve: (report: unknown) => void;
     reject: (error: Error) => void;
@@ -433,6 +442,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         dedicatedConnectionSelected: !!state.settings.controllerConnectionId,
         modelOverrideSelected: !!state.settings.controllerModel,
         connectionCount: state.connections.length,
+        fallbackCount: state.settings.controllerFallbacks.length,
+        lastRun: state.lastControllerRun ? { operation: state.lastControllerRun.operation,
+          attempts: state.lastControllerRun.attempts.map(({ connectionId, ...attempt }) => ({ ...attempt, dedicatedConnection: !!connectionId })) } : null,
         connections: state.connections.map((connection) => ({
           provider: connection.provider,
           model: connection.model,
@@ -508,7 +520,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
             legacyEmptyResult: quality.legacyEmptyResult,
             needsAttention: quality.needsAttention,
           },
-          batches: quality.batches.slice(-10).reverse(),
+          batches: quality.batches.slice(-10).reverse().map((batch) => ({ ...batch,
+            connectionAttempts: batch.connectionAttempts?.map(({ connectionId, ...attempt }) => ({ ...attempt, dedicatedConnection: !!connectionId })),
+          })),
           recent: timeline.records.slice(-10).reverse().map((record) => ({
             messageIndex: record.messageIndex,
             swipe: record.swipeId,
@@ -550,6 +564,132 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       activationPreviewRequests.set(requestId, { resolve, reject, timeout });
       send({ type: "activation_preview", chatId, requestId });
     });
+  }
+
+  function requestFeature(message: FrontendToBackend & { requestId: string }): Promise<BackendToFrontend> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        featureRequests.delete(message.requestId);
+        reject(new Error("The request timed out. Check the controller and try again."));
+      }, message.type === "test_controller" ? 180_000 : 30_000);
+      featureRequests.set(message.requestId, { resolve, reject, timeout });
+      send(message);
+    });
+  }
+
+  function featureModal(title: string) {
+    const modal = ctx.ui.showModal({ title, width: 800, maxHeight: 850 });
+    featureModals.add(modal);
+    modal.onDismiss(() => featureModals.delete(modal));
+    return modal;
+  }
+
+  async function runControllerTest(target: ControllerTarget): Promise<void> {
+    if (!settingsDraft) return;
+    const modal = featureModal("Test controller");
+    const shell = element("div", "lm-root lm-feature-modal");
+    const output = element("p", "lm-view-copy", "Testing structured analysis with a synthetic scene…");
+    shell.append(output);
+    modal.root.appendChild(shell);
+    try {
+      const response = await requestFeature({ type: "test_controller", requestId: createRequestId(), target: { ...target },
+        settings: cloneSettings(settingsDraft), chatId: currentState?.activeChatId });
+      if (response.type !== "test_controller_result") return;
+      const result = response.result;
+      const connectionName = currentState?.connections.find((entry) => entry.id === result.connectionId)?.name ?? "Active connection";
+      output.textContent = `${result.passed ? "Passed" : "Failed"} · ${(result.elapsedMs / 1000).toFixed(1)} seconds`;
+      shell.append(element("p", "lm-view-copy", `${connectionName} · ${result.model ?? "Connection default"} · ${result.outputMode ?? "No structured output"}`),
+        element("p", "lm-view-copy", result.message));
+    } catch (error) { output.textContent = error instanceof Error ? error.message : "Controller test failed."; }
+  }
+
+  async function requestAnalysisRepair(chatId: string): Promise<void> {
+    try {
+      const response = await requestFeature({ type: "repair_preview", chatId, requestId: createRequestId() });
+      if (response.type !== "repair_preview_result" || currentState?.activeChatId !== chatId) return;
+      const preview = response.preview;
+      if (preview.startMessageIndex === null) { showNotice("info", "No analysis warnings need repair."); return; }
+      const result = await ctx.ui.showConfirm({
+        title: preview.resumed ? "Resume analysis repair?" : "Repair LumiMind analysis?",
+        message: `Reanalyze from message ${preview.startMessageIndex + 1} through the current committed history (${preview.messageCount} messages). Earlier analysis, seeds, and locked corrections remain. This makes controller requests using your saved settings.`,
+        confirmLabel: "Repair analysis",
+      });
+      if (!result.confirmed || currentState?.activeChatId !== chatId) return;
+      const started = await requestFeature({ type: "repair_analysis", chatId, requestId: createRequestId(), revision: preview.revision, fingerprint: preview.fingerprint });
+      if (started.type === "repair_started") showNotice("info", "Repair started. Progress is shown in Changes; interrupted repairs can be retried.");
+    } catch (error) { showNotice("error", error instanceof Error ? error.message : "Analysis repair failed."); }
+  }
+
+  function openInjectionPreview(): void {
+    const timeline = currentState?.timeline;
+    if (!timeline) return;
+    closeInjectionPreview?.();
+    const chatId = timeline.chatId;
+    const modal = featureModal("Preview injected minds");
+    closeInjectionPreview = () => modal.dismiss();
+    const shell = element("div", "lm-root lm-feature-modal");
+    const intro = element("p", "lm-view-copy", "Current preview estimates the next LumiMind block using saved settings and available chat context. The assembled generation prompt may change selection and token counts.");
+    const controls = element("div", "lm-inline-actions");
+    const target = element("select", "lm-select");
+    target.setAttribute("aria-label", "Preview target");
+    const defaultOption = element("option", undefined, currentState?.settings.characterCardDirectorMode ? "Director ensemble" : "Current character / present cast");
+    defaultOption.value = "";
+    target.append(defaultOption);
+    for (const actor of timeline.actors.filter((actor) => actor.kind === "character" || actor.kind === "persona")) {
+      const option = element("option", undefined, `${actor.canonicalName}${actor.kind === "persona" ? " (impersonation)" : ""}`);
+      option.value = actor.id;
+      target.append(option);
+    }
+    const view = element("select", "lm-select");
+    view.setAttribute("aria-label", "Injection view");
+    for (const [value, label] of [["current", "Current preview"], ["last", "Last actual injection"]]) {
+      const option = element("option", undefined, label); option.value = value; view.append(option);
+    }
+    const output = element("div");
+    let data: Extract<BackendToFrontend, { type: "injection_preview_result" }> | null = null;
+    let closed = false;
+    let requestVersion = 0;
+    const renderSnapshot = () => {
+      output.replaceChildren();
+      if (!data) return;
+      const snapshot: InjectionSnapshot | null = view.value === "last" ? data.last : data.current;
+      if (!snapshot) { output.append(element("p", "lm-view-copy", "No actual injection has been captured this session. Generate a reply, then refresh.")); return; }
+      const stale = currentState?.timeline?.revision !== snapshot.revision;
+      output.append(element("p", "lm-view-copy", `${snapshot.targetLabel} · ${new Date(snapshot.capturedAt).toLocaleString()} · revision ${snapshot.revision}${stale ? " (older checkpoint)" : ""} · ${snapshot.position.replaceAll("_", " ")}`));
+      if (snapshot.reason) output.append(element("p", "lm-view-copy", snapshot.reason));
+      if (snapshot.telemetry) {
+        const t = snapshot.telemetry;
+        output.append(element("p", "lm-view-copy", `${t.tokenCountApproximate ? "Approximately " : ""}${t.totalTokens.toLocaleString()} tokens / ${t.tokenBudget === 0 ? "unlimited budget" : t.tokenBudget.toLocaleString() + " budget"} · ${t.itemsIncluded} entries included · ${t.itemsOmitted} omitted`));
+      }
+      output.append(element("p", "lm-view-copy", `Included actors: ${snapshot.selection.actors.map((actor) => actor.name).join(", ") || "none"}`));
+      const privateContent = element("details", "lm-preview-private");
+      privateContent.open = currentState?.settings.spoilerSafe === false;
+      privateContent.append(element("summary", undefined, "Reveal private injection and entry selection"));
+      if (snapshot.content) {
+        privateContent.append(textButton("Copy injection", () => { void copyText(snapshot.content!).then((copied) => showNotice(copied ? "success" : "error", copied ? "Injection copied." : "Copy failed.")); }, "secondary"));
+        privateContent.append(element("pre", "lm-diagnostics-output", snapshot.content));
+      }
+      for (const entry of snapshot.selection.entries) {
+        const actor = snapshot.selection.actors.find((candidate) => candidate.id === entry.actorId);
+        privateContent.append(element("p", "lm-preview-entry", `${entry.included ? "Included" : "Omitted by budget"} · ${actor?.name ?? entry.actorId} · ${entry.category}: ${entry.text}`));
+      }
+      output.append(privateContent);
+    };
+    const refresh = async () => {
+      const version = ++requestVersion;
+      output.replaceChildren(element("p", "lm-view-copy", "Building preview…"));
+      try {
+        const response = await requestFeature({ type: "injection_preview", requestId: createRequestId(), chatId, targetActorId: target.value || null });
+        if (closed || version !== requestVersion || currentState?.activeChatId !== chatId || response.type !== "injection_preview_result") return;
+        data = response; renderSnapshot();
+      } catch (error) { if (!closed && version === requestVersion) output.replaceChildren(element("p", "lm-view-copy", error instanceof Error ? error.message : "Preview failed.")); }
+    };
+    controls.append(view, target, textButton("Refresh", () => void refresh(), "secondary"));
+    target.addEventListener("change", () => void refresh());
+    view.addEventListener("change", () => { target.disabled = view.value === "last"; renderSnapshot(); });
+    shell.append(intro, controls, output); modal.root.append(shell);
+    modal.onDismiss(() => { closed = true; closeInjectionPreview = null; });
+    void refresh();
   }
 
   function requestSettingsSave(patch: LumiMindSettings, chatId: string | null): Promise<LumiMindSettings> {
@@ -850,6 +990,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       element("span", `lm-status lm-status-${healthTone(health)}`, healthLabel(health)),
       iconButton("refresh", "Refresh Mind Lens", syncContext),
     );
+    if (currentState?.timeline) actions.append(textButton("Preview injected minds", openInjectionPreview, "quiet"));
     header.append(mark, identity, actions);
     return header;
   }
@@ -1005,7 +1146,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const copy = element("div", "lm-timeline-status-copy");
     copy.appendChild(element("strong", undefined, "Analysis completed with limited usable state"));
     const details: string[] = [];
-    if (quality.legacyEmptyResult) details.push("Existing records contain no mental-state changes; rebuild to run bootstrap extraction.");
+    if (quality.legacyEmptyResult) details.push("Existing records contain no mental-state changes; repair to run bootstrap extraction.");
     if (quality.emptyNontrivialBatches) details.push(`${quality.emptyNontrivialBatches} substantive ${quality.emptyNontrivialBatches === 1 ? "batch remained" : "batches remained"} empty after the corrective pass.`);
     if (quality.normalizationDrops) details.push(`${quality.normalizationDrops} ${quality.normalizationDrops === 1 ? "batch had" : "batches had"} structured entries rejected during normalization.`);
     if (quality.retryFailures) details.push(`${quality.retryFailures} corrective ${quality.retryFailures === 1 ? "request failed" : "requests failed"}; the valid first pass was retained.`);
@@ -1013,7 +1154,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const actions = element("div", "lm-inline-actions");
     actions.append(
       textButton("Diagnostics", openDiagnostics, "quiet"),
-      textButton("Rebuild analysis", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
+      textButton("Repair analysis", () => void requestAnalysisRepair(timeline.chatId), "secondary"),
     );
     const dismiss = iconButton("close", "Dismiss analysis warning", () => {
       dismissedAnalysisWarnings.add(warningKey);
@@ -1202,7 +1343,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     if (all) {
       const result = await ctx.ui.showConfirm({
         title: `Tidy ${actorIds.length} minds?`,
-        message: `This will make ${actorIds.length} sequential controller ${actorIds.length === 1 ? "request" : "requests"}, one per managed actor. You can cancel the remaining scan at any time.`,
+        message: `This scans ${actorIds.length} managed ${actorIds.length === 1 ? "actor" : "actors"} with one request each, plus up to ${currentState?.settings.controllerFallbacks.length ?? 0} backup attempts per actor if needed. Your parallel-request and rate limits apply. You can cancel the remaining scan at any time.`,
         variant: "warning",
         confirmLabel: "Start tidy",
       });
@@ -1763,7 +1904,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     actions.append(
       textButton("Update now", () => send({ type: "update_now", chatId: timeline.chatId }), "primary"),
       textButton(timeline.paused ? "Resume" : "Pause", () => send({ type: "pause", chatId: timeline.chatId, paused: !timeline.paused }), "secondary"),
-      textButton("Rebuild", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
+      textButton("Repair analysis", () => void requestAnalysisRepair(timeline.chatId), "secondary"),
+      textButton("Rebuild all", () => void requestTimelineRebuild(timeline.chatId), "secondary"),
     );
     (actions.firstElementChild as HTMLButtonElement).disabled = timeline.paused || timeline.pendingTurnCount === 0 || !currentState?.permissions.generation || !currentState.permissions.chatMutation;
     const checkpoint = timeline.lastValidMessageIndex >= 0
@@ -1987,6 +2129,52 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       modelSlot,
       "Optional model override for this controller connection. Leave blank to use its configured default.",
     ));
+    const primaryTest = textButton("Test controller", () => {
+      if (settingsDraft) void runControllerTest({ connectionId: settingsDraft.controllerConnectionId, model: settingsDraft.controllerModel });
+    }, "secondary");
+    primaryTest.disabled = !generationAvailable;
+    controller.append(primaryTest, element("p", "lm-settings-description", "Testing makes a model request with a synthetic scene. Draft settings are used without saving; no chat content is sent."));
+    const backups = element("section", "lm-controller-backups");
+    backups.append(element("h3", "lm-settings-title", "Controller fallbacks"), element("p", "lm-settings-description", "Try backups in order when a request fails or returns unusable output. Applies to analysis, Tidy, and core/seed generation. Each new operation starts with the primary."));
+    settingsDraft.controllerFallbacks.forEach((backup, index) => {
+      const row = element("div", "lm-backup-row");
+      const select = element("select", "lm-select");
+      for (const candidate of currentState!.connections) {
+        const option = element("option", undefined, `${candidate.name} · ${candidate.model || candidate.provider}`);
+        option.value = candidate.id; option.selected = candidate.id === backup.connectionId; select.append(option);
+      }
+      if (!currentState!.connections.some((candidate) => candidate.id === backup.connectionId)) {
+        const missing = element("option", undefined, "Connection unavailable"); missing.value = backup.connectionId ?? ""; missing.selected = true; select.append(missing);
+      }
+      select.addEventListener("change", () => { backup.connectionId = select.value; backup.model = null; markSettingsDirty(save); render(); });
+      const model = input(backup.model ?? "", "Use connection default");
+      model.addEventListener("input", () => { backup.model = model.value.trim() || null; markSettingsDirty(save); });
+      row.append(field(`Backup ${index + 1}`, select), field("Model override", model));
+      const actions = element("div", "lm-inline-actions");
+      const test = textButton("Test controller", () => void runControllerTest(backup), "secondary"); test.disabled = !generationAvailable;
+      const move = (offset: number) => {
+        const entries = settingsDraft!.controllerFallbacks;
+        [entries[index], entries[index + offset]] = [entries[index + offset], entries[index]];
+        markSettingsDirty(save); render();
+      };
+      const up = textButton("Move up", () => move(-1), "quiet"); up.disabled = index === 0;
+      const down = textButton("Move down", () => move(1), "quiet"); down.disabled = index === settingsDraft!.controllerFallbacks.length - 1;
+      actions.append(test, up, down, textButton("Remove", () => { settingsDraft!.controllerFallbacks.splice(index, 1); markSettingsDirty(save); render(); }, "quiet"));
+      row.append(actions); backups.append(row);
+    });
+    const addBackup = textButton("Add backup", () => {
+      const candidate = currentState?.connections.find((entry) => entry.id !== settingsDraft?.controllerConnectionId && !settingsDraft?.controllerFallbacks.some((backup) => backup.connectionId === entry.id)) ?? currentState?.connections[0];
+      if (!candidate || !settingsDraft || settingsDraft.controllerFallbacks.length >= 3) return;
+      settingsDraft.controllerFallbacks.push({ connectionId: candidate.id, model: null }); markSettingsDirty(save); render();
+    }, "secondary");
+    addBackup.disabled = settingsDraft.controllerFallbacks.length >= 3 || !currentState.connections.length;
+    backups.append(addBackup);
+    const run = currentState.lastControllerRun;
+    if (run) {
+      const selected = currentState.connections.find((entry) => entry.id === run.selected?.connectionId)?.name ?? "Active connection";
+      backups.append(element("p", "lm-settings-description", `Last ${run.operation}: ${run.selected ? `${selected} · ${run.selected.model ?? "connection default"}` : "all controllers failed"}. ${run.attempts.length} connection attempts.`));
+    }
+    controller.append(backups);
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
@@ -2022,7 +2210,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         1,
         20,
         1,
-        "Maximum controller calls run at once during Mind Tidy. Timeline analysis remains ordered.",
+        "Maximum controller requests in flight across analysis, Tidy, drafts, and tests. Each timeline remains ordered.",
       ),
       numberSetting(
         "Requests per minute",
@@ -2396,7 +2584,23 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   const backendUnsub = ctx.onBackendMessage((payload) => {
     const message = payload as BackendToFrontend;
+    if ("requestId" in message && featureRequests.has(message.requestId)) {
+      const pending = featureRequests.get(message.requestId)!;
+      clearTimeout(pending.timeout); featureRequests.delete(message.requestId);
+      if (message.type === "feature_error") pending.reject(new Error(message.message)); else pending.resolve(message);
+      return;
+    }
+    if (message.type === "controller_run") {
+      if (currentState) currentState.lastControllerRun = message.run;
+      const selected = message.run.selected;
+      if (selected && message.run.attempts.length > 1) {
+        const name = currentState?.connections.find((entry) => entry.id === selected.connectionId)?.name ?? "Active connection";
+        showNotice("info", `${message.run.operation} used ${name} · ${selected.model ?? "connection default"} after ${message.run.attempts.length} connection attempts.`);
+      }
+      return;
+    }
     if (message.type === "state") {
+      if (currentState?.activeChatId !== message.state.activeChatId) closeInjectionPreview?.();
       currentState = message.state;
       if (!settingsDraft || !settingsDirty) {
         settingsDraft = cloneSettings(message.state.settings);
@@ -2511,6 +2715,10 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       pending.reject(new Error("LumiMind closed before the developer report completed."));
     }
     developerReportRequests.clear();
+    for (const pending of featureRequests.values()) { clearTimeout(pending.timeout); pending.reject(new Error("LumiMind closed before the request completed.")); }
+    featureRequests.clear();
+    for (const modal of featureModals) modal.dismiss();
+    featureModals.clear();
     for (const pending of activationPreviewRequests.values()) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("LumiMind closed before the history check completed."));

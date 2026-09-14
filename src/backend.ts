@@ -1,7 +1,9 @@
 declare const spindle: import("lumiverse-spindle-types").SpindleAPI;
 
 import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
-import { analyzeMessages, composeNpcCoreLore, generateMindTidyProposals, generateNpcCoreDraft, generateSeedDraft, isAbortError } from "./controller";
+import { analyzeMessages, composeNpcCoreLore, generateMindTidyProposals, generateNpcCoreDraft, generateSeedDraft, isAbortError, getLastControllerRun, testController } from "./controller";
+import { projectInjection } from "./injection";
+import { beginRepair, previewRepair } from "./repair";
 import { mapWithConcurrency } from "./controller-scheduling";
 import {
   DEFAULT_SETTINGS,
@@ -27,6 +29,8 @@ import {
   materializeSkippedAnalysisRecords,
   mergeActors,
   normalizeSeed,
+  normalizeSettings,
+  messageContentHash,
   normalizeTimeline,
   overrideItem,
   rebuildTimeline,
@@ -61,6 +65,7 @@ import {
   type FrontendToBackend,
   type LumiMindSettings,
   type MindSeedV1,
+  type InjectionSnapshot,
   type MindTidyActorError,
   type MindTidyProposal,
   type PermissionState,
@@ -70,7 +75,7 @@ import {
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
 const RECONCILE_DEBOUNCE_MS = 650;
-const EXTENSION_VERSION = "0.2.0";
+const EXTENSION_VERSION = "0.3.0";
 
 type GenerationContext = {
   generationId: string;
@@ -109,6 +114,7 @@ const controllerDebugResponses = new Map<string, Array<{
   retry: string | null;
 }>>();
 const lastInjectionProjections = new Map<string, import("./types").InjectionProjectionTelemetry>();
+const lastInjections = new Map<string, InjectionSnapshot>();
 let lastFrontendUserId: string | null = null;
 
 function cacheKey(userId: string, chatId: string): string {
@@ -324,6 +330,7 @@ async function buildFrontendState(userId: string, requestedChatId?: string | nul
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
     timeline: timeline ? toTimelineView(timeline, settings) : null,
+    lastControllerRun: getLastControllerRun(userId),
     lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
   };
 }
@@ -357,6 +364,7 @@ async function buildDeveloperDiagnostics(userId: string, requestedChatId?: strin
     activeCharacter: character,
     activePersona: persona,
     controllerRawResponses: chatId ? (controllerDebugResponses.get(cacheKey(userId, chatId)) ?? []) : [],
+    lastControllerRun: getLastControllerRun(userId),
     lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"],
   });
@@ -536,7 +544,7 @@ function enqueue(userId: string, chatId: string, task: () => Promise<void>): Pro
   operations.set(key, next);
   void next.finally(() => {
     if (operations.get(key) === next) operations.delete(key);
-  });
+  }).catch(() => undefined);
   return next;
 }
 
@@ -611,6 +619,7 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
     return;
   }
   if (policyChanged) {
+    timeline.repair = null;
     timeline.records = timeline.records.filter((record) => record.skipReason === "pre_activation_history");
     timeline.analysisPolicyHash = policyHash;
     timeline.lastAnalyzedAt = null;
@@ -618,7 +627,7 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
   }
   // A policy refresh preserves the user's first-activation cutoff. The explicit
   // Rebuild action is the deliberate way to replace it with a full-history replay.
-  if (force) timeline.records = [];
+  if (force) { timeline.records = []; timeline.repair = null; }
   const fullMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
   if (latestGenerationByChat.has(key)) {
     if (updateNow) updateNowRequests.add(key);
@@ -627,11 +636,12 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
   let fullDerivation = rebuildTimeline(timeline, fullMessages);
   if (fullDerivation.firstMissingIndex >= fullDerivation.messages.length) {
     timeline.health = "ready";
+    timeline.repair = null;
     timeline.error = null;
     await persistAndPublish(timeline, userId);
     return;
   }
-  const bypassUpdatePolicy = force || updateNow;
+  const bypassUpdatePolicy = force || updateNow || !!timeline.repair;
   let messages = fullMessages;
   if (!bypassUpdatePolicy && timeline.updateMode === "manual") {
     timeline.health = "waiting";
@@ -652,6 +662,7 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
   const finishAnalysisView = (): boolean => {
     fullDerivation = rebuildTimeline(timeline, fullMessages);
     const current = fullDerivation.firstMissingIndex >= fullDerivation.messages.length;
+    if (current) timeline.repair = null;
     timeline.health = current ? "ready" : "waiting";
     timeline.error = null;
     return current;
@@ -718,8 +729,19 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
         signal: abortController.signal,
+        onRun: (run) => send({ type: "controller_run", run }, userId),
       });
       abortController.signal.throwIfAborted();
+      const committed = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+      abortController.signal.throwIfAborted();
+      const analyzedPrefix = derivation.messages.slice(0, start + batch.length);
+      if (analysisPolicyHash(await getSettings(userId)) !== policyHash || analyzedPrefix.some((message, index) => {
+        const current = committed[index];
+        return !current || current.id !== message.id || (current.swipe_id ?? 0) !== (message.swipe_id ?? 0) || messageContentHash(current) !== messageContentHash(message);
+      })) {
+        scheduleReconcile(userId, chatId, 0);
+        return;
+      }
       const debugKey = cacheKey(userId, chatId);
       const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
       debugResponses.push({
@@ -866,6 +888,7 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
           userId,
           fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
           signal: abortController.signal,
+          onRun: (run) => send({ type: "controller_run", run }, userId),
         });
         completed += 1;
         send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
@@ -1008,7 +1031,7 @@ spindle.registerInterceptor(async (messages, context) => {
     if (connectionId) connectionByChat.set(cacheKey(userId, chatId), connectionId);
     const generationConnectionId = connectionId ?? connectionByChat.get(cacheKey(userId, chatId)) ?? null;
     const timeline = await getTimeline(chatId, userId);
-    if (!timeline.active || timeline.paused) return messages;
+
     const settings = await getSettings(userId);
     const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
     const injectionContext = promptMessages.flatMap((message) => typeof message.content === "string"
@@ -1016,21 +1039,11 @@ spindle.registerInterceptor(async (messages, context) => {
       : []);
     const countTokens = await tokenCounterForConnection(userId, generationConnectionId);
     let targetActorId: string | null = null;
-    let injection: string | null = null;
-    let projection: Awaited<ReturnType<typeof buildProjectedMindInjection>> | null = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
-      if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
-      if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
-      if (targetActorId && timeline.actors[targetActorId]) {
-        projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
-        injection = projection.content;
-      }
-    } else if (settings.characterCardDirectorMode) {
-      projection = await buildProjectedDirectorMindInjection(timeline, settings, injectionContext, countTokens);
-      injection = projection.content;
-    } else {
+      if (personaId && settings.personaMindEnabled && timeline.active && !timeline.paused) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
+    } else if (!settings.characterCardDirectorMode) {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
       if (characterId) targetActorId = `character:${characterId}`;
@@ -1038,10 +1051,14 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
-      injection = projection.content;
     }
-    if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
+    const snapshot = await projectInjection({ timeline: cloneJson(timeline), settings, permissions: currentPermissions(), targetActorId,
+      impersonate: generationType === "impersonate", context: injectionContext, countTokens });
+    lastInjections.set(cacheKey(userId, chatId), snapshot);
+    if (snapshot.telemetry) lastInjectionProjections.set(cacheKey(userId, chatId), snapshot.telemetry);
+    else lastInjectionProjections.delete(cacheKey(userId, chatId));
+    const injection = snapshot.content;
+    if (!timeline.active || timeline.paused) return messages;
     if (!injection) return promptMessages;
     const injected = { role: "system" as const, content: injection };
     const injectionIndex = mindInjectionIndex(promptMessages, settings.injectionPosition);
@@ -1052,6 +1069,12 @@ spindle.registerInterceptor(async (messages, context) => {
       breakdown: [{ messageIndex: injectionIndex, name: "LumiMind — Private Mind" }],
     };
   } catch (error) {
+    const failedChatId = extractChatId(context);
+    const failedUserId = resolveUserId(failedChatId);
+    if (failedChatId && failedUserId) {
+      lastInjections.delete(cacheKey(failedUserId, failedChatId));
+      lastInjectionProjections.delete(cacheKey(failedUserId, failedChatId));
+    }
     spindle.log.warn(`LumiMind interceptor degraded safely: ${error instanceof Error ? error.message : String(error)}`);
     return messages;
   }
@@ -1159,6 +1182,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
+  lastInjections.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 
@@ -1181,6 +1205,56 @@ spindle.onFrontendMessage(async (payload, userId) => {
     await publishScene(userId, timeline);
     await sendState(userId, chatId, characterId);
     if (timeline?.active) scheduleReconcile(userId, timeline.chatId, 0);
+    return;
+  }
+  if (message.type === "test_controller" || message.type === "repair_preview" || message.type === "repair_analysis" || message.type === "injection_preview") {
+    try {
+      if (message.type === "test_controller") {
+        if (!hasPermission("generation")) throw new Error("Generation permission is required to test a controller.");
+        const settings = normalizeSettings(message.settings);
+        const target = { connectionId: typeof message.target.connectionId === "string" ? message.target.connectionId : null,
+          model: typeof message.target.model === "string" ? message.target.model : null };
+        const result = await testController({ target, settings, userId,
+          fallbackConnectionId: message.chatId ? connectionByChat.get(cacheKey(userId, message.chatId)) : null });
+        send({ type: "test_controller_result", requestId: message.requestId, result }, userId);
+      } else if (message.type === "repair_preview") {
+        if (!hasPermission("chat_mutation")) throw new Error("Chat history permission is required to preview repair.");
+        const messages = selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId));
+        const timeline = await getTimeline(message.chatId, userId);
+        send({ type: "repair_preview_result", requestId: message.requestId, chatId: message.chatId, preview: previewRepair(timeline, messages) }, userId);
+      } else if (message.type === "repair_analysis") {
+        if (!hasPermission("chat_mutation") || !hasPermission("generation")) throw new Error("Chat history and generation permissions are required to repair analysis.");
+        cancelScheduledReconcile(userId, message.chatId);
+        cancelActiveAnalysis(userId, message.chatId);
+        await enqueue(userId, message.chatId, async () => {
+          const timeline = await getTimeline(message.chatId, userId);
+          if (!timeline.active || timeline.paused) throw new Error("Activate or resume LumiMind before repairing analysis.");
+          if (timeline.analysisPolicyHash !== analysisPolicyHash(await getSettings(userId))) throw new Error("The analysis policy changed. Wait for the policy update before repairing analysis.");
+          const messages = selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId));
+          const preview = beginRepair(timeline, messages, message);
+          if (preview.startMessageIndex === null) throw new Error("No analysis warnings need repair.");
+          await persistAndPublish(timeline, userId);
+          send({ type: "repair_started", requestId: message.requestId, chatId: message.chatId }, userId);
+          scheduleReconcile(userId, message.chatId, 0, false, true);
+        });
+      } else {
+        const timeline = cloneJson(await getTimeline(message.chatId, userId));
+        const settings = await getSettings(userId);
+        const messages = hasPermission("chat_mutation") ? selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId)) : [];
+        if (hasPermission("chat_mutation")) rebuildTimeline(timeline, messages);
+        const activeCharacter = activeChats.get(userId)?.characterId;
+        const targetActorId = message.targetActorId ?? (activeCharacter ? `character:${activeCharacter}` : null);
+        if (message.targetActorId && !timeline.actors[message.targetActorId]) throw new Error("The selected actor is no longer available.");
+        const current = await projectInjection({ timeline, settings, permissions: currentPermissions(), targetActorId,
+          impersonate: !!targetActorId && timeline.actors[targetActorId]?.kind === "persona",
+          context: limitChatHistoryMessages(messages.map((entry) => ({ ...entry, __isChatHistory: true })), settings.chatHistoryMessageLimit),
+          countTokens: await tokenCounterForConnection(userId, connectionByChat.get(cacheKey(userId, message.chatId)) ?? null) });
+        send({ type: "injection_preview_result", requestId: message.requestId, chatId: message.chatId,
+          current, last: lastInjections.get(cacheKey(userId, message.chatId)) ?? null }, userId);
+      }
+    } catch (error) {
+      send({ type: "feature_error", requestId: message.requestId, message: error instanceof Error ? error.message : "The request could not be completed." }, userId);
+    }
     return;
   }
   try {
@@ -1208,6 +1282,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         pauseRequests.delete(cacheKey(userId, message.chatId));
         rebuildRequests.delete(cacheKey(userId, message.chatId));
         lastInjectionProjections.delete(cacheKey(userId, message.chatId));
+        lastInjections.delete(cacheKey(userId, message.chatId));
         timelines.set(storageTimelineKey(userId, message.chatId), imported);
         await persistAndPublish(imported, userId);
       });
@@ -1322,7 +1397,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!hasPermission("characters") || !hasPermission("generation")) throw new Error("Character and generation permissions are required to draft a seed.");
       const character = await spindle.characters.get(message.characterId, userId);
       if (!character) throw new Error("Character card not found.");
-      const seed = await generateSeedDraft({ character, settings: await getSettings(userId), userId });
+      const seed = await generateSeedDraft({ character, settings: await getSettings(userId), userId,
+        fallbackConnectionId: chatId ? connectionByChat.get(cacheKey(userId, chatId)) : null,
+        onRun: (run) => send({ type: "controller_run", run }, userId) });
       send({ type: "seed_draft", characterId: message.characterId, seed }, userId);
       return;
     }
@@ -1343,6 +1420,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const core = await generateNpcCoreDraft({
         actorName,
         lore,
+        fallbackConnectionId: connectionByChat.get(cacheKey(userId, message.chatId)),
+        onRun: (run) => send({ type: "controller_run", run }, userId),
         settings: await getSettings(userId),
         userId,
       });
@@ -1499,4 +1578,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
   }
 });
 
-spindle.log.info("LumiMind v0.2.0 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.0 loaded — subjective timeline engine ready.");

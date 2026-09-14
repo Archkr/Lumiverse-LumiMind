@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.2.0-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.3.0-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.2.0` is the first stable release. Use the built-in Diagnostics report when a controller behaves unexpectedly.
+LumiMind `0.3.0` adds ordered controller fallbacks, targeted analysis repair, synthetic controller tests, and previews of private mind injection. Existing timelines and settings remain compatible; backup connections are opt-in.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -40,7 +40,7 @@ LumiMind `0.2.0` is the first stable release. Use the built-in Diagnostics repor
 9. [Mind Seed](#mind-seed)
 10. [Timeline behavior](#timeline-behavior)
 11. [Settings reference](#settings-reference)
-12. [Controller usage and cost](#controller-usage-and-cost)
+12. [Controller fallbacks, testing, and repair](#controller-fallbacks-testing-and-repair) · [Injection previews](#preview-injected-minds) · [Controller usage and cost](#controller-usage-and-cost)
 13. [Permissions](#permissions)
 14. [Privacy](#privacy)
 15. [Memory Cortex integration](#memory-cortex-integration)
@@ -69,6 +69,10 @@ LumiMind `0.2.0` is the first stable release. Use the built-in Diagnostics repor
 | **Timeline scheduling** | Keep immediate updates, leave a configurable turn lag, or update a timeline only when requested. |
 | **Private injection** | Adds one cached system message containing the present cast's unresolved state at the configured prompt position; the interceptor makes no model call. |
 | **Portable timelines** | Export a chat's LumiMind database and import it as a sequel checkpoint or matching-history restore. |
+| **Controller fallbacks** | Try up to three ordered backup connection/model pairs across analysis, Tidy, and seed/core generation. |
+| **Targeted repair** | Repair from the first affected batch onward while preserving earlier successful history and locked corrections. |
+| **Controller testing** | Test structured analysis with a synthetic scene before processing private history. |
+| **Injection previews** | Inspect a current estimate or the exact most recent LumiMind injection, including entry selection and token counts. |
 | **Diagnostics** | Produces a privacy-safe report for controller and timeline troubleshooting. |
 
 ---
@@ -118,7 +122,7 @@ Next generation receives a token-budgeted projection of present managed minds
 5. **The next reply gets a cached checkpoint.** LumiMind keeps a heading for every present managed actor and injects the highest-value active or uncertain state that fits the configured token budget. The complete state remains stored.
 6. **You remain the editor.** Manual changes are locked and cannot be overwritten until you unlock them. Once unlocked, any entry may evolve regardless of whether it began as controller, manual, seed, or pinned state.
 
-If a substantive batch leaves a genuinely uninitialized actor without usable mental state, LumiMind performs at most one focused corrective pass. An empty change set is healthy when the existing ledger already covers the scene.
+If a substantive batch leaves a genuinely uninitialized actor without usable mental state, LumiMind performs at most one focused corrective pass per attempted controller connection. An empty change set is healthy when the existing ledger already covers the scene.
 
 ---
 
@@ -127,7 +131,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.2.0` stable |
+| Extension version | `0.3.0` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
@@ -360,7 +364,7 @@ LumiMind settings are user-scoped and apply across chats.
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Controller model | Connection default | Uses Lumiverse's connection-aware model catalog to override the selected connection's configured model. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
-| Parallel requests | `1` | Maximum independent controller calls run at once during Mind Tidy. Ordered timeline analysis remains sequential. |
+| Parallel requests | `1` | Maximum controller requests in flight across analysis, Tidy, drafts, and tests. Each timeline stays sequential. |
 | Requests per minute | Unlimited | Rolling per-provider controller request cap; `0` disables throttling. |
 | Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |
 | Private injection tokens | `8,000` | Target token budget for state added to a roleplay prompt. All stored state remains in the timeline and Mind Lens; `0` injects all eligible state. |
@@ -387,6 +391,24 @@ Open **Mind Lens → Settings → Timeline database** to export or import the cu
 
 ---
 
+## Controller fallbacks, testing, and repair
+
+In **Settings → Analysis controller**, keep your primary connection and optionally add up to three backups. Each backup has its own optional model override; a blank override uses that connection's default. Reorder backups with **Move up/down**, then save. Fallbacks apply to analysis, Tidy, Mind Seeds, and NPC core generation. Each new operation starts with the primary.
+
+LumiMind advances to the next backup on request failures or unusable structured output. Analysis still allows one corrective bootstrap pass per connection. Valid empty analysis and empty Tidy proposals are successful results; minor rejected entries do not trigger backups when useful output remains. Cancellation, missing permissions, and local input/budget errors stop the operation. If every connection fails, usable partial analysis is retained with its warnings when available. Results from separate connections are never merged. Mind Lens and Diagnostics identify connection attempts and the selected model without including raw provider errors.
+
+**Test controller** beside the primary or any backup sends a small synthetic scene using the current draft settings, without saving them. It tests only that connection, makes a model request, and never sends chat content or writes timeline state. The result shows validation success, elapsed time, the resolved model when available, and the structured-output mode. A successful test confirms this small scene works; it does not guarantee every larger chat will succeed.
+
+**Repair analysis** finds the first warning on the active branch and previews the range to reanalyze. It preserves earlier records, the activation cutoff, seeds, and locked corrections, then reprocesses the affected batch and everything after it. The discarded suffix stays in recovery storage until repair completes; only the consistent repaired prefix is used. Failed or interrupted repairs keep their progress and can be resumed with **Retry**. Repair processes pending work even in manual or lagged mode without changing that saved mode. It never silently turns into a full rebuild. **Changes → Rebuild all** remains available for a deliberate full-history replay.
+
+## Preview injected minds
+
+Use **Preview injected minds** in the Mind Lens header. **Current preview** uses saved settings, available committed context, and the current checkpoint; it is an estimate because the final generation prompt can change entry ranking and token counts. Choose a character for group chats or a persona for impersonation; director mode previews the ensemble.
+
+**Last actual injection** shows the exact LumiMind block used by the most recent intercepted generation, with its target, timestamp, and timeline revision. This snapshot stays in memory for the current extension session and is unavailable after reload until another generation. Refresh the preview after generating to inspect it.
+
+Both views show included actors, token counts/budgets, and which active or uncertain entries were included or omitted. The fixed guidance and actor headings can exceed a very small token budget. Private text remains behind an explicit reveal when spoiler-safe mode is on. Previewing makes no model request, changes no minds, and includes no private content in public interoperability snapshots or sanitized diagnostics.
+
 ## Controller usage and cost
 
 LumiMind normally makes one quiet controller call after each newly committed analyzable turn. When persona management is off, user-authored turns are checkpointed without calling the controller.
@@ -401,15 +423,19 @@ Additional calls can occur when:
 - running one corrective pass after a substantive empty bootstrap result;
 - generating a Mind Seed draft;
 - generating or revising an NPC core;
-- running Mind Tidy.
+- running Mind Tidy;
+- testing a controller;
+- using configured backups after an unsuccessful attempt.
+
+With three backups, one analysis operation is bounded to four connections and at most eight model calls including corrective passes. Core, seed, and Tidy operations make at most four calls each. Controller tests use only the selected target and at most one corrective pass.
 
 Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
 
-Mind Tidy is always explicit and review-first. It makes exactly one controller request per selected actor, with up to **Parallel requests** calls in flight at once and the configured **Requests per minute** cap shared across the provider. **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
+Mind Tidy is always explicit and review-first. It makes one primary request per selected actor, plus configured backup attempts on failure, with up to **Parallel requests** calls in flight at once and the configured **Requests per minute** cap shared across the provider. **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
 
 The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message at the configured prompt position. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
-Controller analysis uses the selected controller model's tokenizer and always keeps actor identity stubs available. Ranking favors actors named in the current batch, current presence, lexical relevance, protected or pinned state, relationships to relevant actors, and recency, with fair allocation across relevant actors. LumiMind uses Spindle's provider mapping to force one schema-backed tool call and disables inherited reasoning with `reasoning: { source: "off" }`; plain JSON remains a compatibility fallback. If tokenization fails, diagnostics mark the `characters / 4` estimate used for that request.
+Controller analysis uses each attempted controller model's tokenizer and always keeps actor identity stubs available. Ranking favors actors named in the current batch, current presence, lexical relevance, protected or pinned state, relationships to relevant actors, and recency, with fair allocation across relevant actors. LumiMind uses Spindle's provider mapping to force one schema-backed tool call and disables inherited reasoning with `reasoning: { source: "off" }`; plain JSON remains a compatibility fallback. If tokenization fails, diagnostics mark the `characters / 4` estimate used for that request.
 
 LumiMind uses the dedicated controller connection and optional model override selected in Settings. If no connection is selected, it falls back to the active connection for the chat; a blank model override uses that connection's configured default. It uses Lumiverse connection profiles and does not read or store API credentials.
 
@@ -426,6 +452,8 @@ LumiMind uses the dedicated controller connection and optional model override se
 | `characters` | Stable card identity, reviewed seeds, and Mind Seed editor tab | Card enrichment and seed editing are unavailable. |
 | `personas` | Stable active-persona identity | Persona enrichment is unavailable. |
 | `memories` | Optional Memory Cortex identity import and writeback | The independent actor registry continues to work. |
+
+Controller fallbacks may send the same task context to each configured backup provider. Add only connections you intend to receive that context.
 
 Despite the `chat_mutation` permission name, LumiMind does not edit, delete, hide, append, or swipe Lumiverse chat messages. It reads committed history and stores its own extension timeline separately.
 
@@ -545,10 +573,10 @@ Mind Lens treats a technically compatible but suspiciously empty bootstrap resul
 1. Open **Settings → Diagnostics**.
 2. Compare raw, normalized, and final accepted counts.
 3. Check whether the corrective pass ran or failed.
-4. Choose **Rebuild analysis** from the warning or Changes view.
+4. Choose **Repair analysis** from the warning or Changes view and review the affected message range. Use **Rebuild all** in Changes only when you want to reprocess the full history.
 5. If it remains empty, try a controller with stronger structured-output support and copy the sanitized report for a bug report.
 
-LumiMind 0.1.9 repairs harmless category/operation formatting differences, gives its single corrective pass privacy-safe validation feedback, and records whether structured data came from a tool call, content JSON, reasoning JSON, or nowhere. After upgrading an affected installation, run **Rebuild analysis** once so the failed history is processed through the hardened controller path.
+LumiMind 0.1.9 repairs harmless category/operation formatting differences, gives its single corrective pass privacy-safe validation feedback, and records whether structured data came from a tool call, content JSON, reasoning JSON, or nowhere. In v0.3.0, use **Repair analysis** to reprocess the affected history through the hardened controller path.
 
 </details>
 

@@ -135,3 +135,33 @@ export function resetControllerRpmGatesForTests(): void {
     sweepTimer = null;
   }
 }
+
+const requestSlots = new Map<string, { running: number; waiters: Set<() => void> }>();
+
+/** Share the request limit across analysis, maintenance, and connection tests. */
+export async function withControllerSlot<T>(userId: string, limit: number, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+  let state = requestSlots.get(userId);
+  if (!state) {
+    state = { running: 0, waiters: new Set() };
+    requestSlots.set(userId, state);
+  }
+  const maximum = Math.max(1, Math.min(20, Math.floor(limit) || 1));
+  while (state.running >= maximum) {
+    signal?.throwIfAborted();
+    await new Promise<void>((resolve, reject) => {
+      const wake = () => { cleanup(); resolve(); };
+      const abort = () => { cleanup(); reject(abortReason(signal)); };
+      const cleanup = () => { state!.waiters.delete(wake); signal?.removeEventListener("abort", abort); };
+      state!.waiters.add(wake);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+  signal?.throwIfAborted();
+  state.running += 1;
+  try { return await run(); }
+  finally {
+    state.running -= 1;
+    for (const wake of [...state.waiters]) wake();
+
+  }
+}

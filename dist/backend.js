@@ -5,6 +5,7 @@ var EXTENSION_KEY = "lumi_mind";
 
 // src/engine.ts
 var DEFAULT_SETTINGS = {
+  controllerFallbacks: [],
   controllerConnectionId: null,
   controllerModel: null,
   controllerTemperature: 0.1,
@@ -76,6 +77,7 @@ function normalizeSettings(value) {
   const controllerParallelRequests = typeof raw.controllerParallelRequests === "number" ? raw.controllerParallelRequests : Number(raw.controllerParallelRequests);
   const controllerRequestsPerMinute = typeof raw.controllerRequestsPerMinute === "number" ? raw.controllerRequestsPerMinute : Number(raw.controllerRequestsPerMinute);
   return {
+    controllerFallbacks: (Array.isArray(raw.controllerFallbacks) ? raw.controllerFallbacks : []).map((entry) => ({ connectionId: stringValue(asObject(entry).connectionId), model: stringValue(asObject(entry).model) || null })).filter((entry, index, entries) => entry.connectionId && entries.findIndex((other) => other.connectionId === entry.connectionId && other.model === entry.model) === index).slice(0, 3),
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
@@ -791,6 +793,7 @@ function rebuildTimeline(timeline, rawMessages) {
   }
   applyManualOverrides(minds, overrides.slice(overrideIndex));
   timeline.minds = minds;
+  timeline.activeRecordIds = matchedRecords.map((record) => record.id);
   timeline.lastValidMessageIndex = firstMissingIndex === 0 ? -1 : messages[firstMissingIndex - 1]?.index_in_chat ?? firstMissingIndex - 1;
   timeline.pendingTurnCount = countPendingCompletedTurns(messages, firstMissingIndex);
   if (!timeline.active) timeline.health = "inactive";
@@ -1229,7 +1232,7 @@ function toTimelineView(timeline, settings = DEFAULT_SETTINGS) {
     error: timeline.error,
     actors,
     minds: Object.fromEntries(Object.entries(timeline.minds).filter(([actorId]) => visibleIds.has(actorId))),
-    records: timeline.records.slice().filter((record) => !record.skipReason).sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
+    records: timeline.records.slice().filter((record) => !record.skipReason && (!timeline.activeRecordIds || timeline.activeRecordIds.includes(record.id))).sort((left, right) => left.messageIndex - right.messageIndex || left.createdAt - right.createdAt).map((record) => ({
       id: record.id,
       messageId: record.messageId,
       messageIndex: record.messageIndex,
@@ -1471,11 +1474,15 @@ async function projectMindInjection(timeline, targetActorId, settings, contextMe
     (actor) => (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain")
   );
   const allItemIds = new Set(allItems.map((item) => item.id));
+  const selection = (included) => ({
+    actors: actors.map((actor) => ({ id: actor.id, name: actor.canonicalName })),
+    entries: actors.flatMap((actor) => (timeline.minds[actor.id]?.items ?? []).filter((item) => item.status === "active" || item.status === "uncertain").map((item) => ({ id: item.id, actorId: actor.id, category: item.category, text: item.text, included: included.has(item.id) })))
+  });
   const available = allItems.length;
   const fullContent = director ? renderDirectorMindInjection(timeline, settings, allItemIds) : renderMindInjection(timeline, targetActorId, settings, allItemIds);
   const emptyMeasurement = await countTokens(fullContent ?? "");
   if (!fullContent) {
-    return { content: null, telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
+    return { content: null, selection: selection(/* @__PURE__ */ new Set()), telemetry: projectionTelemetry(settings.injectionTokenBudget, emptyMeasurement, available, 0, actors.length) };
   }
   const orderedCandidates = orderedInjectionCandidates(timeline, actors, targetActorId, contextMessages);
   const render = (includedIds) => (director ? renderDirectorMindInjection(timeline, settings, includedIds) : renderMindInjection(timeline, targetActorId, settings, includedIds)) ?? "";
@@ -1489,6 +1496,7 @@ async function projectMindInjection(timeline, targetActorId, settings, contextMe
   );
   const fullIncluded = settings.injectionTokenBudget === 0 || fitted.includedIds.size === orderedCandidates.length;
   return {
+    selection: selection(fullIncluded ? allItemIds : fitted.includedIds),
     content: fullIncluded ? fullContent : fitted.text,
     telemetry: projectionTelemetry(settings.injectionTokenBudget, fitted.measurement, available, fullIncluded ? available : fitted.includedIds.size, actors.length)
   };
@@ -1597,6 +1605,42 @@ async function mapWithConcurrency(items, limit, mapper) {
   };
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
+}
+var requestSlots = /* @__PURE__ */ new Map();
+async function withControllerSlot(userId, limit, signal, run) {
+  let state = requestSlots.get(userId);
+  if (!state) {
+    state = { running: 0, waiters: /* @__PURE__ */ new Set() };
+    requestSlots.set(userId, state);
+  }
+  const maximum = Math.max(1, Math.min(20, Math.floor(limit) || 1));
+  while (state.running >= maximum) {
+    signal?.throwIfAborted();
+    await new Promise((resolve, reject) => {
+      const wake = () => {
+        cleanup();
+        resolve();
+      };
+      const abort = () => {
+        cleanup();
+        reject(abortReason(signal));
+      };
+      const cleanup = () => {
+        state.waiters.delete(wake);
+        signal?.removeEventListener("abort", abort);
+      };
+      state.waiters.add(wake);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+  signal?.throwIfAborted();
+  state.running += 1;
+  try {
+    return await run();
+  } finally {
+    state.running -= 1;
+    for (const wake of [...state.waiters]) wake();
+  }
 }
 
 // src/controller.ts
@@ -2105,6 +2149,11 @@ function toolChoiceParameters(provider) {
 async function resolveConnection(settings, userId, fallbackConnectionId) {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
   const configuredModel = settings.controllerModel?.trim() || null;
+  if (!id && typeof spindle.connections?.list === "function") {
+    const profiles = await spindle.connections.list(userId).catch(() => []);
+    const defaultProfile = profiles.find((profile) => profile.is_default);
+    if (defaultProfile) return { id: defaultProfile.id, provider: defaultProfile.provider, model: configuredModel ?? defaultProfile.model };
+  }
   if (!id) return { id: null, provider: null, model: configuredModel };
   const connection = await spindle.connections.get(id, userId).catch(() => null);
   return { id, provider: connection?.provider ?? null, model: configuredModel ?? connection?.model ?? null };
@@ -2152,34 +2201,37 @@ function controllerTokenCounter(connection, userId) {
 }
 async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal) {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
-  await waitForControllerRpmSlot({
-    userId,
-    provider: connection.provider,
-    requestsPerMinute: settings.controllerRequestsPerMinute,
-    signal
-  });
-  const result = await spindle.generate.quiet({
-    type: "quiet",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: prompt }
-    ],
-    parameters: {
-      temperature: settings.controllerTemperature,
-      // A blank override deliberately selects the connection default and keeps
-      // legacy preset model fields from replacing it inside quiet generation.
-      model: settings.controllerModel?.trim() ?? "",
-      ...toolChoiceParameters(connection.provider)
-    },
-    tools: [{
-      name: schemaName,
-      description: "Submit the complete structured LumiMind result exactly once.",
-      parameters: schema
-    }],
-    reasoning: { source: "off" },
-    ...connection.id ? { connection_id: connection.id } : {},
-    userId,
-    signal
+  const result = await withControllerSlot(userId, settings.controllerParallelRequests, signal, async () => {
+    if (spindle.permissions && !spindle.permissions.has("generation")) throw new LocalControllerError("Generation permission is required to use the controller.");
+    await waitForControllerRpmSlot({
+      userId,
+      provider: connection.provider,
+      requestsPerMinute: settings.controllerRequestsPerMinute,
+      signal
+    });
+    return spindle.generate.quiet({
+      type: "quiet",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: prompt }
+      ],
+      parameters: {
+        temperature: settings.controllerTemperature,
+        // A blank override deliberately selects the connection default and keeps
+        // legacy preset model fields from replacing it inside quiet generation.
+        model: settings.controllerModel?.trim() ?? "",
+        ...toolChoiceParameters(connection.provider)
+      },
+      tools: [{
+        name: schemaName,
+        description: "Submit the complete structured LumiMind result exactly once.",
+        parameters: schema
+      }],
+      reasoning: { source: "off" },
+      ...connection.id ? { connection_id: connection.id } : {},
+      userId,
+      signal
+    });
   });
   const object = asObject2(result);
   const content = sanitizeControllerText(text(object.content));
@@ -2300,7 +2352,7 @@ ${renderMessages(input.messages)}
     'Call the required result tool with {"actorMentions": [...], "changes": [...]} now.'
   ].join("\n\n");
 }
-async function analyzeMessages(input) {
+async function analyzeMessagesOnce(input) {
   const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
   const stateProjection = await projectControllerState(
     input.compactState,
@@ -2327,7 +2379,9 @@ async function analyzeMessages(input) {
     input.signal
   );
   input.signal?.throwIfAborted();
-  if (!result.parsed) throw new Error("The LumiMind controller returned no parseable structured result.");
+  if (!result.parsed) throw new UnusableControllerOutput("The LumiMind controller returned no parseable structured result.");
+  const shape = asObject2(result.parsed);
+  if (!Array.isArray(shape.actorMentions) || !Array.isArray(shape.changes)) throw new UnusableControllerOutput("The LumiMind controller returned an invalid analysis result.");
   const normalizedFirst = normalizeControllerAnalysisResult(result.parsed);
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
   const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
@@ -2385,11 +2439,11 @@ Perform the corrective bootstrap extraction now.`,
         matchingToolCalls: corrective.matchingToolCalls,
         usableToolCalls: corrective.usableToolCalls
       });
-      if (!corrective.parsed) throw new Error("Corrective controller pass returned no parseable structured result.");
+      if (!corrective.parsed) throw new UnusableControllerOutput("Corrective controller pass returned no parseable structured result.");
       finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
     } catch (error) {
-      if (isAbortError(error)) throw error;
-      retryError = (error instanceof Error ? error.message : String(error)).slice(0, 240);
+      if (input.signal?.aborted || isAbortError(error) || error instanceof LocalControllerError || permissionFailure(error)) throw error;
+      retryError = error instanceof UnusableControllerOutput ? error.message : "Corrective controller request failed.";
     }
   }
   const warningCodes = /* @__PURE__ */ new Set();
@@ -2435,7 +2489,7 @@ var SEED_SYSTEM_PROMPT = [
   "Call the required LumiMind result tool exactly once. Extract enduring characterization from the card without inventing events, relationships, or secrets not supported by the card.",
   "The seed must be concise, portable across new chats, and written as private subjective state rather than visible roleplay prose."
 ].join("\n");
-async function generateSeedDraft(input) {
+async function generateSeedDraftOnce(input) {
   const prompt = [
     "Draft a reusable mind seed from this character card:",
     `<character_card>
@@ -2443,9 +2497,22 @@ ${JSON.stringify(input.character)}
 </character_card>`,
     "Use schemaVersion 1 and updatedAt equal to the current Unix time in milliseconds."
   ].join("\n\n").slice(0, 8e4);
-  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId);
+  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal);
   const normalized = normalizeSeed(result.parsed);
-  if (!normalized) throw new Error("The LumiMind controller returned an invalid mind seed.");
+  if (!normalized || !Object.keys(asObject2(asObject2(result.parsed).core)).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid mind seed.");
+  if (!normalized.core.selfConcept && ![
+    ...normalized.core.values,
+    ...normalized.core.desires,
+    ...normalized.core.fears,
+    ...normalized.core.boundaries,
+    ...normalized.core.notes,
+    ...normalized.startingBeliefs,
+    ...normalized.startingSecrets,
+    ...normalized.startingGoals,
+    ...normalized.relationshipPriors
+  ].length) {
+    throw new UnusableControllerOutput("The LumiMind controller returned an empty mind seed.");
+  }
   return { ...makeEmptySeed(), ...normalized, schemaVersion: 1, updatedAt: Date.now() };
 }
 var NPC_CORE_SYSTEM_PROMPT = [
@@ -2453,9 +2520,9 @@ var NPC_CORE_SYSTEM_PROMPT = [
   "Call the required LumiMind result tool exactly once. Use only characterization supported by the lore; do not invent events, relationships, secrets, or temporary scene state.",
   "Write a concise private subjective frame covering stable self-concept, values, desires, fears, boundaries, and other enduring notes."
 ].join("\n");
-async function generateNpcCoreDraft(input) {
+async function generateNpcCoreDraftOnce(input) {
   const lore = input.lore.trim();
-  if (!lore) throw new Error("NPC lore is required to generate a core draft.");
+  if (!lore) throw new LocalControllerError("NPC lore is required to generate a core draft.");
   const boundedLore = lore.slice(0, 75e3);
   const prompt = [
     `Draft an enduring frame for the timeline NPC named ${JSON.stringify(input.actorName.trim() || "Unnamed NPC")}.`,
@@ -2464,12 +2531,12 @@ ${boundedLore}
 </npc_lore>`,
     "Return only characterization supported by this lore."
   ].join("\n\n");
-  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId);
+  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal);
   const raw = asObject2(result.parsed);
-  if (!Object.keys(raw).length) throw new Error("The LumiMind controller returned an invalid NPC core draft.");
+  if (!Object.keys(raw).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid NPC core draft.");
   const core = normalizeCore(raw);
   if (!core.selfConcept && !core.values.length && !core.desires.length && !core.fears.length && !core.boundaries.length && !core.notes.length) {
-    throw new Error("The LumiMind controller returned an empty NPC core draft.");
+    throw new UnusableControllerOutput("The LumiMind controller returned an empty NPC core draft.");
   }
   return core;
 }
@@ -2518,7 +2585,7 @@ function normalizeTidyItem(value, knownActorIds) {
     dimensions
   };
 }
-async function generateMindTidyProposals(input) {
+async function generateMindTidyProposalsOnce(input) {
   const knownActorIds = new Set(input.knownActors.map((actor) => actor.id));
   const itemIds = new Set(input.mind.items.map((item) => item.id));
   const statePayload = {
@@ -2537,7 +2604,7 @@ async function generateMindTidyProposals(input) {
   const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
   const stateMeasurement = await countTextTokens(stateJson, connection, input.userId);
   if (input.settings.analysisStateTokenBudget > 0 && stateMeasurement.totalTokens > input.settings.analysisStateTokenBudget) {
-    throw new Error(
+    throw new LocalControllerError(
       `This actor needs ${stateMeasurement.totalTokens.toLocaleString()} state tokens, above the ${input.settings.analysisStateTokenBudget.toLocaleString()} tidy limit. Increase Analysis state tokens or set it to 0.`
     );
   }
@@ -2565,8 +2632,8 @@ ${renderMessages(input.recentContext)}
   );
   input.signal?.throwIfAborted();
   const raw = asObject2(result.parsed);
-  if (!Array.isArray(raw.proposals)) throw new Error("The LumiMind controller returned an invalid tidy result.");
-  return raw.proposals.flatMap((entry) => {
+  if (!Array.isArray(raw.proposals)) throw new UnusableControllerOutput("The LumiMind controller returned an invalid tidy result.");
+  const proposals = raw.proposals.flatMap((entry) => {
     const proposal = asObject2(entry);
     if (text(proposal.actorId) !== input.actor.id) return [];
     const finding = proposal.finding === "missing" || proposal.finding === "mislabeled" || proposal.finding === "outdated" || proposal.finding === "duplicate" || proposal.finding === "inconsistent" ? proposal.finding : null;
@@ -2593,6 +2660,181 @@ ${renderMessages(input.recentContext)}
       item
     }];
   });
+  if (raw.proposals.length && !proposals.length) throw new UnusableControllerOutput("The LumiMind controller returned no valid tidy proposals.");
+  return proposals;
+}
+var UnusableControllerOutput = class extends Error {
+};
+var LocalControllerError = class extends Error {
+};
+var lastControllerRuns = /* @__PURE__ */ new Map();
+function getLastControllerRun(userId) {
+  return lastControllerRuns.get(userId) ?? null;
+}
+function permissionFailure(error) {
+  const value = asObject2(error);
+  const message = error instanceof Error ? error.message : "";
+  return value.code === "PERMISSION_DENIED" || /permission (?:denied|required|not granted)|missing .*permission/i.test(message);
+}
+async function withFallbacks(input, operation2, run, usable = () => true) {
+  const targets = [
+    { connectionId: input.settings.controllerConnectionId ?? input.fallbackConnectionId ?? null, model: input.settings.controllerModel },
+    ...(input.settings.controllerFallbacks ?? []).slice(0, 3)
+  ].filter((entry, index, entries) => entries.findIndex((other) => other.connectionId === entry.connectionId && other.model === entry.model) === index);
+  const attempts = [];
+  const attemptedTargets = /* @__PURE__ */ new Set();
+  let partial = null;
+  let lastError;
+  const finish = (result, selected) => {
+    const report2 = { operation: operation2, attempts, selected };
+    lastControllerRuns.set(input.userId, report2);
+    input.onRun?.(report2);
+    if (operation2 === "Analysis") result.telemetry.connectionAttempts = attempts;
+    return result;
+  };
+  for (const target of targets) {
+    input.signal?.throwIfAborted();
+    const settings = { ...input.settings, controllerConnectionId: target.connectionId, controllerModel: target.model, controllerFallbacks: [] };
+    let connection = { id: target.connectionId, provider: null, model: target.model };
+    try {
+      connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId);
+      const targetKey = JSON.stringify([connection.id, connection.model]);
+      if (attemptedTargets.has(targetKey)) continue;
+      attemptedTargets.add(targetKey);
+      const result = await run(settings);
+      input.signal?.throwIfAborted();
+      const accepted = usable(result);
+      const resolved = { connectionId: connection.id, model: connection.model };
+      attempts.push({ ...resolved, provider: connection.provider, outcome: accepted ? "success" : "unusable_output" });
+      if (accepted) return finish(result, resolved);
+      const analysis = operation2 === "Analysis" ? result.analysis : null;
+      if (targets.length === 1 || !analysis || analysis.actorMentions.length || analysis.changes.length) partial ??= { result, target: resolved };
+      lastError = new UnusableControllerOutput("The configured controllers returned no usable analysis. Try Test controller or choose another connection.");
+    } catch (error) {
+      if (input.signal?.aborted || isAbortError(error) || error instanceof LocalControllerError || permissionFailure(error)) throw error;
+      attempts.push({ connectionId: connection.id, model: connection.model, provider: connection.provider, outcome: error instanceof UnusableControllerOutput ? "unusable_output" : "request_failed" });
+      lastError = error;
+    }
+  }
+  if (partial) return finish(partial.result, partial.target);
+  const report = { operation: operation2, attempts, selected: null };
+  lastControllerRuns.set(input.userId, report);
+  input.onRun?.(report);
+  throw new Error(lastError instanceof UnusableControllerOutput ? lastError.message : "All configured LumiMind controllers failed. Check the connections and try Test controller.");
+}
+function analyzeMessages(input) {
+  return withFallbacks(input, "Analysis", (settings) => analyzeMessagesOnce({ ...input, settings }), (result) => {
+    if (result.telemetry.warningCodes.includes("empty_nontrivial_batch")) return false;
+    const rejectedAllChanges = result.telemetry.first.rawChanges > 0 && result.telemetry.finalChanges === 0 && result.telemetry.first.invalidChangesRejected > 0;
+    const rejectedAllMentions = result.telemetry.first.rawActorMentions > 0 && result.telemetry.first.acceptedActorMentions === 0 && result.telemetry.finalActorMentions === 0;
+    return !rejectedAllChanges && !rejectedAllMentions;
+  });
+}
+function generateSeedDraft(input) {
+  return withFallbacks(input, "Mind Seed", (settings) => generateSeedDraftOnce({ ...input, settings }));
+}
+function generateNpcCoreDraft(input) {
+  if (!input.lore.trim()) return Promise.reject(new LocalControllerError("NPC lore is required to generate a core draft."));
+  return withFallbacks(input, "NPC core", (settings) => generateNpcCoreDraftOnce({ ...input, settings }));
+}
+function generateMindTidyProposals(input) {
+  return withFallbacks(input, "Tidy", (settings) => generateMindTidyProposalsOnce({ ...input, settings }));
+}
+async function testController(input) {
+  const started = Date.now();
+  const settings = { ...input.settings, controllerConnectionId: input.target.connectionId, controllerModel: input.target.model, controllerFallbacks: [], personaMindEnabled: true, characterCardDirectorMode: false };
+  const connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId);
+  const meta = { connectionId: connection.id, provider: connection.provider, model: connection.model };
+  try {
+    const result = await analyzeMessagesOnce({
+      settings,
+      userId: input.userId,
+      fallbackConnectionId: input.fallbackConnectionId,
+      messages: [{ id: "controller-test-scene", role: "assistant", index_in_chat: 0, content: "Mira stands alone outside a locked observatory. She believes her missing notebook is inside because she saw it through the window. She wants to retrieve it before the rain begins. Mira feels worried about the approaching storm and plans to ask the caretaker for a key. No other person is present." }],
+      recentContext: [],
+      compactState: []
+    });
+    const passed = result.analysis.changes.length > 0;
+    const response = result.telemetry.retry?.acceptedChanges ? result.telemetry.retry : result.telemetry.first;
+    return {
+      ...meta,
+      passed,
+      elapsedMs: Date.now() - started,
+      outputMode: response.structuredSource ?? response.outputMode,
+      message: passed ? "The controller returned usable, evidence-linked analysis for the test scene." : "The controller returned no usable mental-state changes for the test scene."
+    };
+  } catch (error) {
+    return {
+      ...meta,
+      passed: false,
+      elapsedMs: Date.now() - started,
+      outputMode: null,
+      message: error instanceof UnusableControllerOutput ? error.message : "The test request failed. Check connection access, model availability, and provider limits."
+    };
+  }
+}
+
+// src/injection.ts
+async function projectInjection(input) {
+  const { timeline, settings, targetActorId } = input;
+  const target = targetActorId ? timeline.actors[targetActorId] : null;
+  const director = settings.characterCardDirectorMode && !input.impersonate;
+  const reason = !input.permissions.interceptor ? "Interceptor permission is unavailable." : !timeline.active ? "LumiMind is inactive for this chat." : timeline.paused ? "LumiMind is paused for this chat." : input.impersonate && !settings.personaMindEnabled ? "Persona mind management is disabled." : input.impersonate && !target ? "No persona is available for impersonation." : null;
+  const snapshot = {
+    chatId: timeline.chatId,
+    revision: timeline.revision,
+    capturedAt: Date.now(),
+    targetActorId,
+    targetLabel: director ? "Director ensemble" : target?.canonicalName ?? "Present cast",
+    content: null,
+    reason,
+    position: settings.injectionPosition,
+    telemetry: null,
+    selection: { actors: [], entries: [] }
+  };
+  if (reason) return snapshot;
+  const projection = director ? await buildProjectedDirectorMindInjection(timeline, settings, input.context, input.countTokens) : await buildProjectedMindInjection(timeline, targetActorId, settings, input.context, input.countTokens);
+  return { ...snapshot, ...projection, reason: projection.content ? null : "No managed mind state is available for injection." };
+}
+
+// src/repair.ts
+function previewRepair(timeline, messages) {
+  const copy = structuredClone(timeline);
+  const derivation = rebuildTimeline(copy, messages);
+  const records = derivation.matchedRecords;
+  const analyzed = records.filter((record) => !record.skipReason);
+  const warning = analyzed.find((record) => record.controller.telemetry?.warningCodes.length);
+  const warningBatch = warning?.controller.telemetry?.batchId;
+  let start = warning ? records.findIndex((record) => record.controller.telemetry?.batchId === warningBatch) : -1;
+  const legacy = analyzed.length > 0 && analyzed.every((record) => !record.controller.telemetry && !record.deltas.length) && Object.values(copy.minds).every((mind) => !mind.items.length);
+  if (start < 0 && legacy) start = records.indexOf(analyzed[0]);
+  if (timeline.repair) start = derivation.firstMissingIndex;
+  const fingerprint = stableHash(JSON.stringify({
+    messages: derivation.messages.map((message) => [message.id, message.swipe_id ?? 0, message.content]),
+    records: records.map((record) => record.id),
+    start
+  }));
+  return {
+    revision: timeline.revision,
+    fingerprint,
+    startMessageIndex: start >= 0 && start < derivation.messages.length ? derivation.messages[start].index_in_chat ?? start : null,
+    messageCount: start >= 0 ? derivation.messages.length - start : 0,
+    resumed: !!timeline.repair
+  };
+}
+function beginRepair(timeline, messages, expected) {
+  const preview = previewRepair(timeline, messages);
+  if (preview.revision !== expected.revision || preview.fingerprint !== expected.fingerprint) {
+    throw new Error("The timeline changed. Open Repair analysis again to review the updated range.");
+  }
+  if (preview.startMessageIndex === null) return preview;
+  if (!timeline.repair) {
+    const suffix = timeline.records.filter((record) => record.messageIndex >= preview.startMessageIndex);
+    timeline.repair = { backupRecords: structuredClone(suffix), startedAt: Date.now() };
+    timeline.records = timeline.records.filter((record) => record.messageIndex < preview.startMessageIndex);
+  }
+  rebuildTimeline(timeline, messages);
+  return preview;
 }
 
 // src/storage.ts
@@ -2687,7 +2929,7 @@ function redactDiagnosticCredentials(value) {
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECONCILE_DEBOUNCE_MS = 650;
-var EXTENSION_VERSION = "0.2.0";
+var EXTENSION_VERSION = "0.3.0";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
@@ -2705,6 +2947,7 @@ var latestGenerationByChat = /* @__PURE__ */ new Map();
 var connectionByChat = /* @__PURE__ */ new Map();
 var controllerDebugResponses = /* @__PURE__ */ new Map();
 var lastInjectionProjections = /* @__PURE__ */ new Map();
+var lastInjections = /* @__PURE__ */ new Map();
 var lastFrontendUserId = null;
 function cacheKey(userId, chatId) {
   return `${userId}:${chatId}`;
@@ -2893,6 +3136,7 @@ async function buildFrontendState(userId, requestedChatId, characterId) {
     activeChatId: chatId ?? null,
     activeCharacterId: characterId ?? active.characterId,
     timeline: timeline ? toTimelineView(timeline, settings) : null,
+    lastControllerRun: getLastControllerRun(userId),
     lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null
   };
 }
@@ -2922,6 +3166,7 @@ async function buildDeveloperDiagnostics(userId, requestedChatId) {
     activeCharacter: character,
     activePersona: persona,
     controllerRawResponses: chatId ? controllerDebugResponses.get(cacheKey(userId, chatId)) ?? [] : [],
+    lastControllerRun: getLastControllerRun(userId),
     lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"]
   });
@@ -3076,7 +3321,7 @@ function enqueue(userId, chatId, task) {
   operations.set(key, next);
   void next.finally(() => {
     if (operations.get(key) === next) operations.delete(key);
-  });
+  }).catch(() => void 0);
   return next;
 }
 function cancelScheduledReconcile(userId, chatId) {
@@ -3143,12 +3388,16 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
     return;
   }
   if (policyChanged) {
+    timeline.repair = null;
     timeline.records = timeline.records.filter((record) => record.skipReason === "pre_activation_history");
     timeline.analysisPolicyHash = policyHash;
     timeline.lastAnalyzedAt = null;
     timeline.error = null;
   }
-  if (force) timeline.records = [];
+  if (force) {
+    timeline.records = [];
+    timeline.repair = null;
+  }
   const fullMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
   if (latestGenerationByChat.has(key)) {
     if (updateNow) updateNowRequests.add(key);
@@ -3157,11 +3406,12 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
   let fullDerivation = rebuildTimeline(timeline, fullMessages);
   if (fullDerivation.firstMissingIndex >= fullDerivation.messages.length) {
     timeline.health = "ready";
+    timeline.repair = null;
     timeline.error = null;
     await persistAndPublish(timeline, userId);
     return;
   }
-  const bypassUpdatePolicy = force || updateNow;
+  const bypassUpdatePolicy = force || updateNow || !!timeline.repair;
   let messages = fullMessages;
   if (!bypassUpdatePolicy && timeline.updateMode === "manual") {
     timeline.health = "waiting";
@@ -3182,6 +3432,7 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
   const finishAnalysisView = () => {
     fullDerivation = rebuildTimeline(timeline, fullMessages);
     const current = fullDerivation.firstMissingIndex >= fullDerivation.messages.length;
+    if (current) timeline.repair = null;
     timeline.health = current ? "ready" : "waiting";
     timeline.error = null;
     return current;
@@ -3245,9 +3496,20 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
         settings,
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
-        signal: abortController.signal
+        signal: abortController.signal,
+        onRun: (run) => send({ type: "controller_run", run }, userId)
       });
       abortController.signal.throwIfAborted();
+      const committed = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
+      abortController.signal.throwIfAborted();
+      const analyzedPrefix = derivation.messages.slice(0, start + batch.length);
+      if (analysisPolicyHash(await getSettings(userId)) !== policyHash || analyzedPrefix.some((message, index) => {
+        const current = committed[index];
+        return !current || current.id !== message.id || (current.swipe_id ?? 0) !== (message.swipe_id ?? 0) || messageContentHash(current) !== messageContentHash(message);
+      })) {
+        scheduleReconcile(userId, chatId, 0);
+        return;
+      }
       const debugKey = cacheKey(userId, chatId);
       const debugResponses = controllerDebugResponses.get(debugKey) ?? [];
       debugResponses.push({
@@ -3378,7 +3640,8 @@ async function runTidy(userId, chatId, requestId, requestedActorIds) {
           settings,
           userId,
           fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
-          signal: abortController.signal
+          signal: abortController.signal,
+          onRun: (run) => send({ type: "controller_run", run }, userId)
         });
         completed += 1;
         send({ type: "tidy_progress", requestId, chatId, completed, total: actors.length, actorId: actor.id }, userId);
@@ -3512,27 +3775,16 @@ spindle.registerInterceptor(async (messages, context) => {
     if (connectionId) connectionByChat.set(cacheKey(userId, chatId), connectionId);
     const generationConnectionId = connectionId ?? connectionByChat.get(cacheKey(userId, chatId)) ?? null;
     const timeline = await getTimeline(chatId, userId);
-    if (!timeline.active || timeline.paused) return messages;
     const settings = await getSettings(userId);
     const promptMessages = limitChatHistoryMessages(messages, settings.chatHistoryMessageLimit);
     const injectionContext = promptMessages.flatMap((message) => typeof message.content === "string" ? [{ content: message.content, name: typeof message.name === "string" ? message.name : void 0 }] : []);
     const countTokens = await tokenCounterForConnection(userId, generationConnectionId);
     let targetActorId = null;
-    let injection = null;
-    let projection = null;
     const generationType = extractGenerationType(context);
     if (generationType === "impersonate") {
-      if (!settings.personaMindEnabled) return promptMessages;
       const personaId = extractPersonaId(context);
-      if (personaId) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
-      if (targetActorId && timeline.actors[targetActorId]) {
-        projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
-        injection = projection.content;
-      }
-    } else if (settings.characterCardDirectorMode) {
-      projection = await buildProjectedDirectorMindInjection(timeline, settings, injectionContext, countTokens);
-      injection = projection.content;
-    } else {
+      if (personaId && settings.personaMindEnabled && timeline.active && !timeline.paused) targetActorId = (await ensurePersonaActor(timeline, personaId, userId)).id;
+    } else if (!settings.characterCardDirectorMode) {
       const latest = latestGenerationByChat.get(cacheKey(userId, chatId));
       const characterId = latest?.characterId ?? extractCharacterId(context);
       if (characterId) targetActorId = `character:${characterId}`;
@@ -3540,10 +3792,21 @@ spindle.registerInterceptor(async (messages, context) => {
         const chat = hasPermission("chats") ? await spindle.chats.get(chatId, userId).catch(() => null) : null;
         if (chat?.character_id) targetActorId = `character:${chat.character_id}`;
       }
-      projection = await buildProjectedMindInjection(timeline, targetActorId, settings, injectionContext, countTokens);
-      injection = projection.content;
     }
-    if (projection) lastInjectionProjections.set(cacheKey(userId, chatId), projection.telemetry);
+    const snapshot = await projectInjection({
+      timeline: cloneJson(timeline),
+      settings,
+      permissions: currentPermissions(),
+      targetActorId,
+      impersonate: generationType === "impersonate",
+      context: injectionContext,
+      countTokens
+    });
+    lastInjections.set(cacheKey(userId, chatId), snapshot);
+    if (snapshot.telemetry) lastInjectionProjections.set(cacheKey(userId, chatId), snapshot.telemetry);
+    else lastInjectionProjections.delete(cacheKey(userId, chatId));
+    const injection = snapshot.content;
+    if (!timeline.active || timeline.paused) return messages;
     if (!injection) return promptMessages;
     const injected = { role: "system", content: injection };
     const injectionIndex = mindInjectionIndex(promptMessages, settings.injectionPosition);
@@ -3554,6 +3817,12 @@ spindle.registerInterceptor(async (messages, context) => {
       breakdown: [{ messageIndex: injectionIndex, name: "LumiMind \u2014 Private Mind" }]
     };
   } catch (error) {
+    const failedChatId = extractChatId(context);
+    const failedUserId = resolveUserId(failedChatId);
+    if (failedChatId && failedUserId) {
+      lastInjections.delete(cacheKey(failedUserId, failedChatId));
+      lastInjectionProjections.delete(cacheKey(failedUserId, failedChatId));
+    }
     spindle.log.warn(`LumiMind interceptor degraded safely: ${error instanceof Error ? error.message : String(error)}`);
     return messages;
   }
@@ -3653,6 +3922,7 @@ onEvent("CHAT_DELETED", (payload, eventUserId) => {
   timelines.delete(storageTimelineKey(userId, chatId));
   controllerDebugResponses.delete(cacheKey(userId, chatId));
   lastInjectionProjections.delete(cacheKey(userId, chatId));
+  lastInjections.delete(cacheKey(userId, chatId));
   void deleteTimeline(chatId, userId);
 });
 spindle.permissions.onChanged(() => {
@@ -3673,6 +3943,72 @@ spindle.onFrontendMessage(async (payload, userId) => {
     await publishScene(userId, timeline);
     await sendState(userId, chatId, characterId);
     if (timeline?.active) scheduleReconcile(userId, timeline.chatId, 0);
+    return;
+  }
+  if (message.type === "test_controller" || message.type === "repair_preview" || message.type === "repair_analysis" || message.type === "injection_preview") {
+    try {
+      if (message.type === "test_controller") {
+        if (!hasPermission("generation")) throw new Error("Generation permission is required to test a controller.");
+        const settings = normalizeSettings(message.settings);
+        const target = {
+          connectionId: typeof message.target.connectionId === "string" ? message.target.connectionId : null,
+          model: typeof message.target.model === "string" ? message.target.model : null
+        };
+        const result = await testController({
+          target,
+          settings,
+          userId,
+          fallbackConnectionId: message.chatId ? connectionByChat.get(cacheKey(userId, message.chatId)) : null
+        });
+        send({ type: "test_controller_result", requestId: message.requestId, result }, userId);
+      } else if (message.type === "repair_preview") {
+        if (!hasPermission("chat_mutation")) throw new Error("Chat history permission is required to preview repair.");
+        const messages = selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId));
+        const timeline = await getTimeline(message.chatId, userId);
+        send({ type: "repair_preview_result", requestId: message.requestId, chatId: message.chatId, preview: previewRepair(timeline, messages) }, userId);
+      } else if (message.type === "repair_analysis") {
+        if (!hasPermission("chat_mutation") || !hasPermission("generation")) throw new Error("Chat history and generation permissions are required to repair analysis.");
+        cancelScheduledReconcile(userId, message.chatId);
+        cancelActiveAnalysis(userId, message.chatId);
+        await enqueue(userId, message.chatId, async () => {
+          const timeline = await getTimeline(message.chatId, userId);
+          if (!timeline.active || timeline.paused) throw new Error("Activate or resume LumiMind before repairing analysis.");
+          if (timeline.analysisPolicyHash !== analysisPolicyHash(await getSettings(userId))) throw new Error("The analysis policy changed. Wait for the policy update before repairing analysis.");
+          const messages = selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId));
+          const preview = beginRepair(timeline, messages, message);
+          if (preview.startMessageIndex === null) throw new Error("No analysis warnings need repair.");
+          await persistAndPublish(timeline, userId);
+          send({ type: "repair_started", requestId: message.requestId, chatId: message.chatId }, userId);
+          scheduleReconcile(userId, message.chatId, 0, false, true);
+        });
+      } else {
+        const timeline = cloneJson(await getTimeline(message.chatId, userId));
+        const settings = await getSettings(userId);
+        const messages = hasPermission("chat_mutation") ? selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId)) : [];
+        if (hasPermission("chat_mutation")) rebuildTimeline(timeline, messages);
+        const activeCharacter = activeChats.get(userId)?.characterId;
+        const targetActorId = message.targetActorId ?? (activeCharacter ? `character:${activeCharacter}` : null);
+        if (message.targetActorId && !timeline.actors[message.targetActorId]) throw new Error("The selected actor is no longer available.");
+        const current = await projectInjection({
+          timeline,
+          settings,
+          permissions: currentPermissions(),
+          targetActorId,
+          impersonate: !!targetActorId && timeline.actors[targetActorId]?.kind === "persona",
+          context: limitChatHistoryMessages(messages.map((entry) => ({ ...entry, __isChatHistory: true })), settings.chatHistoryMessageLimit),
+          countTokens: await tokenCounterForConnection(userId, connectionByChat.get(cacheKey(userId, message.chatId)) ?? null)
+        });
+        send({
+          type: "injection_preview_result",
+          requestId: message.requestId,
+          chatId: message.chatId,
+          current,
+          last: lastInjections.get(cacheKey(userId, message.chatId)) ?? null
+        }, userId);
+      }
+    } catch (error) {
+      send({ type: "feature_error", requestId: message.requestId, message: error instanceof Error ? error.message : "The request could not be completed." }, userId);
+    }
     return;
   }
   try {
@@ -3698,6 +4034,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         pauseRequests.delete(cacheKey(userId, message.chatId));
         rebuildRequests.delete(cacheKey(userId, message.chatId));
         lastInjectionProjections.delete(cacheKey(userId, message.chatId));
+        lastInjections.delete(cacheKey(userId, message.chatId));
         timelines.set(storageTimelineKey(userId, message.chatId), imported);
         await persistAndPublish(imported, userId);
       });
@@ -3807,7 +4144,13 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!hasPermission("characters") || !hasPermission("generation")) throw new Error("Character and generation permissions are required to draft a seed.");
       const character = await spindle.characters.get(message.characterId, userId);
       if (!character) throw new Error("Character card not found.");
-      const seed = await generateSeedDraft({ character, settings: await getSettings(userId), userId });
+      const seed = await generateSeedDraft({
+        character,
+        settings: await getSettings(userId),
+        userId,
+        fallbackConnectionId: chatId ? connectionByChat.get(cacheKey(userId, chatId)) : null,
+        onRun: (run) => send({ type: "controller_run", run }, userId)
+      });
       send({ type: "seed_draft", characterId: message.characterId, seed }, userId);
       return;
     }
@@ -3826,6 +4169,8 @@ spindle.onFrontendMessage(async (payload, userId) => {
       const core = await generateNpcCoreDraft({
         actorName,
         lore,
+        fallbackConnectionId: connectionByChat.get(cacheKey(userId, message.chatId)),
+        onRun: (run) => send({ type: "controller_run", run }, userId),
         settings: await getSettings(userId),
         userId
       });
@@ -3981,4 +4326,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.2.0 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.0 loaded \u2014 subjective timeline engine ready.");

@@ -744,7 +744,7 @@ describe("controller response parsing", () => {
     const result = await analyzeMessages({ messages, recentContext: [], compactState: [], settings: DEFAULT_SETTINGS, userId: "user" });
     expect(result.analysis.changes).toEqual([]);
     expect(result.telemetry.warningCodes).toEqual(expect.arrayContaining(["retry_failed", "empty_nontrivial_batch"]));
-    expect(result.telemetry.retryError).toBe("temporary provider failure");
+    expect(result.telemetry.retryError).toBe("Corrective controller request failed.");
   });
 
   it("forwards an abort signal to every controller pass and propagates cancellation", async () => {

@@ -201,6 +201,7 @@ export interface ControllerResponseTelemetry {
 }
 
 export interface ControllerBatchTelemetry {
+  connectionAttempts?: ControllerAttempt[];
   schemaVersion: 1;
   batchId: string;
   messageCount: number;
@@ -239,6 +240,8 @@ export interface ManualOverride {
 export type TimelineHealth = "inactive" | "initializing" | "ready" | "waiting" | "pending" | "stale" | "paused" | "error";
 
 export interface ChatTimelineV1 {
+  activeRecordIds?: string[];
+  repair?: { backupRecords: AnalysisRecord[]; startedAt: number } | null;
   schemaVersion: 1;
   chatId: string;
   analysisPolicyHash: string;
@@ -272,6 +275,7 @@ export interface TimelineDatabaseArchiveV1 {
 }
 
 export interface LumiMindSettings {
+  controllerFallbacks: ControllerTarget[];
   controllerConnectionId: string | null;
   controllerModel: string | null;
   controllerTemperature: number;
@@ -374,6 +378,7 @@ export interface TimelineView {
 }
 
 export interface FrontendState {
+  lastControllerRun?: ControllerRun | null;
   settings: LumiMindSettings;
   permissions: PermissionState;
   connections: ConnectionOption[];
@@ -384,6 +389,10 @@ export interface FrontendState {
 }
 
 export type FrontendToBackend =
+  | { type: "test_controller"; requestId: string; target: ControllerTarget; settings: LumiMindSettings; chatId?: string | null }
+  | { type: "repair_preview"; requestId: string; chatId: string }
+  | { type: "repair_analysis"; requestId: string; chatId: string; revision: number; fingerprint: string }
+  | { type: "injection_preview"; requestId: string; chatId: string; targetActorId?: string | null }
   | { type: "ready"; chatId?: string | null; characterId?: string | null }
   | { type: "refresh"; chatId?: string | null; characterId?: string | null }
   | { type: "developer_report"; chatId?: string | null; requestId: string }
@@ -418,6 +427,12 @@ export type FrontendToBackend =
   | { type: "writeback_actor"; chatId: string; actorId: string };
 
 export type BackendToFrontend =
+  | { type: "controller_run"; run: ControllerRun }
+  | { type: "test_controller_result"; requestId: string; result: ControllerTestResult }
+  | { type: "repair_preview_result"; requestId: string; chatId: string; preview: RepairPreview }
+  | { type: "repair_started"; requestId: string; chatId: string }
+  | { type: "injection_preview_result"; requestId: string; chatId: string; current: InjectionSnapshot; last: InjectionSnapshot | null }
+  | { type: "feature_error"; requestId: string; message: string }
   | { type: "state"; state: FrontendState }
   | { type: "developer_report"; requestId: string; report: unknown }
   | { type: "developer_report_error"; requestId: string; message: string }
@@ -481,4 +496,56 @@ export interface ControllerChange {
 export interface ControllerAnalysis {
   actorMentions: ControllerActorMention[];
   changes: ControllerChange[];
+}
+
+export interface ControllerTarget {
+  connectionId: string | null;
+  model: string | null;
+}
+
+export interface ControllerAttempt extends ControllerTarget {
+  provider: string | null;
+  outcome: "success" | "unusable_output" | "request_failed";
+}
+
+export interface ControllerRun {
+  operation: string;
+  attempts: ControllerAttempt[];
+  selected: ControllerTarget | null;
+}
+
+export interface ControllerTestResult {
+  passed: boolean;
+  elapsedMs: number;
+  connectionId: string | null;
+  provider: string | null;
+  model: string | null;
+  outputMode: string | null;
+  message: string;
+}
+
+export interface RepairPreview {
+  revision: number;
+  fingerprint: string;
+  startMessageIndex: number | null;
+  messageCount: number;
+  resumed: boolean;
+}
+
+export interface InjectionSelection {
+  actors: Array<{ id: string; name: string }>;
+  entries: Array<{ id: string; actorId: string; category: MindCategory; text: string; included: boolean }>;
+}
+
+export interface InjectionSnapshot {
+  chatId: string;
+  revision: number;
+  capturedAt: number;
+  targetActorId: string | null;
+  targetLabel: string;
+  content: string | null;
+  reason: string | null;
+  position: LumiMindSettings["injectionPosition"];
+  telemetry: InjectionProjectionTelemetry | null;
+  selection: InjectionSelection;
 }
