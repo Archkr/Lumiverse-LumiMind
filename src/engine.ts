@@ -33,6 +33,7 @@ export const DEFAULT_SETTINGS: LumiMindSettings = {
   controllerConnectionId: null,
   controllerModel: null,
   controllerTemperature: 0.1,
+  controllerTimeoutSeconds: 120,
   controllerParallelRequests: 1,
   controllerRequestsPerMinute: 0,
   analysisStateTokenBudget: 24_000,
@@ -128,6 +129,7 @@ export function normalizeSettings(value: unknown): LumiMindSettings {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
+    controllerTimeoutSeconds: Math.round(clamp(raw.controllerTimeoutSeconds, 15, 1800, DEFAULT_SETTINGS.controllerTimeoutSeconds)),
     controllerParallelRequests: Math.round(Number.isFinite(controllerParallelRequests)
       ? Math.min(20, Math.max(1, controllerParallelRequests))
       : DEFAULT_SETTINGS.controllerParallelRequests),

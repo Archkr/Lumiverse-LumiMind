@@ -459,6 +459,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           credentialConfigured: connection.hasApiKey,
         })),
         temperature: state.settings.controllerTemperature,
+        timeoutSeconds: state.settings.controllerTimeoutSeconds,
+        progress: state.analysisProgress ?? null,
         parallelRequests: state.settings.controllerParallelRequests,
         requestsPerMinute: state.settings.controllerRequestsPerMinute,
         stateTokenBudget: state.settings.analysisStateTokenBudget,
@@ -578,7 +580,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const timeout = setTimeout(() => {
         featureRequests.delete(message.requestId);
         reject(new Error("The request timed out. Check the controller and try again."));
-      }, message.type === "test_controller" ? 180_000 : 30_000);
+      }, message.type === "test_controller" ? Math.max(180_000, (message.settings.controllerTimeoutSeconds * 2 + 90) * 1000) : 30_000);
       featureRequests.set(message.requestId, { resolve, reject, timeout });
       send(message);
     });
@@ -1112,11 +1114,20 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const pulse = element("span", "lm-pulse");
     const copy = element("div", "lm-timeline-status-copy");
     copy.appendChild(element("strong", undefined, healthLabel(timeline.health)));
+    const progress = currentState?.analysisProgress;
+    const progressLabel = progress ? {
+      preparing: "Preparing analysis",
+      queued: "Waiting for a controller slot",
+      rate_limited: "Waiting for the request rate limit",
+      requesting: "Waiting for the controller response",
+    }[progress.phase] : null;
     const detail = timeline.error
       ?? (timeline.health === "paused"
         ? "Analysis and private mind injection are paused."
         : timeline.health === "waiting"
           ? `${timeline.pendingTurnCount} completed ${timeline.pendingTurnCount === 1 ? "turn is" : "turns are"} waiting. The last valid checkpoint remains available for injection.`
+          : progress
+            ? `${progressLabel} · messages ${progress.startMessageIndex + 1}–${progress.endMessageIndex + 1} of ${progress.totalMessages}.`
           : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
     copy.appendChild(element("span", undefined, detail));
     const actions = element("div", "lm-inline-actions");
@@ -2196,7 +2207,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const numberGrid = element("div", "lm-settings-grid");
     const numberSetting = (
       label: string,
-      key: "controllerTemperature" | "controllerParallelRequests" | "controllerRequestsPerMinute" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
+      key: "controllerTimeoutSeconds" | "controllerTemperature" | "controllerParallelRequests" | "controllerRequestsPerMinute" | "analysisStateTokenBudget" | "injectionTokenBudget" | "analysisContextMessageLimit" | "chatHistoryMessageLimit",
       min: number,
       max: number | null,
       step: number,
@@ -2222,6 +2233,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     };
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
+      numberSetting("Request timeout (seconds)", "controllerTimeoutSeconds", 15, 1800, 1,
+        "Maximum wait for each controller response. A timeout tries the next fallback or shows an error you can retry."),
       numberSetting(
         "Parallel requests",
         "controllerParallelRequests",
@@ -2606,6 +2619,16 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       const pending = featureRequests.get(message.requestId)!;
       clearTimeout(pending.timeout); featureRequests.delete(message.requestId);
       if (message.type === "feature_error") pending.reject(new Error(message.message)); else pending.resolve(message);
+      return;
+    }
+    if (message.type === "analysis_progress") {
+      if (currentState?.activeChatId === message.chatId) {
+        currentState.analysisProgress = message.progress;
+        const previous = root.querySelector(".lm-timeline-status");
+        const next = renderTimelineStatus();
+        if (previous && next) previous.replaceWith(next);
+        diagnosticsRefresh?.();
+      }
       return;
     }
     if (message.type === "controller_run") {

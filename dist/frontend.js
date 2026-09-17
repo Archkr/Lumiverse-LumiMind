@@ -995,6 +995,8 @@ function setup(ctx) {
           credentialConfigured: connection.hasApiKey
         })),
         temperature: state.settings.controllerTemperature,
+        timeoutSeconds: state.settings.controllerTimeoutSeconds,
+        progress: state.analysisProgress ?? null,
         parallelRequests: state.settings.controllerParallelRequests,
         requestsPerMinute: state.settings.controllerRequestsPerMinute,
         stateTokenBudget: state.settings.analysisStateTokenBudget,
@@ -1112,7 +1114,7 @@ function setup(ctx) {
       const timeout = setTimeout(() => {
         featureRequests.delete(message.requestId);
         reject(new Error("The request timed out. Check the controller and try again."));
-      }, message.type === "test_controller" ? 18e4 : 3e4);
+      }, message.type === "test_controller" ? Math.max(18e4, (message.settings.controllerTimeoutSeconds * 2 + 90) * 1e3) : 3e4);
       featureRequests.set(message.requestId, { resolve, reject, timeout });
       send(message);
     });
@@ -1626,7 +1628,14 @@ function setup(ctx) {
     const pulse = element("span", "lm-pulse");
     const copy = element("div", "lm-timeline-status-copy");
     copy.appendChild(element("strong", void 0, healthLabel(timeline.health)));
-    const detail = timeline.error ?? (timeline.health === "paused" ? "Analysis and private mind injection are paused." : timeline.health === "waiting" ? `${timeline.pendingTurnCount} completed ${timeline.pendingTurnCount === 1 ? "turn is" : "turns are"} waiting. The last valid checkpoint remains available for injection.` : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
+    const progress = currentState?.analysisProgress;
+    const progressLabel = progress ? {
+      preparing: "Preparing analysis",
+      queued: "Waiting for a controller slot",
+      rate_limited: "Waiting for the request rate limit",
+      requesting: "Waiting for the controller response"
+    }[progress.phase] : null;
+    const detail = timeline.error ?? (timeline.health === "paused" ? "Analysis and private mind injection are paused." : timeline.health === "waiting" ? `${timeline.pendingTurnCount} completed ${timeline.pendingTurnCount === 1 ? "turn is" : "turns are"} waiting. The last valid checkpoint remains available for injection.` : progress ? `${progressLabel} \xB7 messages ${progress.startMessageIndex + 1}\u2013${progress.endMessageIndex + 1} of ${progress.totalMessages}.` : `Processed through message ${Math.max(0, timeline.lastValidMessageIndex + 1)}. Normal generation remains available.`);
     copy.appendChild(element("span", void 0, detail));
     const actions = element("div", "lm-inline-actions");
     if (timeline.health === "error") {
@@ -2671,6 +2680,14 @@ function setup(ctx) {
     numberGrid.append(
       numberSetting("Temperature", "controllerTemperature", 0, 2, 0.05),
       numberSetting(
+        "Request timeout (seconds)",
+        "controllerTimeoutSeconds",
+        15,
+        1800,
+        1,
+        "Maximum wait for each controller response. A timeout tries the next fallback or shows an error you can retry."
+      ),
+      numberSetting(
         "Parallel requests",
         "controllerParallelRequests",
         1,
@@ -3053,6 +3070,16 @@ function setup(ctx) {
       featureRequests.delete(message.requestId);
       if (message.type === "feature_error") pending.reject(new Error(message.message));
       else pending.resolve(message);
+      return;
+    }
+    if (message.type === "analysis_progress") {
+      if (currentState?.activeChatId === message.chatId) {
+        currentState.analysisProgress = message.progress;
+        const previous = root.querySelector(".lm-timeline-status");
+        const next = renderTimelineStatus();
+        if (previous && next) previous.replaceWith(next);
+        diagnosticsRefresh?.();
+      }
       return;
     }
     if (message.type === "controller_run") {

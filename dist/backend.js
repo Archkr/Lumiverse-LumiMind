@@ -9,6 +9,7 @@ var DEFAULT_SETTINGS = {
   controllerConnectionId: null,
   controllerModel: null,
   controllerTemperature: 0.1,
+  controllerTimeoutSeconds: 120,
   controllerParallelRequests: 1,
   controllerRequestsPerMinute: 0,
   analysisStateTokenBudget: 24e3,
@@ -81,6 +82,7 @@ function normalizeSettings(value) {
     controllerConnectionId: stringValue(raw.controllerConnectionId) || null,
     controllerModel: stringValue(raw.controllerModel) || null,
     controllerTemperature: clamp(raw.controllerTemperature, 0, 2, DEFAULT_SETTINGS.controllerTemperature),
+    controllerTimeoutSeconds: Math.round(clamp(raw.controllerTimeoutSeconds, 15, 1800, DEFAULT_SETTINGS.controllerTimeoutSeconds)),
     controllerParallelRequests: Math.round(Number.isFinite(controllerParallelRequests) ? Math.min(20, Math.max(1, controllerParallelRequests)) : DEFAULT_SETTINGS.controllerParallelRequests),
     controllerRequestsPerMinute: Math.round(Number.isFinite(controllerRequestsPerMinute) ? Math.max(0, controllerRequestsPerMinute) : DEFAULT_SETTINGS.controllerRequestsPerMinute),
     analysisStateTokenBudget: Math.round(Number.isFinite(analysisStateTokenBudget) ? Math.max(0, analysisStateTokenBudget) : DEFAULT_SETTINGS.analysisStateTokenBudget),
@@ -1508,6 +1510,45 @@ function buildProjectedDirectorMindInjection(timeline, settings, contextMessages
   return projectMindInjection(timeline, null, settings, contextMessages, countTokens, true);
 }
 
+// src/controller-requests.ts
+var CONTROLLER_LOOKUP_TIMEOUT_MS = 15e3;
+var ControllerRequestTimeoutError = class extends Error {
+  constructor(label, timeoutMs) {
+    super(`${label} timed out after ${Math.round(timeoutMs / 1e3)} seconds. Retry or choose another controller connection.`);
+    this.name = "ControllerRequestTimeoutError";
+  }
+};
+function controllerRequest(run, signal, timeoutMs, label = "The controller request") {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  const request = new AbortController();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+      request.abort(error);
+    };
+    const cancel = () => fail(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    const timer = setTimeout(() => fail(new ControllerRequestTimeoutError(label, timeoutMs)), timeoutMs);
+    signal?.addEventListener("abort", cancel, { once: true });
+    Promise.resolve().then(() => {
+      request.signal.throwIfAborted();
+      return run(request.signal);
+    }).then((value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    }, fail);
+  });
+}
+
 // src/controller-scheduling.ts
 var DEFAULT_WINDOW_MS = 6e4;
 var STALE_GATE_TTL_MS = 10 * 6e4;
@@ -2146,16 +2187,22 @@ function toolChoiceParameters(provider) {
   if (normalized === "anthropic") return { tool_choice: { type: "any" } };
   return { tool_choice: "required" };
 }
-async function resolveConnection(settings, userId, fallbackConnectionId) {
+async function resolveConnection(settings, userId, fallbackConnectionId, signal) {
   const id = settings.controllerConnectionId?.trim() || fallbackConnectionId?.trim() || null;
   const configuredModel = settings.controllerModel?.trim() || null;
   if (!id && typeof spindle.connections?.list === "function") {
-    const profiles = await spindle.connections.list(userId).catch(() => []);
+    const profiles = await controllerRequest(() => spindle.connections.list(userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup").catch((error) => {
+      if (signal?.aborted || isAbortError(error)) throw error;
+      return [];
+    });
     const defaultProfile = profiles.find((profile) => profile.is_default);
     if (defaultProfile) return { id: defaultProfile.id, provider: defaultProfile.provider, model: configuredModel ?? defaultProfile.model };
   }
   if (!id) return { id: null, provider: null, model: configuredModel };
-  const connection = await spindle.connections.get(id, userId).catch(() => null);
+  const connection = await controllerRequest(() => spindle.connections.get(id, userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup").catch((error) => {
+    if (signal?.aborted || isAbortError(error)) throw error;
+    return null;
+  });
   return { id, provider: connection?.provider ?? null, model: configuredModel ?? connection?.model ?? null };
 }
 function fallbackTokenMeasurement(textValue, model) {
@@ -2167,9 +2214,9 @@ function fallbackTokenMeasurement(textValue, model) {
     fallback: true
   };
 }
-async function countTextTokens(textValue, connection, userId) {
+async function countTextTokens(textValue, connection, userId, signal) {
   try {
-    const result = await spindle.tokens.countText(textValue, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId });
+    const result = await controllerRequest(() => spindle.tokens.countText(textValue, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId }), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Token counting");
     return {
       totalTokens: result.total_tokens,
       model: result.model || connection.model,
@@ -2177,13 +2224,14 @@ async function countTextTokens(textValue, connection, userId) {
       approximate: result.approximate,
       fallback: false
     };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) throw error;
     return fallbackTokenMeasurement(textValue, connection.model);
   }
 }
-async function countMessageTokens(messages, connection, userId) {
+async function countMessageTokens(messages, connection, userId, signal) {
   try {
-    const result = await spindle.tokens.countMessages(messages, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId });
+    const result = await controllerRequest(() => spindle.tokens.countMessages(messages, connection.model ? { model: connection.model, userId } : { modelSource: "main", userId }), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Token counting");
     return {
       totalTokens: result.total_tokens,
       model: result.model || connection.model,
@@ -2191,25 +2239,29 @@ async function countMessageTokens(messages, connection, userId) {
       approximate: result.approximate,
       fallback: false
     };
-  } catch {
+  } catch (error) {
+    if (signal?.aborted || isAbortError(error)) throw error;
     return fallbackTokenMeasurement(messages.map((message) => `${message.role}
 ${message.content}`).join("\n"), connection.model);
   }
 }
-function controllerTokenCounter(connection, userId) {
-  return (value) => countTextTokens(value, connection, userId);
+function controllerTokenCounter(connection, userId, signal) {
+  return (value) => countTextTokens(value, connection, userId, signal);
 }
-async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal) {
-  const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId);
+async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal, onProgress) {
+  const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId, signal);
+  onProgress?.("queued");
   const result = await withControllerSlot(userId, settings.controllerParallelRequests, signal, async () => {
     if (spindle.permissions && !spindle.permissions.has("generation")) throw new LocalControllerError("Generation permission is required to use the controller.");
+    if (settings.controllerRequestsPerMinute > 0) onProgress?.("rate_limited");
     await waitForControllerRpmSlot({
       userId,
       provider: connection.provider,
       requestsPerMinute: settings.controllerRequestsPerMinute,
       signal
     });
-    return spindle.generate.quiet({
+    onProgress?.("requesting");
+    return controllerRequest((requestSignal) => spindle.generate.quiet({
       type: "quiet",
       messages: [
         { role: "system", content: systemPrompt },
@@ -2230,8 +2282,8 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
       reasoning: { source: "off" },
       ...connection.id ? { connection_id: connection.id } : {},
       userId,
-      signal
-    });
+      signal: requestSignal
+    }), signal, (settings.controllerTimeoutSeconds ?? 120) * 1e3);
   });
   const object = asObject2(result);
   const content = sanitizeControllerText(text(object.content));
@@ -2353,20 +2405,20 @@ ${renderMessages(input.messages)}
   ].join("\n\n");
 }
 async function analyzeMessagesOnce(input) {
-  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId, input.signal);
   const stateProjection = await projectControllerState(
     input.compactState,
     input.messages,
     input.recentContext,
     input.settings.analysisStateTokenBudget,
-    controllerTokenCounter(connection, input.userId)
+    controllerTokenCounter(connection, input.userId, input.signal)
   );
   const prompt = buildAnalysisPrompt({ ...input, compactState: stateProjection.state });
   const systemPrompt = analysisSystemPrompt(input.settings);
   const inputMeasurement = await countMessageTokens([
     { role: "system", content: systemPrompt },
     { role: "user", content: prompt }
-  ], connection, input.userId);
+  ], connection, input.userId, input.signal);
   const result = await quietJson(
     prompt,
     systemPrompt,
@@ -2376,7 +2428,8 @@ async function analyzeMessagesOnce(input) {
     input.userId,
     input.fallbackConnectionId,
     connection,
-    input.signal
+    input.signal,
+    input.onProgress
   );
   input.signal?.throwIfAborted();
   if (!result.parsed) throw new UnusableControllerOutput("The LumiMind controller returned no parseable structured result.");
@@ -2421,7 +2474,8 @@ Perform the corrective bootstrap extraction now.`,
         input.userId,
         input.fallbackConnectionId,
         connection,
-        input.signal
+        input.signal,
+        input.onProgress
       );
       input.signal?.throwIfAborted();
       retryRaw = corrective.raw;
@@ -2601,8 +2655,8 @@ async function generateMindTidyProposalsOnce(input) {
     knownActors: input.knownActors.map((actor) => ({ id: actor.id, name: actor.canonicalName, aliases: actor.aliases }))
   };
   const stateJson = JSON.stringify(statePayload);
-  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId);
-  const stateMeasurement = await countTextTokens(stateJson, connection, input.userId);
+  const connection = await resolveConnection(input.settings, input.userId, input.fallbackConnectionId, input.signal);
+  const stateMeasurement = await countTextTokens(stateJson, connection, input.userId, input.signal);
   if (input.settings.analysisStateTokenBudget > 0 && stateMeasurement.totalTokens > input.settings.analysisStateTokenBudget) {
     throw new LocalControllerError(
       `This actor needs ${stateMeasurement.totalTokens.toLocaleString()} state tokens, above the ${input.settings.analysisStateTokenBudget.toLocaleString()} tidy limit. Increase Analysis state tokens or set it to 0.`
@@ -2697,7 +2751,8 @@ async function withFallbacks(input, operation2, run, usable = () => true) {
     const settings = { ...input.settings, controllerConnectionId: target.connectionId, controllerModel: target.model, controllerFallbacks: [] };
     let connection = { id: target.connectionId, provider: null, model: target.model };
     try {
-      connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId);
+      input.onProgress?.("preparing");
+      connection = await resolveConnection(settings, input.userId, input.fallbackConnectionId, input.signal);
       const targetKey = JSON.stringify([connection.id, connection.model]);
       if (attemptedTargets.has(targetKey)) continue;
       attemptedTargets.add(targetKey);
@@ -2720,7 +2775,7 @@ async function withFallbacks(input, operation2, run, usable = () => true) {
   const report = { operation: operation2, attempts, selected: null };
   lastControllerRuns.set(input.userId, report);
   input.onRun?.(report);
-  throw new Error(lastError instanceof UnusableControllerOutput ? lastError.message : "All configured LumiMind controllers failed. Check the connections and try Test controller.");
+  throw new Error(lastError instanceof UnusableControllerOutput || lastError instanceof ControllerRequestTimeoutError ? lastError.message : "All configured LumiMind controllers failed. Check the connections and try Test controller.");
 }
 function analyzeMessages(input) {
   return withFallbacks(input, "Analysis", (settings) => analyzeMessagesOnce({ ...input, settings }), (result) => {
@@ -2769,7 +2824,7 @@ async function testController(input) {
       passed: false,
       elapsedMs: Date.now() - started,
       outputMode: null,
-      message: error instanceof UnusableControllerOutput ? error.message : "The test request failed. Check connection access, model availability, and provider limits."
+      message: error instanceof UnusableControllerOutput || error instanceof ControllerRequestTimeoutError ? error.message : "The test request failed. Check connection access, model availability, and provider limits."
     };
   }
 }
@@ -2929,13 +2984,14 @@ function redactDiagnosticCredentials(value) {
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECONCILE_DEBOUNCE_MS = 650;
-var EXTENSION_VERSION = "0.3.0";
+var EXTENSION_VERSION = "0.3.1";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
 var chatUsers = /* @__PURE__ */ new Map();
 var operations = /* @__PURE__ */ new Map();
 var reconcileTimers = /* @__PURE__ */ new Map();
+var analysisProgress = /* @__PURE__ */ new Map();
 var analysisAbortControllers = /* @__PURE__ */ new Map();
 var tidyAbortControllers = /* @__PURE__ */ new Map();
 var tidyResults = /* @__PURE__ */ new Map();
@@ -3108,7 +3164,7 @@ function currentPermissions() {
 }
 async function listConnections(userId) {
   if (!hasPermission("generation")) return [];
-  const connections = await spindle.connections.list(userId).catch(() => []);
+  const connections = await controllerRequest(() => spindle.connections.list(userId), void 0, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup").catch(() => []);
   return connections.map((connection) => ({
     id: connection.id,
     name: connection.name,
@@ -3137,6 +3193,7 @@ async function buildFrontendState(userId, requestedChatId, characterId) {
     activeCharacterId: characterId ?? active.characterId,
     timeline: timeline ? toTimelineView(timeline, settings) : null,
     lastControllerRun: getLastControllerRun(userId),
+    analysisProgress: chatId ? analysisProgress.get(cacheKey(userId, chatId)) ?? null : null,
     lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null
   };
 }
@@ -3167,6 +3224,7 @@ async function buildDeveloperDiagnostics(userId, requestedChatId) {
     activePersona: persona,
     controllerRawResponses: chatId ? controllerDebugResponses.get(cacheKey(userId, chatId)) ?? [] : [],
     lastControllerRun: getLastControllerRun(userId),
+    analysisProgress: chatId ? analysisProgress.get(cacheKey(userId, chatId)) ?? null : null,
     lastInjectionProjection: chatId ? lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"]
   });
@@ -3497,6 +3555,11 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
         signal: abortController.signal,
+        onProgress: (phase) => {
+          const progress = { phase, startMessageIndex: start, endMessageIndex: start + batch.length - 1, totalMessages: derivation.messages.length };
+          analysisProgress.set(key, progress);
+          send({ type: "analysis_progress", chatId, progress }, userId);
+        },
         onRun: (run) => send({ type: "controller_run", run }, userId)
       });
       abortController.signal.throwIfAborted();
@@ -3549,7 +3612,11 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
     await persistAndPublish(timeline, userId);
     spindle.log.warn(`LumiMind analysis failed for ${chatId}: ${timeline.error}`);
   } finally {
-    if (analysisAbortControllers.get(key) === abortController) analysisAbortControllers.delete(key);
+    if (analysisAbortControllers.get(key) === abortController) {
+      analysisAbortControllers.delete(key);
+      analysisProgress.delete(key);
+      send({ type: "analysis_progress", chatId, progress: null }, userId);
+    }
   }
 }
 function scheduleReconcile(userId, chatId, delay = RECONCILE_DEBOUNCE_MS, force = false, updateNow = false) {
@@ -4326,4 +4393,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.3.0 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.1 loaded \u2014 subjective timeline engine ready.");

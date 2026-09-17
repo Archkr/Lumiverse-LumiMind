@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.3.0-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.3.1-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.3.0` adds ordered controller fallbacks, targeted analysis repair, synthetic controller tests, and previews of private mind injection. Existing timelines and settings remain compatible; backup connections are opt-in.
+LumiMind `0.3.1` fixes stalled controller requests blocking analysis recovery, adds configurable request timeouts, and shows the current analysis step and message batch. Existing timelines and settings remain compatible. Controller fallbacks, targeted analysis repair, synthetic controller tests, and private injection previews remain available from `0.3.0`.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -131,7 +131,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.3.0` stable |
+| Extension version | `0.3.1` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
@@ -338,7 +338,7 @@ LumiMind is designed for conversations that do not stay perfectly linear.
 | Message deletion | Rebuilds from the earliest affected point. |
 | Chat fork | Copies compatible records through the fork point, preserves actor IDs, then evolves independently. |
 | Rapid changes | Coalesces work through one serialized queue per chat. |
-| Controller delay | Keeps normal generation available and uses the last valid checkpoint. |
+| Controller delay | Shows the current batch and whether analysis is preparing, queued, rate-limited, or awaiting a response. Keeps normal generation available and uses the last valid checkpoint. |
 | Controller error | Exposes stale/error status and retains recoverable state. |
 
 Controller results are stored as evidence-linked deltas rather than one repeatedly rewritten state blob. Manual overrides are replayed chronologically with controller records. The lock flag alone prevents controller updates and deletions; pinning controls priority, not write protection.
@@ -364,6 +364,7 @@ LumiMind settings are user-scoped and apply across chats.
 | Controller connection | Active connection | Uses a dedicated Lumiverse connection when selected. |
 | Controller model | Connection default | Uses Lumiverse's connection-aware model catalog to override the selected connection's configured model. |
 | Temperature | `0.1` | Sampling temperature for background controller calls. |
+| Request timeout (seconds) | `120` | Maximum wait per controller response (15–1800 seconds). Timeouts try the next configured fallback or show a recoverable error. Queue and rate-limit waits are separate. |
 | Parallel requests | `1` | Maximum controller requests in flight across analysis, Tidy, drafts, and tests. Each timeline stays sequential. |
 | Requests per minute | Unlimited | Rolling per-provider controller request cap; `0` disables throttling. |
 | Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |

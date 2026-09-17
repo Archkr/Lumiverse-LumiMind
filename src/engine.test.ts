@@ -596,6 +596,9 @@ describe("hashing, settings, and compaction", () => {
     expect(normalizeSettings({ analysisContextMessageLimit: -4 }).analysisContextMessageLimit).toBe(0);
     expect(normalizeSettings({ chatHistoryMessageLimit: -4 }).chatHistoryMessageLimit).toBe(0);
     expect(normalizeSettings({ controllerModel: "   " }).controllerModel).toBeNull();
+    expect(normalizeSettings({}).controllerTimeoutSeconds).toBe(120);
+    expect(normalizeSettings({ controllerTimeoutSeconds: 0 }).controllerTimeoutSeconds).toBe(15);
+    expect(normalizeSettings({ controllerTimeoutSeconds: 9999 }).controllerTimeoutSeconds).toBe(1800);
     expect(normalizeSettings({ controllerParallelRequests: 0 }).controllerParallelRequests).toBe(1);
     expect(normalizeSettings({ controllerRequestsPerMinute: -4 }).controllerRequestsPerMinute).toBe(0);
     expect(normalizeSettings({ injectionPosition: "before_last_user" }).injectionPosition).toBe("before_last_user");

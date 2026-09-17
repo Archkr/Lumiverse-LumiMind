@@ -52,9 +52,11 @@ import {
 } from "./engine";
 import { deleteTimeline, loadSettings, loadTimeline, saveSettings, saveTimeline } from "./storage";
 import { makeMindLumiStateSnapshot } from "./lumi-state";
+import { controllerRequest, CONTROLLER_LOOKUP_TIMEOUT_MS } from "./controller-requests";
 import { redactDiagnosticCredentials } from "./diagnostics";
 import {
   EXTENSION_KEY,
+  type AnalysisProgress,
   type ActorMind,
   type ActorRecord,
   type BackendToFrontend,
@@ -75,7 +77,7 @@ import {
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
 const RECONCILE_DEBOUNCE_MS = 650;
-const EXTENSION_VERSION = "0.3.0";
+const EXTENSION_VERSION = "0.3.1";
 
 type GenerationContext = {
   generationId: string;
@@ -92,6 +94,7 @@ const activeChats = new Map<string, { chatId: string | null; characterId: string
 const chatUsers = new Map<string, string>();
 const operations = new Map<string, Promise<void>>();
 const reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const analysisProgress = new Map<string, AnalysisProgress>();
 const analysisAbortControllers = new Map<string, AbortController>();
 const tidyAbortControllers = new Map<string, { chatId: string; controller: AbortController }>();
 const tidyResults = new Map<string, {
@@ -301,7 +304,7 @@ function currentPermissions(): PermissionState {
 
 async function listConnections(userId: string): Promise<ConnectionOption[]> {
   if (!hasPermission("generation")) return [];
-  const connections = await spindle.connections.list(userId).catch(() => []);
+  const connections = await controllerRequest(() => spindle.connections.list(userId), undefined, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup").catch(() => []);
   return connections.map((connection) => ({
     id: connection.id,
     name: connection.name,
@@ -331,6 +334,7 @@ async function buildFrontendState(userId: string, requestedChatId?: string | nul
     activeCharacterId: characterId ?? active.characterId,
     timeline: timeline ? toTimelineView(timeline, settings) : null,
     lastControllerRun: getLastControllerRun(userId),
+    analysisProgress: chatId ? analysisProgress.get(cacheKey(userId, chatId)) ?? null : null,
     lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
   };
 }
@@ -365,6 +369,7 @@ async function buildDeveloperDiagnostics(userId: string, requestedChatId?: strin
     activePersona: persona,
     controllerRawResponses: chatId ? (controllerDebugResponses.get(cacheKey(userId, chatId)) ?? []) : [],
     lastControllerRun: getLastControllerRun(userId),
+    analysisProgress: chatId ? analysisProgress.get(cacheKey(userId, chatId)) ?? null : null,
     lastInjectionProjection: chatId ? (lastInjectionProjections.get(cacheKey(userId, chatId)) ?? null) : null,
     unavailable: ["API credential values", "raw controller responses created before the current extension runtime"],
   });
@@ -729,6 +734,11 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
         userId,
         fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
         signal: abortController.signal,
+        onProgress: (phase) => {
+          const progress = { phase, startMessageIndex: start, endMessageIndex: start + batch.length - 1, totalMessages: derivation.messages.length };
+          analysisProgress.set(key, progress);
+          send({ type: "analysis_progress", chatId, progress }, userId);
+        },
         onRun: (run) => send({ type: "controller_run", run }, userId),
       });
       abortController.signal.throwIfAborted();
@@ -782,7 +792,11 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
     await persistAndPublish(timeline, userId);
     spindle.log.warn(`LumiMind analysis failed for ${chatId}: ${timeline.error}`);
   } finally {
-    if (analysisAbortControllers.get(key) === abortController) analysisAbortControllers.delete(key);
+    if (analysisAbortControllers.get(key) === abortController) {
+      analysisAbortControllers.delete(key);
+      analysisProgress.delete(key);
+      send({ type: "analysis_progress", chatId, progress: null }, userId);
+    }
   }
 }
 
@@ -1578,4 +1592,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
   }
 });
 
-spindle.log.info("LumiMind v0.3.0 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.1 loaded — subjective timeline engine ready.");

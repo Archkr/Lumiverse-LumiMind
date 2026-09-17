@@ -121,3 +121,67 @@ describe("v0.3 backend flows", () => {
     expect(host.quiet).not.toHaveBeenCalled(); expect(host.writes).not.toHaveBeenCalled();
   });
 });
+
+
+describe("first activation", () => {
+  function history(): ChatMessageLike[] {
+    return Array.from({ length: 50 }, (_, index) => ({ id: `m${index}`, role: index % 2 ? "assistant" : "user", content: `Mira waits ${index}.`, index_in_chat: index }));
+  }
+
+  it("builds all 50 messages on first activation", async () => {
+    const host = await backend(createTimeline("chat"), history());
+    await host.receive({ type: "activate", chatId: "chat", historyMode: "full" });
+    const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
+    expect(saved.lastValidMessageIndex).toBe(49);
+    expect(saved.records).toHaveLength(50);
+    expect(saved.health).toBe("ready");
+  });
+
+  it.each(["update_now", "rebuild"] as const)("releases a stalled first request when %s cancels it, even without host acknowledgement", async (type) => {
+    const host = await backend(createTimeline("chat"), history());
+    host.quiet.mockImplementationOnce(() => new Promise(() => {}));
+    const activation = host.receive({ type: "activate", chatId: "chat", historyMode: "full" });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.quiet).toHaveBeenCalledTimes(1);
+    const update = host.receive({ type, chatId: "chat" });
+    await vi.advanceTimersByTimeAsync(1);
+    const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
+    expect(saved.health).toBe("ready");
+    expect(saved.lastValidMessageIndex).toBe(49);
+    await Promise.all([activation, update]);
+  });
+  it("shows a timeout after a stalled activation and lets Retry finish", async () => {
+    const host = await backend(createTimeline("chat"), history());
+    host.quiet.mockImplementationOnce(() => new Promise(() => {}));
+    const activation = host.receive({ type: "activate", chatId: "chat", historyMode: "full" });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.sent).toContainEqual({ type: "analysis_progress", chatId: "chat", progress: {
+      phase: "requesting", startMessageIndex: 0, endMessageIndex: 5, totalMessages: 50,
+    } });
+    await vi.advanceTimersByTimeAsync(DEFAULT_SETTINGS.controllerTimeoutSeconds * 1000);
+    await activation;
+    const stalled = host.stored.get("timelines/chat.json") as ChatTimelineV1;
+    expect(stalled.health).toBe("error");
+    expect(stalled.error).toContain("timed out after 120 seconds");
+    expect(stalled.records).toHaveLength(0);
+    expect(host.quiet.mock.calls[0][0].signal.aborted).toBe(true);
+    expect(host.sent.at(-1)).toEqual({ type: "analysis_progress", chatId: "chat", progress: null });
+    await host.receive({ type: "retry", chatId: "chat" });
+    expect(host.stored.get("timelines/chat.json")).toMatchObject({ health: "ready", lastValidMessageIndex: 49 });
+  });
+
+  it("pauses a stalled activation immediately and ignores its late result", async () => {
+    const host = await backend(createTimeline("chat"), history());
+    let finish!: (value: unknown) => void;
+    host.quiet.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const activation = host.receive({ type: "activate", chatId: "chat", historyMode: "full" });
+    await vi.advanceTimersByTimeAsync(1);
+    await host.receive({ type: "pause", chatId: "chat", paused: true });
+    await activation;
+    finish({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.stored.get("timelines/chat.json")).toMatchObject({ health: "paused", records: [], lastValidMessageIndex: -1 });
+    expect(host.quiet).toHaveBeenCalledTimes(1);
+  });
+
+});

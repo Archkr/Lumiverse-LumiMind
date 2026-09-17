@@ -18,9 +18,36 @@ function host(quiet: ReturnType<typeof vi.fn>) {
   return spindle;
 }
 const analyze = (extra = {}) => analyzeMessages({ messages, recentContext: [], compactState: [], settings, userId: "fallback-test", ...extra });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("controller fallbacks", () => {
+  it("times out an unresponsive primary, releases its slot, and uses the backup", async () => {
+    vi.useFakeTimers();
+    const quiet = vi.fn().mockImplementationOnce(() => new Promise(() => {})).mockResolvedValue(response(valid));
+    host(quiet);
+    const pending = analyze({ settings: { ...settings, controllerTimeoutSeconds: 15 } });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const result = await pending;
+    expect(quiet.mock.calls[0][0].signal.aborted).toBe(true);
+    expect(result.meta.connectionId).toBe("backup");
+    expect(result.telemetry.connectionAttempts?.map((attempt) => attempt.outcome)).toEqual(["request_failed", "success"]);
+  });
+
+  it("cancels stalled token counting before sending generation or trying backups", async () => {
+    vi.useFakeTimers();
+    const quiet = vi.fn();
+    const spindle = host(quiet);
+    spindle.tokens.countText.mockImplementation(() => new Promise(() => {}));
+    const controller = new AbortController();
+    const pending = analyze({ signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(spindle.tokens.countText).toHaveBeenCalled();
+    controller.abort();
+    await rejected;
+    expect(quiet).not.toHaveBeenCalled();
+  });
+
   it("isolates model overrides, counts with the backup tokenizer, and restarts at primary", async () => {
     const quiet = vi.fn().mockRejectedValueOnce(new Error("down")).mockResolvedValue(response(valid));
     const spindle = host(quiet);

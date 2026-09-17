@@ -769,8 +769,8 @@ describe("controller response parsing", () => {
     })).rejects.toMatchObject({ name: "AbortError" });
 
     expect(quiet).toHaveBeenCalledTimes(2);
-    expect(quiet.mock.calls[0][0]).toMatchObject({ signal: abortController.signal });
-    expect(quiet.mock.calls[1][0]).toMatchObject({ signal: abortController.signal });
+    expect(quiet.mock.calls[0][0].signal).toBeInstanceOf(AbortSignal);
+    expect(quiet.mock.calls[1][0].signal.aborted).toBe(true);
   });
 });
 

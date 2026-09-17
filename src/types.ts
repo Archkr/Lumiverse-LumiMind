@@ -279,6 +279,7 @@ export interface LumiMindSettings {
   controllerConnectionId: string | null;
   controllerModel: string | null;
   controllerTemperature: number;
+  controllerTimeoutSeconds: number;
   controllerParallelRequests: number;
   controllerRequestsPerMinute: number;
   analysisStateTokenBudget: number;
@@ -377,7 +378,17 @@ export interface TimelineView {
   updatedAt: number;
 }
 
+export type ControllerPhase = "preparing" | "queued" | "rate_limited" | "requesting";
+
+export interface AnalysisProgress {
+  phase: ControllerPhase;
+  startMessageIndex: number;
+  endMessageIndex: number;
+  totalMessages: number;
+}
+
 export interface FrontendState {
+  analysisProgress?: AnalysisProgress | null;
   lastControllerRun?: ControllerRun | null;
   settings: LumiMindSettings;
   permissions: PermissionState;
@@ -427,6 +438,7 @@ export type FrontendToBackend =
   | { type: "writeback_actor"; chatId: string; actorId: string };
 
 export type BackendToFrontend =
+  | { type: "analysis_progress"; chatId: string; progress: AnalysisProgress | null }
   | { type: "controller_run"; run: ControllerRun }
   | { type: "test_controller_result"; requestId: string; result: ControllerTestResult }
   | { type: "repair_preview_result"; requestId: string; chatId: string; preview: RepairPreview }
