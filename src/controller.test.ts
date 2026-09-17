@@ -8,7 +8,6 @@ import {
   generateNpcCoreDraft,
   isNontrivialAnalysisBatch,
   makeControllerResponseTelemetry,
-  mergeControllerAnalyses,
   normalizeControllerAnalysis,
   parseJsonValue,
   sanitizeControllerText,
@@ -76,7 +75,7 @@ describe("controller response parsing", () => {
     ]);
   });
 
-  it("deduplicates paraphrased additions within one controller response", () => {
+  it("preserves distinct additions across messages during normalization", () => {
     const result = normalizeControllerAnalysis({
       actorMentions: [],
       changes: [
@@ -84,8 +83,8 @@ describe("controller response parsing", () => {
         { subjectRef: "Mira", category: "goal", operation: "add", text: "Escape the tower", targetRefs: [], messageId: "m2" },
       ],
     });
-    expect(result.changes).toHaveLength(1);
-    expect(result.changes[0]).toMatchObject({ text: "Escape the tower", messageId: "m2" });
+    expect(result.changes).toHaveLength(2);
+    expect(result.changes[1]).toMatchObject({ text: "Escape the tower", messageId: "m2" });
   });
 
   it("preserves the current analysis batch after very large state context", () => {
@@ -381,22 +380,6 @@ describe("controller response parsing", () => {
     });
   });
 
-  it("merges corrective mentions while taking corrective state changes", () => {
-    const first: ControllerAnalysis = {
-      actorMentions: [{ ref: "aster", name: "Aster", messageId: "m1" }],
-      changes: [],
-    };
-    const corrective: ControllerAnalysis = {
-      actorMentions: [
-        { ref: "aster", name: "Aster", messageId: "m1", present: true },
-        { ref: "mira", name: "Mira", messageId: "m1" },
-      ],
-      changes: [{ subjectRef: "aster", category: "emotion", operation: "add", text: "Wary", messageId: "m1" }],
-    };
-    const merged = mergeControllerAnalyses(first, corrective);
-    expect(merged.actorMentions).toHaveLength(2);
-    expect(merged.changes).toHaveLength(1);
-  });
 
   it("blocks disabled persona and director-card minds while treating portrayed characters as NPCs", () => {
     const analysis: ControllerAnalysis = {
@@ -431,7 +414,7 @@ describe("controller response parsing", () => {
   it("allows controller changes to unlocked manual, seed, and pinned entries while still blocking locks", async () => {
     const changes: ControllerAnalysis["changes"] = [
       { subjectRef: "Mira", category: "goal", operation: "update", targetItemId: "manual", text: "Manual evolved", messageId: "m1" },
-      { subjectRef: "Mira", category: "belief", operation: "remove", targetItemId: "seed", messageId: "m1" },
+      { subjectRef: "Mira", category: "belief", operation: "resolve", targetItemId: "seed", messageId: "m1" },
       { subjectRef: "Mira", category: "emotion", operation: "update", targetItemId: "locked", text: "Locked evolved", messageId: "m1" },
     ];
     const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes }) });

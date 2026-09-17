@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.3.2-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.3.3-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.3.2` lets you choose the exact message where analysis repair starts, preview the number of messages to reanalyze, and retain earlier analysis. Existing timelines and settings remain compatible.
+LumiMind `0.3.3` hardens background state operations: existing state can be updated, resolved, or abandoned, while permanent deletion requires manual editing or Tidy approval. Invalid operations receive at most one corrective pass per connection, and Diagnostics reports emitted and accepted operation counts. Existing analysis remains compatible without a rebuild.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -131,7 +131,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.3.2` stable |
+| Extension version | `0.3.3` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
@@ -396,7 +396,11 @@ Open **Mind Lens → Settings → Timeline database** to export or import the cu
 
 In **Settings → Analysis controller**, keep your primary connection and optionally add up to three backups. Each backup has its own optional model override; a blank override uses that connection's default. Reorder backups with **Move up/down**, then save. Fallbacks apply to analysis, Tidy, Mind Seeds, and NPC core generation. Each new operation starts with the primary.
 
-LumiMind advances to the next backup on request failures or unusable structured output. Analysis still allows one corrective bootstrap pass per connection. Valid empty analysis and empty Tidy proposals are successful results; minor rejected entries do not trigger backups when useful output remains. Cancellation, missing permissions, and local input/budget errors stop the operation. If every connection fails, usable partial analysis is retained with its warnings when available. Results from separate connections are never merged. Mind Lens and Diagnostics identify connection attempts and the selected model without including raw provider errors.
+LumiMind advances to the next backup on request failures or unusable structured output. Analysis allows one corrective pass per connection, shared between bootstrap extraction and validation failures. A correction returns a complete replacement result; if it fails validation or the request fails, the valid first-pass result is retained. Valid empty analysis and empty Tidy proposals are successful results; minor rejected entries do not trigger backups when useful output remains. Cancellation, missing permissions, and local input/budget errors stop the operation. If every connection fails, usable partial analysis is retained with its warnings when available. Results from separate connections are never merged. Mind Lens and Diagnostics identify connection attempts and the selected model without including raw provider errors.
+
+Background analysis uses **add** for independent new state, **update** for materially changed existing state, **resolve** for concluded state, and **abandon** for explicitly renounced state. It cannot emit permanent **remove** operations; delete entries manually or approve deletion proposals in **Tidy**. Resolution and abandonment preserve stored entries and stop their inclusion as unresolved state. Age or silence alone does not justify either operation. Locked entries remain protected.
+
+LumiMind suppresses unchanged duplicate additions and requests correction when an addition would implicitly replace an existing entry. Supported changes to the same entry across messages retain their chronological transitions. The shared corrective-pass limit also covers invalid operation tokens, forbidden deletions, missing targets, and protected targets. Successful corrections clear the corresponding batch warning; unsuccessful corrections retain valid first-pass edits and expose warnings. Diagnostics distinguishes emitted, accepted, and final operation counts; older records without these counters show unavailable values. Historical removal records continue to replay unchanged, and adopting these rules does not trigger a history rebuild.
 
 **Test controller** beside the primary or any backup sends a small synthetic scene using the current draft settings, without saving them. It tests only that connection, makes a model request, and never sends chat content or writes timeline state. The result shows validation success, elapsed time, the resolved model when available, and the structured-output mode. A successful test confirms this small scene works; it does not guarantee every larger chat will succeed.
 
@@ -423,7 +427,7 @@ Additional calls can occur when:
 - replaying edits, deletions, or changed swipes;
 - changing Persona or Director policy;
 - retrying transient failures;
-- running one corrective pass after a substantive empty bootstrap result;
+- running one corrective pass after a substantive empty bootstrap result or invalid operations;
 - generating a Mind Seed draft;
 - generating or revising an NPC core;
 - running Mind Tidy;

@@ -531,6 +531,9 @@ export function setup(ctx: SpindleFrontendContext): () => void {
             needsAttention: quality.needsAttention,
           },
           batches: quality.batches.slice(-10).reverse().map((batch) => ({ ...batch,
+            finalOperations: batch.finalOperations ?? null,
+            first: { ...batch.first, emittedOperations: batch.first.emittedOperations ?? null, acceptedOperations: batch.first.acceptedOperations ?? null },
+            retry: batch.retry ? { ...batch.retry, emittedOperations: batch.retry.emittedOperations ?? null, acceptedOperations: batch.retry.acceptedOperations ?? null } : null,
             connectionAttempts: batch.connectionAttempts?.map(({ connectionId, ...attempt }) => ({ ...attempt, dedicatedConnection: !!connectionId })),
           })),
           recent: timeline.records.slice(-10).reverse().map((record) => ({

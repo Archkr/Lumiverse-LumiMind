@@ -1688,7 +1688,7 @@ async function withControllerSlot(userId, limit, signal, run) {
 var THINK_BLOCK_RE = /<think[\s\S]*?<\/think>/gi;
 var ANALYSIS_TOOL_NAME = "lumi_mind_analysis_v1";
 var MIND_CATEGORIES = ["belief", "secret", "goal", "plan", "emotion", "relationship", "awareness"];
-var MIND_OPERATIONS = ["add", "update", "resolve", "abandon", "remove"];
+var MIND_OPERATIONS = ["add", "update", "resolve", "abandon"];
 var CATEGORY_NORMALIZATIONS = {
   belief: "belief",
   beliefs: "belief",
@@ -1750,24 +1750,8 @@ function operation(value) {
   const normalized = typeof value === "string" ? value.trim().toLocaleLowerCase() : "";
   return MIND_OPERATIONS.find((candidate) => candidate === normalized) ?? null;
 }
-function normalizedReference(value) {
-  return value.trim().toLocaleLowerCase();
-}
-function sameReferences(left, right) {
-  const normalizedLeft = uniqueStrings(left ?? []).map(normalizedReference).sort();
-  const normalizedRight = uniqueStrings(right ?? []).map(normalizedReference).sort();
-  return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
-}
 function duplicateControllerChange(left, right) {
-  if (normalizedReference(left.subjectRef) !== normalizedReference(right.subjectRef) || left.category !== right.category) return false;
-  if (left.targetItemId && right.targetItemId) return left.targetItemId === right.targetItemId;
-  if (left.operation !== "add" || right.operation !== "add") return false;
-  if (!sameReferences(left.targetRefs, right.targetRefs) || !sameReferences(left.concealedFromRefs, right.concealedFromRefs)) return false;
-  const leftText = left.text ?? "";
-  const rightText = right.text ?? "";
-  const leftCanonical = canonicalMindText(leftText);
-  const rightCanonical = canonicalMindText(rightText);
-  return !!leftCanonical && leftCanonical === rightCanonical || mindTextsNearDuplicate(leftText, rightText);
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 function deduplicateControllerChanges(changes) {
   const result = [];
@@ -1819,8 +1803,19 @@ function normalizeControllerAnalysisResult(value) {
     const normalizedCategory = category(item.category);
     const normalizedOperation = operation(item.operation);
     const normalizedText = text(item.text);
+    const normalizedStatus = text(item.status).toLocaleLowerCase();
     const targetItemId = text(item.targetItemId) || null;
-    const rejectionReason = !subjectRef ? "missing_subject" : !messageId ? "missing_message_id" : !normalizedCategory ? "invalid_category" : !normalizedOperation ? "invalid_operation" : (normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText ? "missing_text" : normalizedOperation !== "add" && !targetItemId ? "missing_target_id" : null;
+    let rejectionReason = null;
+    if (!subjectRef) rejectionReason = "missing_subject";
+    else if (!messageId) rejectionReason = "missing_message_id";
+    else if (!normalizedCategory) rejectionReason = "invalid_category";
+    else if (text(item.operation).toLocaleLowerCase() === "remove") rejectionReason = "forbidden_remove";
+    else if (!normalizedOperation) rejectionReason = "invalid_operation";
+    else if (normalizedOperation === "add" && targetItemId) rejectionReason = "unexpected_target_id";
+    else if ((normalizedOperation === "add" || normalizedOperation === "update") && (normalizedStatus === "resolved" || normalizedStatus === "abandoned")) rejectionReason = "invalid_status";
+    else if (normalizedStatus && !["active", "uncertain", "resolved", "abandoned"].includes(normalizedStatus)) rejectionReason = "invalid_status";
+    else if ((normalizedOperation === "add" || normalizedOperation === "update") && !normalizedText) rejectionReason = "missing_text";
+    else if (normalizedOperation !== "add" && !targetItemId) rejectionReason = "missing_target_id";
     if (rejectionReason) {
       incrementInvalidReason(invalidChangeReasons, rejectionReason);
       return [];
@@ -1836,7 +1831,7 @@ function normalizeControllerAnalysisResult(value) {
       operation: normalizedOperation,
       targetItemId,
       text: normalizedText,
-      status: item.status === "resolved" || item.status === "abandoned" || item.status === "uncertain" ? item.status : "active",
+      status: normalizedOperation === "resolve" ? "resolved" : normalizedOperation === "abandon" ? "abandoned" : normalizedStatus === "uncertain" ? "uncertain" : "active",
       confidence: Math.min(1, Math.max(0, numberValue(item.confidence, 0.75))),
       targetRefs: stringArray(item.targetRefs),
       concealedFromRefs: stringArray(item.concealedFromRefs),
@@ -1926,65 +1921,109 @@ function resolveControllerTarget(items, targetItemId) {
   return prefixMatches.length === 1 ? prefixMatches[0] : null;
 }
 function validateControllerAnalysisContext(analysis, messages, compactState) {
-  const messageIds = new Set(messages.map((message) => message.id));
+  const messageOrder = new Map(messages.map((message, index) => [message.id, index]));
   const actorByReference = /* @__PURE__ */ new Map();
   for (const value of Array.isArray(compactState) ? compactState : []) {
-    const actor = asObject2(value);
-    const references = [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []];
-    for (const reference of references) {
+    const actor = structuredClone(asObject2(value));
+    actor.items = (Array.isArray(actor.items) ? actor.items : []).map(asObject2);
+    for (const reference of [actor.ref, actor.name, ...Array.isArray(actor.aliases) ? actor.aliases : []]) {
       const key = policyReference(reference);
       if (key) actorByReference.set(key, actor);
     }
   }
-  const actorMentions = analysis.actorMentions.filter((mention) => messageIds.has(mention.messageId));
+  const actorMentions = analysis.actorMentions.filter((mention) => messageOrder.has(mention.messageId));
   for (const mention of actorMentions) {
-    const actor = { items: [] };
+    const actor = actorByReference.get(policyReference(mention.ref)) ?? actorByReference.get(policyReference(mention.name)) ?? { ref: mention.ref, items: [] };
     for (const reference of [mention.ref, mention.name, ...mention.aliases ?? []]) {
       const key = policyReference(reference);
       if (key && !actorByReference.has(key)) actorByReference.set(key, actor);
     }
   }
+  let duplicatesSuppressed = 0;
+  const correctionTargets = [];
   const invalidChangeReasons = {};
-  const changes = analysis.changes.flatMap((change) => {
+  const ordered = [...analysis.changes].sort((left, right) => (messageOrder.get(left.messageId) ?? Infinity) - (messageOrder.get(right.messageId) ?? Infinity));
+  const changes = ordered.flatMap((change) => {
     const actor = actorByReference.get(policyReference(change.subjectRef));
-    if (!messageIds.has(change.messageId)) {
-      incrementInvalidReason(invalidChangeReasons, "message_outside_batch");
+    const reject = (reason) => {
+      incrementInvalidReason(invalidChangeReasons, reason);
       return [];
-    }
-    if (!actor) {
-      incrementInvalidReason(invalidChangeReasons, "unknown_subject");
-      return [];
-    }
+    };
+    if (!messageOrder.has(change.messageId)) return reject("message_outside_batch");
+    if (!actor) return reject("unknown_subject");
+    const knownReferences = (values) => uniqueStrings((values ?? []).map((reference) => actorByReference.get(policyReference(reference))).filter((value) => !!value).map((value) => text(value.ref)));
+    change = { ...change, targetRefs: knownReferences(change.targetRefs), concealedFromRefs: knownReferences(change.concealedFromRefs) };
+    const items = actor.items;
     if (change.operation !== "add") {
       const targetItemId = change.targetItemId?.trim();
-      if (!targetItemId) {
-        incrementInvalidReason(invalidChangeReasons, "missing_target_id");
-        return [];
-      }
-      const target = resolveControllerTarget(
-        (Array.isArray(actor.items) ? actor.items : []).map(asObject2),
-        targetItemId
-      );
-      if (!target) {
-        incrementInvalidReason(invalidChangeReasons, "target_not_found");
-        return [];
-      }
-      const protectedTarget = target.locked === true;
-      if (protectedTarget) {
-        incrementInvalidReason(invalidChangeReasons, "protected_target");
-        return [];
-      }
+      if (!targetItemId) return reject("missing_target_id");
+      const target = resolveControllerTarget(items, targetItemId);
+      if (!target) return reject("target_not_found");
+      if (target.locked === true || target.controllerWritable === false) return reject("protected_target");
       change = { ...change, targetItemId: text(target.id) };
+      if (change.operation === "update") Object.assign(target, {
+        category: change.category,
+        text: change.text,
+        status: change.status,
+        targetActorIds: change.targetRefs,
+        concealedFromActorIds: change.concealedFromRefs,
+        intensity: change.intensity,
+        dimensions: change.dimensions
+      });
+      else target.status = change.operation === "resolve" ? "resolved" : "abandoned";
+    } else {
+      const matchable = items.flatMap((item) => {
+        const itemCategory = category(item.category);
+        return itemCategory ? [{
+          source: item,
+          id: text(item.id),
+          category: itemCategory,
+          text: text(item.text),
+          status: item.status === "resolved" || item.status === "abandoned" || item.status === "uncertain" ? item.status : "active",
+          targetActorIds: stringArray(item.targetActorIds),
+          concealedFromActorIds: stringArray(item.concealedFromActorIds)
+        }] : [];
+      });
+      const match = matchingMindItem({ items: matchable }, {
+        operation: "add",
+        targetItemId: null,
+        category: change.category,
+        text: change.text ?? "",
+        targetActorIds: change.targetRefs ?? [],
+        concealedFromActorIds: change.concealedFromRefs ?? []
+      });
+      if (match) {
+        const matched = matchable[match.index];
+        const original = matched.source;
+        const previousDimensions = asObject2(original.dimensions);
+        const nextDimensions = change.dimensions ?? {};
+        const changedDimensions = [.../* @__PURE__ */ new Set([...Object.keys(previousDimensions), ...Object.keys(nextDimensions)])].some((key) => previousDimensions[key] !== nextDimensions[key]);
+        const unchanged = matched.status === change.status && (original.intensity ?? null) === (change.intensity ?? null) && !changedDimensions;
+        if (match.kind === "exact" && unchanged) {
+          duplicatesSuppressed++;
+          return [];
+        }
+        if (original?.locked === true || original?.controllerWritable === false) return reject("protected_target");
+        if (matched.id) correctionTargets.push({ subjectRef: text(actor.ref), targetItemId: matched.id });
+        return reject("implicit_replacement");
+      }
+      items.push({
+        id: "",
+        category: change.category,
+        text: change.text,
+        status: change.status,
+        targetActorIds: change.targetRefs,
+        concealedFromActorIds: change.concealedFromRefs,
+        intensity: change.intensity,
+        dimensions: change.dimensions
+      });
     }
-    const knownReferences = (values) => (values ?? []).filter((reference) => actorByReference.has(policyReference(reference)));
-    return [{
-      ...change,
-      targetRefs: knownReferences(change.targetRefs),
-      concealedFromRefs: knownReferences(change.concealedFromRefs)
-    }];
+    return [change];
   });
   return {
     analysis: { actorMentions, changes },
+    duplicatesSuppressed,
+    correctionTargets,
     invalidChangesRejected: invalidReasonTotal(invalidChangeReasons),
     invalidChangeReasons
   };
@@ -1993,6 +2032,14 @@ function isNontrivialAnalysisBatch(messages) {
   const lengths = messages.map((message) => message.content.replace(/\s+/g, " ").trim().length);
   const total = lengths.reduce((sum, length) => sum + length, 0);
   return total >= 400 || lengths.some((length) => length >= 280) || messages.length >= 2 && total >= 240;
+}
+function operationCounts(changes) {
+  const counts = { add: 0, update: 0, resolve: 0, abandon: 0, remove: 0 };
+  for (const change of changes) {
+    const key = text(asObject2(change).operation).toLocaleLowerCase();
+    if (Object.hasOwn(counts, key)) counts[key]++;
+  }
+  return counts;
 }
 function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}, outputMode = "json", transport = {}) {
   const object = asObject2(parsed);
@@ -2005,22 +2052,13 @@ function makeControllerResponseTelemetry(raw, parsed, accepted, diagnostics = {}
     responseHash: stableHash(raw),
     rawActorMentions: Array.isArray(object.actorMentions) ? object.actorMentions.length : 0,
     rawChanges,
+    emittedOperations: operationCounts(Array.isArray(object.changes) ? object.changes : []),
+    acceptedOperations: operationCounts(accepted.changes),
     acceptedActorMentions: accepted.actorMentions.length,
     acceptedChanges: accepted.changes.length,
     duplicatesSuppressed,
     invalidChangesRejected: diagnostics.invalidChangesRejected ?? Math.max(0, rawChanges - accepted.changes.length - duplicatesSuppressed),
     invalidChangeReasons: diagnostics.invalidChangeReasons ?? {}
-  };
-}
-function mergeControllerAnalyses(first, corrective) {
-  const mentions = /* @__PURE__ */ new Map();
-  for (const mention of [...first.actorMentions, ...corrective.actorMentions]) {
-    const key = `${mention.messageId}|${mention.ref || mention.name}`.toLocaleLowerCase();
-    mentions.set(key, mention);
-  }
-  return {
-    actorMentions: [...mentions.values()],
-    changes: corrective.changes.length ? corrective.changes : first.changes
   };
 }
 var ANALYSIS_SCHEMA = {
@@ -2062,7 +2100,7 @@ var ANALYSIS_SCHEMA = {
           operation: {
             type: "string",
             enum: [...MIND_OPERATIONS],
-            description: "Use exactly one operation: add, update, resolve, abandon, or remove. These are verbs; never use status words such as active, resolved, or abandoned here."
+            description: "Use exactly one operation: add, update, resolve, or abandon. Permanent deletion is available only through human-reviewed Tidy or manual editing. These are verbs; never use status words such as active, resolved, or abandoned here."
           },
           targetItemId: {
             anyOf: [{ type: "string" }, { type: "null" }],
@@ -2072,7 +2110,7 @@ var ANALYSIS_SCHEMA = {
           status: {
             type: "string",
             enum: ["active", "resolved", "abandoned", "uncertain"],
-            description: "Resulting state status. Do not place this status token in operation."
+            description: "Use active or uncertain for add/update, resolved for resolve, and abandoned for abandon. Do not place this status token in operation."
           },
           confidence: { type: "number", minimum: 0, maximum: 1 },
           targetRefs: { type: "array", items: { type: "string" }, description: "Known actor refs targeted by this state; otherwise an empty array." },
@@ -2325,7 +2363,11 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Call the required LumiMind result tool exactly once. Analyze every supplied message and identify every named actor with narrative agency that the roleplay-mode instructions permit LumiMind to manage.",
   `Use only these category tokens: ${MIND_CATEGORIES.join(", ")}.`,
   "Map a motive, desire, intention, or intended outcome to goal; a chosen method, strategy, or intended action sequence to plan; a current fear, feeling, or reaction to emotion; a noticed, witnessed, or currently known fact to awareness; a subjective proposition accepted as true or likely to belief; deliberately concealed knowledge to secret; and a stance toward another actor to relationship.",
-  `Use only these operation tokens: ${MIND_OPERATIONS.join(", ")}. Use add for novel state, update for materially evolved writable state, resolve for concluded state, abandon for renounced state, and remove only when the writable ledger item itself should be deleted.`,
+  `Use only these operation tokens: ${MIND_OPERATIONS.join(", ")}. Use add for novel state, update for materially evolved writable state, resolve for concluded state, and abandon for explicitly renounced state. Never permanently delete state; deletion requires human review in Tidy.`,
+  "An existing plan changes from entering through the gate to using the tunnel: update the same plan ID. Finding the sought notebook: resolve the existing find-notebook goal ID. Explicitly giving up the search: abandon that goal ID.",
+  "A belief materially changes after new evidence: update its existing ID. A repeated goal or paraphrase: emit no edit. A genuinely independent new objective: add with targetItemId=null.",
+  "Do not resolve or abandon an item merely because it is old, omitted from recent dialogue, or absent from the projected state. Never force a mixture of operations.",
+  "Preserve supported transitions in transcript order. If one entry changes in one message and concludes in a later message, emit both operations with their respective message IDs.",
   "Infer subjective state only when directly stated or strongly supported by subtext.",
   "Never invent objective events. Beliefs may be false or uncertain and must remain subjective.",
   "Treat a secret as information the subject knows and is deliberately concealing; concealedFromRefs names who it is hidden from.",
@@ -2334,10 +2376,10 @@ var ANALYSIS_SYSTEM_PROMPT = [
   "Classify each candidate internally as exactly one of COVERED, EVOLVED, ENDED, PROTECTED, or NOVEL before emitting JSON. Do not output these labels.",
   "COVERED: an existing item already expresses the same claim, intent, reaction, stance, or a broader state that entails it. Emit no change, even when the new wording is more vivid, specific, or paraphrased.",
   "EVOLVED: the same continuing state materially changed and its existing item has controllerWritable=true. Emit update with that exact item ID; never add a second version.",
-  "ENDED: an existing controllerWritable=true state clearly concluded or became obsolete. Resolve, abandon, or remove that exact item rather than adding its opposite.",
+  "ENDED: an existing controllerWritable=true state clearly concluded or was explicitly renounced. Resolve a concluded state or abandon an explicitly renounced state using that exact item. Never delete it or add its opposite.",
   "PROTECTED: the best semantic match has controllerWritable=false. Emit no change. Never add a replacement, workaround, refinement, contradiction, or scene-specific restatement of protected state.",
   "NOVEL: no existing item or earlier change in this response covers the same semantic proposition or continuity function. Only NOVEL candidates may use add. When uncertain between COVERED and NOVEL, choose COVERED and emit nothing.",
-  "Use existing item IDs in targetItemId for every update, resolve, abandon, or remove operation. Never target an item with controllerWritable=false.",
+  "Use existing item IDs in targetItemId for every update, resolve, or abandon operation. Never target an item with controllerWritable=false.",
   "Represent one emotional reaction to the same event, cause, and target as one concise composite emotion; do not split its adjectives or facets into separate entries.",
   "Represent one intended outcome as one goal and one method as one plan. Do not turn each action, sentence, observation, or rhetorical question into another state item.",
   "Maintain one current relationship stance per subject-target pair. Update the writable stance when it changes; if the stance is protected, emit nothing.",
@@ -2439,8 +2481,8 @@ async function analyzeMessagesOnce(input) {
   const policyFirst = applyControllerMindPolicy(normalizedFirst.analysis, input.compactState, input.settings);
   const validatedFirst = validateControllerAnalysisContext(policyFirst, input.messages, input.compactState);
   const firstAnalysis = validatedFirst.analysis;
-  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, normalizedFirst.analysis, {
-    duplicatesSuppressed: normalizedFirst.duplicatesSuppressed,
+  const firstTelemetry = makeControllerResponseTelemetry(result.raw, result.parsed, firstAnalysis, {
+    duplicatesSuppressed: normalizedFirst.duplicatesSuppressed + validatedFirst.duplicatesSuppressed,
     invalidChangesRejected: normalizedFirst.invalidChangesRejected + validatedFirst.invalidChangesRejected,
     invalidChangeReasons: mergeInvalidReasons(normalizedFirst.invalidChangeReasons, validatedFirst.invalidChangeReasons)
   }, result.outputMode, {
@@ -2455,8 +2497,11 @@ async function analyzeMessagesOnce(input) {
   let retryTelemetry = null;
   let retryRaw = null;
   let retryError = null;
+  let policyDrops = { mentions: normalizedFirst.analysis.actorMentions.length - policyFirst.actorMentions.length, changes: normalizedFirst.analysis.changes.length - policyFirst.changes.length };
   let attempts = 1;
-  if (nontrivial && bootstrapNeeded && firstAnalysis.changes.length === 0) {
+  const bootstrapRetry = nontrivial && bootstrapNeeded && firstAnalysis.changes.length === 0;
+  const operationRetry = firstTelemetry.invalidChangesRejected > 0;
+  if (bootstrapRetry || operationRetry) {
     attempts = 2;
     try {
       const corrective = await quietJson(
@@ -2464,10 +2509,15 @@ async function analyzeMessagesOnce(input) {
 
 <corrective_feedback>
 ${correctiveFeedback(firstTelemetry)}
+${JSON.stringify({ replacementTargets: validatedFirst.correctionTargets })}
 </corrective_feedback>
 
-Perform the corrective bootstrap extraction now.`,
-        analysisSystemPrompt(input.settings, true),
+<valid_first_pass_edits>
+${JSON.stringify(firstAnalysis)}
+</valid_first_pass_edits>
+
+Return a complete corrected result for this entire analysis_batch, including every valid first-pass edit that is still warranted. Do not return only a patch. Reconsider forbidden removals as resolve or abandon only when supported; otherwise omit them. For implicit replacements, use the existing writable ID to update changed state or omit covered state. Never invent IDs for proposed additions.`,
+        analysisSystemPrompt(input.settings, bootstrapRetry),
         ANALYSIS_TOOL_NAME,
         ANALYSIS_SCHEMA,
         input.settings,
@@ -2483,8 +2533,8 @@ Perform the corrective bootstrap extraction now.`,
       const policyCorrective = applyControllerMindPolicy(normalizedCorrective.analysis, input.compactState, input.settings);
       const validatedCorrective = validateControllerAnalysisContext(policyCorrective, input.messages, input.compactState);
       const correctiveAnalysis = validatedCorrective.analysis;
-      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, normalizedCorrective.analysis, {
-        duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed,
+      retryTelemetry = makeControllerResponseTelemetry(corrective.raw, corrective.parsed, correctiveAnalysis, {
+        duplicatesSuppressed: normalizedCorrective.duplicatesSuppressed + validatedCorrective.duplicatesSuppressed,
         invalidChangesRejected: normalizedCorrective.invalidChangesRejected + validatedCorrective.invalidChangesRejected,
         invalidChangeReasons: mergeInvalidReasons(normalizedCorrective.invalidChangeReasons, validatedCorrective.invalidChangeReasons)
       }, corrective.outputMode, {
@@ -2494,15 +2544,20 @@ Perform the corrective bootstrap extraction now.`,
         usableToolCalls: corrective.usableToolCalls
       });
       if (!corrective.parsed) throw new UnusableControllerOutput("Corrective controller pass returned no parseable structured result.");
-      finalAnalysis = mergeControllerAnalyses(firstAnalysis, correctiveAnalysis);
+      const correctiveShape = asObject2(corrective.parsed);
+      if (!Array.isArray(correctiveShape.actorMentions) || !Array.isArray(correctiveShape.changes)) throw new UnusableControllerOutput("Corrective controller pass returned an invalid analysis result.");
+      if (retryTelemetry.invalidChangesRejected > 0) throw new UnusableControllerOutput("Corrective controller pass still contained invalid operations; valid first-pass analysis was retained.");
+      finalAnalysis = correctiveAnalysis;
+      policyDrops = { mentions: normalizedCorrective.analysis.actorMentions.length - policyCorrective.actorMentions.length, changes: normalizedCorrective.analysis.changes.length - policyCorrective.changes.length };
     } catch (error) {
       if (input.signal?.aborted || isAbortError(error) || error instanceof LocalControllerError || permissionFailure(error)) throw error;
       retryError = error instanceof UnusableControllerOutput ? error.message : "Corrective controller request failed.";
     }
   }
   const warningCodes = /* @__PURE__ */ new Set();
-  const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions > telemetry.acceptedActorMentions || telemetry.rawChanges - telemetry.acceptedChanges > telemetry.duplicatesSuppressed || telemetry.invalidChangesRejected > 0);
-  if (normalizationDropped(firstTelemetry) || normalizationDropped(retryTelemetry)) warningCodes.add("normalization_drop");
+  const normalizationDropped = (telemetry) => !!telemetry && (telemetry.rawActorMentions - policyDrops.mentions > telemetry.acceptedActorMentions || telemetry.rawChanges - policyDrops.changes - telemetry.acceptedChanges > telemetry.duplicatesSuppressed || telemetry.invalidChangesRejected > 0);
+  const effectiveTelemetry = retryTelemetry && !retryError ? retryTelemetry : firstTelemetry;
+  if (normalizationDropped(effectiveTelemetry)) warningCodes.add("normalization_drop");
   if (retryError) warningCodes.add("retry_failed");
   if (nontrivial && bootstrapNeeded && finalAnalysis.changes.length === 0) warningCodes.add("empty_nontrivial_batch");
   return {
@@ -2528,11 +2583,12 @@ Perform the corrective bootstrap extraction now.`,
       tokenCountFallback: stateProjection.telemetry.tokenCountFallback || result.providerInputTokens === null && inputMeasurement.fallback,
       nontrivial,
       attempts,
-      retryReason: attempts === 2 ? "empty_nontrivial_batch" : null,
+      retryReason: attempts === 2 ? operationRetry ? "invalid_operations" : "empty_nontrivial_batch" : null,
       first: firstTelemetry,
       retry: retryTelemetry,
       finalActorMentions: finalAnalysis.actorMentions.length,
       finalChanges: finalAnalysis.changes.length,
+      finalOperations: operationCounts(finalAnalysis.changes),
       warningCodes: [...warningCodes],
       retryError
     }
@@ -2780,8 +2836,9 @@ async function withFallbacks(input, operation2, run, usable = () => true) {
 function analyzeMessages(input) {
   return withFallbacks(input, "Analysis", (settings) => analyzeMessagesOnce({ ...input, settings }), (result) => {
     if (result.telemetry.warningCodes.includes("empty_nontrivial_batch")) return false;
-    const rejectedAllChanges = result.telemetry.first.rawChanges > 0 && result.telemetry.finalChanges === 0 && result.telemetry.first.invalidChangesRejected > 0;
-    const rejectedAllMentions = result.telemetry.first.rawActorMentions > 0 && result.telemetry.first.acceptedActorMentions === 0 && result.telemetry.finalActorMentions === 0;
+    const effective = result.telemetry.retry && !result.telemetry.retryError ? result.telemetry.retry : result.telemetry.first;
+    const rejectedAllChanges = effective.rawChanges > 0 && result.telemetry.finalChanges === 0 && effective.invalidChangesRejected > 0;
+    const rejectedAllMentions = effective.rawActorMentions > 0 && effective.acceptedActorMentions === 0 && result.telemetry.finalActorMentions === 0;
     return !rejectedAllChanges && !rejectedAllMentions;
   });
 }
@@ -3000,7 +3057,7 @@ function redactDiagnosticCredentials(value) {
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECONCILE_DEBOUNCE_MS = 650;
-var EXTENSION_VERSION = "0.3.2";
+var EXTENSION_VERSION = "0.3.3";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
@@ -4409,4 +4466,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.3.2 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.3 loaded \u2014 subjective timeline engine ready.");

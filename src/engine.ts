@@ -770,9 +770,9 @@ function protectedMindItem(item: MindItem): boolean {
 
 type MindMatchKind = "target" | "exact" | "near" | "relationship";
 
-function matchingMindItem(
-  mind: ActorMind,
-  delta: MindDelta,
+export function matchingMindItem(
+  mind: { items: Array<Pick<MindItem, "id" | "category" | "text" | "status" | "targetActorIds" | "concealedFromActorIds">> },
+  delta: Pick<MindDelta, "operation" | "targetItemId" | "category" | "text" | "targetActorIds" | "concealedFromActorIds">,
 ): { index: number; kind: MindMatchKind } | null {
   if (delta.targetItemId) {
     const index = mind.items.findIndex((item) => item.id === delta.targetItemId);

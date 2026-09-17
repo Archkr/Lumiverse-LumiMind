@@ -143,6 +143,10 @@ export type InvalidMindChangeReason =
   | "missing_message_id"
   | "invalid_category"
   | "invalid_operation"
+  | "forbidden_remove"
+  | "unexpected_target_id"
+  | "implicit_replacement"
+  | "invalid_status"
   | "missing_text"
   | "missing_target_id"
   | "message_outside_batch"
@@ -183,7 +187,11 @@ export interface AnalysisRecord {
 
 export type ControllerWarningCode = "empty_nontrivial_batch" | "normalization_drop" | "retry_failed";
 
+export type ControllerOperationCounts = Record<MindOperation, number>;
+
 export interface ControllerResponseTelemetry {
+  emittedOperations?: ControllerOperationCounts;
+  acceptedOperations?: ControllerOperationCounts;
   outputMode: "tool" | "json";
   structuredSource?: "tool" | "content_json" | "reasoning_json" | "none";
   toolCallsReceived?: number;
@@ -219,11 +227,12 @@ export interface ControllerBatchTelemetry {
   tokenCountFallback: boolean;
   nontrivial: boolean;
   attempts: number;
-  retryReason: "empty_nontrivial_batch" | null;
+  retryReason: "empty_nontrivial_batch" | "invalid_operations" | null;
   first: ControllerResponseTelemetry;
   retry: ControllerResponseTelemetry | null;
   finalActorMentions: number;
   finalChanges: number;
+  finalOperations?: ControllerOperationCounts;
   warningCodes: ControllerWarningCode[];
   retryError: string | null;
 }
