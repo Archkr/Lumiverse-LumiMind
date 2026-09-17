@@ -77,7 +77,7 @@ import {
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
 const RECONCILE_DEBOUNCE_MS = 650;
-const EXTENSION_VERSION = "0.3.1";
+const EXTENSION_VERSION = "0.3.2";
 
 type GenerationContext = {
   generationId: string;
@@ -1592,4 +1592,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
   }
 });
 
-spindle.log.info("LumiMind v0.3.1 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.2 loaded — subjective timeline engine ready.");

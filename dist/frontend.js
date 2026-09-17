@@ -616,6 +616,7 @@ var LUMI_MIND_CSS = `
 }
 
 .lm-feature-modal { padding:20px; overflow:auto; }
+.lm-repair-form { display:flex; flex-direction:column; gap:14px; }
 .lm-feature-modal .lm-inline-actions { flex-wrap:wrap; margin-bottom:16px; }
 .lm-feature-modal .lm-select { width:auto; max-width:100%; }
 .lm-preview-private { margin-top:16px; }
@@ -1152,23 +1153,92 @@ function setup(ctx) {
       output.textContent = error instanceof Error ? error.message : "Controller test failed.";
     }
   }
+  function chooseRepairStart(preview) {
+    return new Promise((resolve) => {
+      const modal = ctx.ui.showModal({ title: preview.resumed ? "Resume analysis repair" : "Repair analysis", width: 520, maxHeight: 660 });
+      featureModals.add(modal);
+      const form = element("form", "lm-root lm-feature-modal lm-repair-form");
+      const first = preview.messageIndices[0];
+      const last = preview.messageIndices.at(-1);
+      const recommended = preview.startMessageIndex;
+      const input2 = element("input", "lm-input");
+      input2.type = "number";
+      input2.min = String(first + 1);
+      input2.max = String(preview.maxStartMessageIndex + 1);
+      input2.step = "1";
+      input2.required = true;
+      input2.value = String((recommended ?? first) + 1);
+      input2.setAttribute("aria-label", "Start at message");
+      const description = element("p", "lm-view-copy", recommended === null ? "Choose where to start reanalyzing the committed chat history." : preview.resumed ? `Continue from message ${recommended + 1}, or choose an earlier starting message.` : `The first affected batch starts at message ${recommended + 1}. You can choose a later message to repair less history.`);
+      const summary = element("p", "lm-view-copy");
+      summary.setAttribute("aria-live", "polite");
+      const preserved = element("p", "lm-view-copy");
+      const hint = element("p", "lm-field-hint", "Seeds and locked corrections remain. Warnings before your chosen start remain unchanged. This makes controller requests using your saved settings.");
+      const actions = element("div", "lm-modal-actions");
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+        modal.dismiss();
+      };
+      const submit = element("button", "lm-button lm-button-primary", "Repair analysis");
+      submit.type = "submit";
+      const selectedStart = () => {
+        const index = input2.valueAsNumber - 1;
+        return Number.isInteger(index) && preview.messageIndices.includes(index) && index <= preview.maxStartMessageIndex ? index : null;
+      };
+      const updateRange = () => {
+        const index = selectedStart();
+        submit.disabled = index === null;
+        input2.setAttribute("aria-invalid", String(index === null));
+        if (index === null) {
+          summary.textContent = `Choose a committed message from ${first + 1} to ${preview.maxStartMessageIndex + 1}.`;
+          preserved.textContent = "";
+          return;
+        }
+        const count = preview.messageIndices.length - preview.messageIndices.indexOf(index);
+        summary.textContent = `Reanalyze messages ${index + 1}\u2013${last + 1} (${count.toLocaleString()} ${count === 1 ? "message" : "messages"}).`;
+        preserved.textContent = index === first ? "This reanalyzes all committed history." : `Keep existing analysis before message ${index + 1}.`;
+      };
+      input2.addEventListener("input", updateRange);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const index = selectedStart();
+        if (index !== null) finish(index);
+      });
+      actions.append(textButton("Cancel", () => finish(null), "secondary"), submit);
+      form.append(description, field("Start at message", input2), summary, preserved, hint);
+      if (preview.maxStartMessageIndex !== last) {
+        form.append(element("p", "lm-field-hint", `Start no later than message ${preview.maxStartMessageIndex + 1}: earlier history must have valid saved analysis. Use Update now first to catch up.`));
+      }
+      form.append(actions);
+      modal.root.append(form);
+      modal.onDismiss(() => {
+        featureModals.delete(modal);
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      });
+      updateRange();
+      input2.focus();
+      input2.select();
+    });
+  }
   async function requestAnalysisRepair(chatId) {
     try {
       const response = await requestFeature({ type: "repair_preview", chatId, requestId: createRequestId() });
       if (response.type !== "repair_preview_result" || currentState?.activeChatId !== chatId) return;
       const preview = response.preview;
-      if (preview.startMessageIndex === null) {
-        showNotice("info", "No analysis warnings need repair.");
+      if (!preview.messageIndices.length) {
+        showNotice("info", "No committed messages are available to repair.");
         return;
       }
-      const result = await ctx.ui.showConfirm({
-        title: preview.resumed ? "Resume analysis repair?" : "Repair LumiMind analysis?",
-        message: `Reanalyze from message ${preview.startMessageIndex + 1} through the current committed history (${preview.messageCount} messages). Earlier analysis, seeds, and locked corrections remain. This makes controller requests using your saved settings.`,
-        confirmLabel: "Repair analysis"
-      });
-      if (!result.confirmed || currentState?.activeChatId !== chatId) return;
-      const started = await requestFeature({ type: "repair_analysis", chatId, requestId: createRequestId(), revision: preview.revision, fingerprint: preview.fingerprint });
-      if (started.type === "repair_started") showNotice("info", "Repair started. Progress is shown in Changes; interrupted repairs can be retried.");
+      const startMessageIndex = await chooseRepairStart(preview);
+      if (startMessageIndex === null || currentState?.activeChatId !== chatId) return;
+      const started = await requestFeature({ type: "repair_analysis", chatId, requestId: createRequestId(), revision: preview.revision, fingerprint: preview.fingerprint, startMessageIndex });
+      if (started.type === "repair_started") showNotice("info", `Repair started from message ${startMessageIndex + 1}. Progress is shown in Changes; interrupted repairs can be retried.`);
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : "Analysis repair failed.");
     }

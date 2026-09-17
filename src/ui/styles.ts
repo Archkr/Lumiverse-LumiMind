@@ -348,6 +348,7 @@ export const LUMI_MIND_CSS = `
 }
 
 .lm-feature-modal { padding:20px; overflow:auto; }
+.lm-repair-form { display:flex; flex-direction:column; gap:14px; }
 .lm-feature-modal .lm-inline-actions { flex-wrap:wrap; margin-bottom:16px; }
 .lm-feature-modal .lm-select { width:auto; max-width:100%; }
 .lm-preview-private { margin-top:16px; }

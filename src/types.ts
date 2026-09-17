@@ -402,7 +402,7 @@ export interface FrontendState {
 export type FrontendToBackend =
   | { type: "test_controller"; requestId: string; target: ControllerTarget; settings: LumiMindSettings; chatId?: string | null }
   | { type: "repair_preview"; requestId: string; chatId: string }
-  | { type: "repair_analysis"; requestId: string; chatId: string; revision: number; fingerprint: string }
+  | { type: "repair_analysis"; requestId: string; chatId: string; revision: number; fingerprint: string; startMessageIndex?: number }
   | { type: "injection_preview"; requestId: string; chatId: string; targetActorId?: string | null }
   | { type: "ready"; chatId?: string | null; characterId?: string | null }
   | { type: "refresh"; chatId?: string | null; characterId?: string | null }
@@ -542,6 +542,8 @@ export interface RepairPreview {
   startMessageIndex: number | null;
   messageCount: number;
   resumed: boolean;
+  messageIndices: number[];
+  maxStartMessageIndex: number | null;
 }
 
 export interface InjectionSelection {

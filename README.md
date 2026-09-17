@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.3.1-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.3.2-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.3.1` fixes stalled controller requests blocking analysis recovery, adds configurable request timeouts, and shows the current analysis step and message batch. Existing timelines and settings remain compatible. Controller fallbacks, targeted analysis repair, synthetic controller tests, and private injection previews remain available from `0.3.0`.
+LumiMind `0.3.2` lets you choose the exact message where analysis repair starts, preview the number of messages to reanalyze, and retain earlier analysis. Existing timelines and settings remain compatible.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -131,7 +131,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.3.1` stable |
+| Extension version | `0.3.2` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection or the active chat connection |
@@ -400,7 +400,9 @@ LumiMind advances to the next backup on request failures or unusable structured 
 
 **Test controller** beside the primary or any backup sends a small synthetic scene using the current draft settings, without saving them. It tests only that connection, makes a model request, and never sends chat content or writes timeline state. The result shows validation success, elapsed time, the resolved model when available, and the structured-output mode. A successful test confirms this small scene works; it does not guarantee every larger chat will succeed.
 
-**Repair analysis** finds the first warning on the active branch and previews the range to reanalyze. It preserves earlier records, the activation cutoff, seeds, and locked corrections, then reprocesses the affected batch and everything after it. The discarded suffix stays in recovery storage until repair completes; only the consistent repaired prefix is used. Failed or interrupted repairs keep their progress and can be resumed with **Retry**. Repair processes pending work even in manual or lagged mode without changing that saved mode. It never silently turns into a full rebuild. **Changes → Rebuild all** remains available for a deliberate full-history replay.
+**Repair analysis** suggests the first warning on the active branch and lets you choose an exact **Start at message** instead. The dialog previews the selected range and message count before making controller requests. For example, starting at message 1100 in a 1160-message chat reanalyzes only the final 61 messages. Earlier records (including any earlier warnings), seeds, and locked corrections remain; the selected message and everything after it are reanalyzed. Message numbers match those shown in Changes. If earlier analysis is missing or invalid after an edit or swipe, choose that point or earlier, or use **Update now** before selecting a later start. A changed timeline invalidates the confirmation instead of silently expanding the range.
+
+The discarded suffix stays in recovery storage until repair completes; only the consistent repaired prefix is used. Failed or interrupted repairs keep their progress and can be resumed with **Retry** or **Repair analysis**. Repair processes pending work even in manual or lagged mode without changing that saved mode. **Changes → Rebuild all** remains available for a deliberate full-history replay.
 
 ## Preview injected minds
 

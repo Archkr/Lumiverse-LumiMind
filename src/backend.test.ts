@@ -43,6 +43,46 @@ function fixture() {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("v0.3 backend flows", () => {
+  it("repairs a chosen later range despite an earlier warning, and retries only that range after failure", async () => {
+    const { timeline, messages } = fixture();
+    timeline.records[0].controller.telemetry!.warningCodes = ["normalization_drop"];
+    const host = await backend(timeline, messages);
+    await host.receive({ type: "repair_preview", chatId: "chat", requestId: "preview" });
+    const response = host.sent.find((message) => message.type === "repair_preview_result");
+    if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
+    expect(response.preview.startMessageIndex).toBe(0);
+    host.quiet.mockRejectedValueOnce(new Error("Temporarily unavailable"));
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint, startMessageIndex: 1 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.stored.get("timelines/chat.json")).toMatchObject({ health: "error", records: [timeline.records[0]] });
+    await host.receive({ type: "repair_preview", chatId: "chat", requestId: "resume" });
+    expect(host.sent.find((message) => "requestId" in message && message.requestId === "resume")).toMatchObject({ preview: { startMessageIndex: 1, resumed: true, messageCount: 1 } });
+    await host.receive({ type: "retry", chatId: "chat" });
+    const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
+    expect(saved.records[0]).toEqual(timeline.records[0]);
+    expect(saved.records[1].id).not.toBe(timeline.records[1].id);
+    expect(saved.repair).toBeNull();
+    expect(saved.minds["character:mira"].items[0].locked).toBe(true);
+    expect(host.quiet).toHaveBeenCalledTimes(2);
+    for (const [call] of host.quiet.mock.calls) {
+      expect(call.messages[1].content).toContain('id="m1"');
+      const batch = call.messages[1].content.split("<analysis_batch>")[1].split("</analysis_batch>")[0];
+      expect(batch).not.toContain('id="m0"');
+    }
+  });
+
+  it("rejects a custom repair if the transcript changed after preview without altering saved records", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    await host.receive({ type: "repair_preview", chatId: "chat", requestId: "preview" });
+    const response = host.sent.find((message) => message.type === "repair_preview_result");
+    if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
+    messages[0].content = "The earlier message changed.";
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint, startMessageIndex: 1 });
+    expect(host.sent.at(-1)).toMatchObject({ type: "feature_error", requestId: "repair", message: expect.stringContaining("timeline changed") });
+    expect(host.writes).not.toHaveBeenCalled();
+    expect(host.quiet).not.toHaveBeenCalled();
+  });
+
   it("captures the actual interceptor block and previews without writes or generation", async () => {
     const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
     await host.receive({ type: "ready", chatId: "chat", characterId: "mira" });
@@ -65,7 +105,7 @@ describe("v0.3 backend flows", () => {
     if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
     expect(response.preview).toMatchObject({ startMessageIndex: 1, messageCount: 1 });
     expect(host.writes).not.toHaveBeenCalled();
-    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", ...response.preview });
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint });
     expect(host.sent.some((message) => message.type === "repair_started")).toBe(true);
     await vi.advanceTimersByTimeAsync(1);
     const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
@@ -84,7 +124,7 @@ describe("v0.3 backend flows", () => {
     await host.receive({ type: "repair_preview", chatId: "chat", requestId: "preview" });
     const response = host.sent.find((message) => message.type === "repair_preview_result");
     if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
-    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", ...response.preview });
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint });
     await vi.advanceTimersByTimeAsync(1);
     const interrupted = host.stored.get("timelines/chat.json") as ChatTimelineV1;
     expect(interrupted.health).toBe("error"); expect(interrupted.repair?.backupRecords).toHaveLength(1);
@@ -104,7 +144,7 @@ describe("v0.3 backend flows", () => {
     await host.receive({ type: "repair_preview", chatId: "chat", requestId: "preview" });
     const response = host.sent.find((message) => message.type === "repair_preview_result");
     if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
-    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", ...response.preview });
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint });
     await vi.advanceTimersByTimeAsync(10);
     const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
     expect(Object.values(saved.actors).some((actor) => actor.canonicalName === "Obsolete actor")).toBe(false);
