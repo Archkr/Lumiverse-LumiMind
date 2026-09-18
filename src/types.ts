@@ -415,7 +415,8 @@ export interface FrontendState {
   lastInjectionProjection?: InjectionProjectionTelemetry | null;
 }
 
-export type FrontendToBackend =
+export type FrontendToBackend = { activeConnectionId?: string | null } & (
+  | { type: "connection_context" }
   | { type: "test_controller"; requestId: string; target: ControllerTarget; settings: LumiMindSettings; chatId?: string | null }
   | { type: "repair_preview"; requestId: string; chatId: string }
   | { type: "repair_analysis"; requestId: string; chatId: string; revision: number; fingerprint: string; startMessageIndex?: number }
@@ -451,7 +452,7 @@ export type FrontendToBackend =
   | { type: "start_tidy"; chatId: string; requestId: string; actorIds: string[] }
   | { type: "cancel_tidy"; chatId: string; requestId: string }
   | { type: "apply_tidy"; chatId: string; requestId: string; proposalIds: string[] }
-  | { type: "writeback_actor"; chatId: string; actorId: string };
+  | { type: "writeback_actor"; chatId: string; actorId: string });
 
 export type BackendToFrontend =
   | { type: "analysis_progress"; chatId: string; progress: AnalysisProgress | null }

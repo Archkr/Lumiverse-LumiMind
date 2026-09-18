@@ -760,6 +760,7 @@ function safeActiveChat(ctx) {
 }
 function setup(ctx) {
   ctx.deferReady();
+  const connections = ctx.connections;
   const cleanups = [];
   cleanups.push(ctx.dom.addStyle(LUMI_MIND_CSS));
   const drawer = ctx.ui.registerDrawerTab({
@@ -818,7 +819,8 @@ function setup(ctx) {
   let seedLoadVersion = 0;
   function send(message) {
     try {
-      ctx.sendToBackend(message);
+      const activeConnectionId = connections?.getActive().activeProfileId;
+      ctx.sendToBackend(activeConnectionId === void 0 ? message : { ...message, activeConnectionId });
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : "LumiMind could not reach its backend.");
     }
@@ -3327,6 +3329,7 @@ Intensity: ${item.intensity ?? "None"} \xB7 Dimensions: ${Object.entries(item.di
     cleanups.push(ctx.events.on(eventName, () => setTimeout(syncContext, 0)));
   }
   cleanups.push(ctx.events.on("PERMISSION_CHANGED", syncContext));
+  if (connections) cleanups.push(connections.subscribe(() => send({ type: "connection_context" })));
   render();
   ctx.ready();
   const active = safeActiveChat(ctx);

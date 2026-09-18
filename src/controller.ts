@@ -664,7 +664,7 @@ async function resolveConnection(settings: LumiMindSettings, userId: string, fal
   const configuredModel = settings.controllerModel?.trim() || null;
   if (!id && typeof spindle.connections?.list === "function") {
     const profiles = await controllerRequest(() => spindle.connections.list(userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup").catch((error) => { if (signal?.aborted || isAbortError(error)) throw error; return []; });
-    const defaultProfile = profiles.find((profile) => profile.is_default);
+    const defaultProfile = profiles.find((profile) => profile.is_default) ?? profiles[0];
     if (defaultProfile) return { id: defaultProfile.id, provider: defaultProfile.provider, model: configuredModel ?? defaultProfile.model };
   }
   if (!id) return { id: null, provider: null, model: configuredModel };

@@ -172,6 +172,11 @@ function safeActiveChat(ctx: SpindleFrontendContext): { chatId: string | null; c
 
 export function setup(ctx: SpindleFrontendContext): () => void {
   ctx.deferReady();
+  // This host API is newer than the bundled Spindle type declarations.
+  const connections = (ctx as SpindleFrontendContext & { connections?: {
+    getActive(): { activeProfileId: string | null };
+    subscribe(handler: () => void): () => void;
+  } }).connections;
   const cleanups: Array<() => void> = [];
   cleanups.push(ctx.dom.addStyle(LUMI_MIND_CSS));
 
@@ -259,7 +264,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
   function send(message: FrontendToBackend): void {
     try {
-      ctx.sendToBackend(message);
+      const activeConnectionId = connections?.getActive().activeProfileId;
+      ctx.sendToBackend(activeConnectionId === undefined ? message : { ...message, activeConnectionId });
     } catch (error) {
       showNotice("error", error instanceof Error ? error.message : "LumiMind could not reach its backend.");
     }
@@ -2853,6 +2859,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     cleanups.push(ctx.events.on(eventName, () => setTimeout(syncContext, 0)));
   }
   cleanups.push(ctx.events.on("PERMISSION_CHANGED", syncContext));
+  if (connections) cleanups.push(connections.subscribe(() => send({ type: "connection_context" })));
 
   render();
   ctx.ready();

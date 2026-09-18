@@ -134,7 +134,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Extension version | `0.3.3` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
-| Controller connection | Dedicated connection or the active chat connection |
+| Controller connection | Dedicated connection, or the chat's pinned connection / current active Lumiverse connection |
 | Build output | Committed `dist/backend.js` and `dist/frontend.js` |
 
 LumiMind degrades by capability. Optional identity, seed, and Memory Cortex features disappear when their permissions are unavailable without breaking normal Lumiverse chat.

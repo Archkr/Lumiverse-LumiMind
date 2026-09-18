@@ -11,6 +11,11 @@ async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], 
   const permissions = new Set(["generation", "interceptor", "chat_mutation"]);
   const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
   const writes = vi.fn(async (key: string, value: unknown) => { stored.set(key, structuredClone(value)); });
+  const connections = {
+    get: vi.fn(async (_id: string): Promise<{ provider: string; model: string } | null> => ({ provider: "openrouter", model: "test-model" })),
+    list: vi.fn(async () => [{ id: "default", provider: "openrouter", model: "test-model", is_default: true }]),
+  };
+  const chatMetadata: Record<string, unknown> = {};
   vi.stubGlobal("spindle", {
     onFrontendMessage: (callback: typeof receive) => { receive = callback; },
     registerInterceptor: (callback: typeof intercept) => { intercept = callback; },
@@ -19,12 +24,14 @@ async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], 
     sendToFrontend: (message: BackendToFrontend) => sent.push(message),
     userStorage: { getJson: vi.fn(async (key: string, options: { fallback: unknown }) => structuredClone(stored.get(key) ?? options.fallback)), setJson: writes },
     chat: { getMessages: vi.fn(async () => structuredClone(transcript)) },
-    connections: { get: vi.fn(async () => ({ provider: "test", model: "test-model" })), list: vi.fn(async () => []) },
+    chats: { get: vi.fn(async () => ({ id: "chat", metadata: chatMetadata })) },
+    characters: { get: vi.fn(async () => ({ id: "mira", name: "Mira", description: "A patient scout." })) },
+    connections,
     generate: { quiet },
     tokens: { countText: vi.fn(async (text: string) => ({ total_tokens: text.length, model: "test-model", tokenizer_name: "test", approximate: false })) },
   });
   await import("./backend");
-  return { receive: (message: FrontendToBackend) => receive(message, "user"), intercept, stored, sent, permissions, quiet, writes };
+  return { receive: (message: FrontendToBackend, userId = "user") => receive(message, userId), intercept, stored, sent, permissions, quiet, writes, connections, chatMetadata };
 }
 function fixture() {
   const timeline = createTimeline("chat"); timeline.active = true; timeline.updateMode = "manual";
@@ -41,6 +48,79 @@ function fixture() {
   return { timeline, messages };
 }
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe("current controller connection", () => {
+  const requests: FrontendToBackend[] = [
+    { type: "start_tidy", chatId: "chat", requestId: "tidy", actorIds: ["character:mira"] },
+    { type: "test_controller", chatId: "chat", requestId: "test", settings: DEFAULT_SETTINGS, target: { connectionId: null, model: null } },
+    { type: "generate_seed", characterId: "mira" },
+    { type: "generate_npc_core", chatId: "chat", requestId: "core", name: "Scout", lore: "A patient scout." },
+    { type: "update_now", chatId: "chat" },
+    { type: "rebuild", chatId: "chat" },
+    { type: "retry", chatId: "chat" },
+    { type: "activate", chatId: "chat", historyMode: "full" },
+  ];
+  it.each(requests)("uses the live profile for $type before any chat generation", async (request) => {
+    const { timeline, messages } = fixture();
+    timeline.updateMode = "immediate";
+    messages.push({ id: "m2", role: "assistant", content: "Mira waits.", index_in_chat: 2 });
+    const host = await backend(timeline, messages);
+    host.permissions.add("characters");
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [], actorMentions: [], changes: [], core: { selfConcept: "A patient scout." }, selfConcept: "A patient scout." }) });
+    await host.receive({ ...request, activeConnectionId: "zai-profile" });
+    expect(host.quiet).toHaveBeenCalled();
+    for (const [call] of host.quiet.mock.calls) expect(call.connection_id).toBe("zai-profile");
+  });
+
+  it.each([
+    { active: "new-profile", pin: undefined, expected: "new-profile" },
+    { active: "new-profile", pin: "pinned-profile", expected: "pinned-profile" },
+    { active: "new-profile", pin: "deleted", expected: "new-profile" },
+    { active: "deleted", pin: undefined, expected: "default" },
+    { active: null, pin: undefined, expected: "default" },
+    { active: undefined, pin: undefined, expected: "old-profile" },
+  ])("uses $expected instead of the last generation ($active, $pin)", async ({ active, pin, expected }) => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    await host.receive({ type: "ready", chatId: "chat" });
+    await host.intercept(messages, { chatId: "chat", connectionId: "old-profile" });
+    host.permissions.add("chats");
+    host.chatMetadata.connection_profile_id = pin;
+    host.connections.get.mockImplementation(async (id) => id === "deleted" ? null : { provider: "openrouter", model: "test-model" });
+    // A connection switch must reach background work, not just button clicks.
+    await host.receive({ type: "connection_context", activeConnectionId: active });
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [] }) });
+    await host.receive(requests[0]);
+    expect(host.quiet.mock.calls[0][0].connection_id).toBe(expected);
+  });
+
+  it("keeps a dedicated controller and its explicit fallback ahead of active and pinned connections", async () => {
+    const { timeline, messages } = fixture();
+    const host = await backend(timeline, messages, { controllerConnectionId: "dedicated", controllerFallbacks: [{ connectionId: "backup", model: null }] });
+    host.permissions.add("chats"); host.chatMetadata.connection_profile_id = "pinned";
+    host.quiet.mockRejectedValueOnce(new Error("down")).mockResolvedValue({ content: JSON.stringify({ proposals: [] }) });
+    await host.receive({ ...requests[0], activeConnectionId: "active" });
+    expect(host.quiet.mock.calls.map(([call]) => call.connection_id)).toEqual(["dedicated", "backup"]);
+  });
+
+  it("does not share the active selection across users", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    await host.receive({ type: "connection_context", activeConnectionId: "other-user-profile" }, "other-user");
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [] }) });
+    await host.receive(requests[0]);
+    expect(host.quiet.mock.calls[0][0].connection_id).toBe("default");
+  });
+
+  it("uses the current connection for scheduled repair", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    await host.receive({ type: "repair_preview", chatId: "chat", requestId: "preview", activeConnectionId: "old" });
+    const response = host.sent.find((message) => message.type === "repair_preview_result");
+    if (response?.type !== "repair_preview_result") throw new Error("Missing preview");
+    await host.receive({ type: "repair_analysis", chatId: "chat", requestId: "repair", revision: response.preview.revision, fingerprint: response.preview.fingerprint, activeConnectionId: "new" });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(host.quiet).toHaveBeenCalled();
+    expect(host.quiet.mock.calls[0][0].connection_id).toBe("new");
+  });
+});
 
 describe("v0.3 backend flows", () => {
   it("repairs a chosen later range despite an earlier warning, and retries only that range after failure", async () => {

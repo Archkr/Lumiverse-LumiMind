@@ -21,6 +21,14 @@ const analyze = (extra = {}) => analyzeMessages({ messages, recentContext: [], c
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("controller fallbacks", () => {
+  it("uses an available profile when no active or default connection exists", async () => {
+    const quiet = vi.fn().mockResolvedValue(response(valid));
+    const spindle = host(quiet);
+    Object.assign(spindle.connections, { list: vi.fn(async () => [{ id: "available", provider: "openrouter", model: "available-default", is_default: false }]) });
+    await analyze({ settings: { ...DEFAULT_SETTINGS } });
+    expect(quiet.mock.calls[0][0].connection_id).toBe("available");
+  });
+
   it("times out an unresponsive primary, releases its slot, and uses the backup", async () => {
     vi.useFakeTimers();
     const quiet = vi.fn().mockImplementationOnce(() => new Promise(() => {})).mockResolvedValue(response(valid));

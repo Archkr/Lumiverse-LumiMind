@@ -113,6 +113,7 @@ const updateNowRequests = new Set<string>();
 const generationContexts = new Map<string, GenerationContext>();
 const latestGenerationByChat = new Map<string, GenerationContext>();
 const connectionByChat = new Map<string, string>();
+const activeConnectionByUser = new Map<string, string | null>();
 const controllerDebugResponses = new Map<string, Array<{
   batchId: string;
   capturedAt: string;
@@ -316,6 +317,28 @@ async function listConnections(userId: string): Promise<ConnectionOption[]> {
     isDefault: connection.is_default,
     hasApiKey: connection.has_api_key,
   }));
+}
+
+async function currentChatConnectionId(userId: string, chatId?: string | null, override?: string | null, signal?: AbortSignal): Promise<string | null> {
+  if (override?.trim()) return override.trim();
+  // Match main chat routing: a live chat pin wins over the active profile.
+  if (chatId && hasPermission("chats") && hasPermission("generation")) {
+    const chat = await controllerRequest(() => spindle.chats.get(chatId, userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Chat connection lookup");
+    const pinnedId = typeof chat?.metadata?.connection_profile_id === "string" ? chat.metadata.connection_profile_id.trim() : "";
+    if (pinnedId) {
+      const pinned = await controllerRequest(() => spindle.connections.get(pinnedId, userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup");
+      if (pinned) return pinnedId;
+    }
+  }
+  // A reported null clears the selection; never resurrect a stale generation.
+  if (activeConnectionByUser.has(userId)) {
+    const id = activeConnectionByUser.get(userId);
+    if (!id) return null;
+    const active = await controllerRequest(() => spindle.connections.get(id, userId), signal, CONTROLLER_LOOKUP_TIMEOUT_MS, "Connection lookup");
+    return active ? id : null;
+  }
+  // Compatibility for hosts without the frontend connections API.
+  return chatId ? connectionByChat.get(cacheKey(userId, chatId)) ?? null : null;
 }
 
 async function buildFrontendState(userId: string, requestedChatId?: string | null, characterId?: string | null): Promise<FrontendState> {
@@ -735,7 +758,7 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
         compactState: compactStateForController(timeline, settings),
         settings,
         userId,
-        fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+        fallbackConnectionId: await currentChatConnectionId(userId, chatId, settings.controllerConnectionId, abortController.signal),
         signal: abortController.signal,
         onProgress: (phase) => {
           const progress = { phase, startMessageIndex: start, endMessageIndex: start + batch.length - 1, totalMessages: derivation.messages.length };
@@ -904,7 +927,7 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
           history,
           settings,
           userId,
-          fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
+          fallbackConnectionId: await currentChatConnectionId(userId, chatId, settings.controllerConnectionId, abortController.signal),
           signal: abortController.signal,
           onRun: (run) => send({ type: "controller_run", run }, userId),
         });
@@ -1215,6 +1238,10 @@ spindle.permissions.onChanged(() => {
 spindle.onFrontendMessage(async (payload, userId) => {
   lastFrontendUserId = userId;
   const message = payload as FrontendToBackend;
+  if (message.activeConnectionId === null || typeof message.activeConnectionId === "string") {
+    activeConnectionByUser.set(userId, message.activeConnectionId?.trim() || null);
+  }
+  if (message.type === "connection_context") return;
   const chatId = "chatId" in message ? message.chatId ?? null : null;
   const characterId = "characterId" in message ? message.characterId ?? null : null;
   if (chatId) rememberChatUser(chatId, userId);
@@ -1234,7 +1261,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const target = { connectionId: typeof message.target.connectionId === "string" ? message.target.connectionId : null,
           model: typeof message.target.model === "string" ? message.target.model : null };
         const result = await testController({ target, settings, userId,
-          fallbackConnectionId: message.chatId ? connectionByChat.get(cacheKey(userId, message.chatId)) : null });
+          fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, target.connectionId) });
         send({ type: "test_controller_result", requestId: message.requestId, result }, userId);
       } else if (message.type === "repair_preview") {
         if (!hasPermission("chat_mutation")) throw new Error("Chat history permission is required to preview repair.");
@@ -1267,7 +1294,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const current = await projectInjection({ timeline, settings, permissions: currentPermissions(), targetActorId,
           impersonate: !!targetActorId && timeline.actors[targetActorId]?.kind === "persona",
           context: limitChatHistoryMessages(messages.map((entry) => ({ ...entry, __isChatHistory: true })), settings.chatHistoryMessageLimit),
-          countTokens: await tokenCounterForConnection(userId, connectionByChat.get(cacheKey(userId, message.chatId)) ?? null) });
+          countTokens: await tokenCounterForConnection(userId, await currentChatConnectionId(userId, message.chatId)) });
         send({ type: "injection_preview_result", requestId: message.requestId, chatId: message.chatId,
           current, last: lastInjections.get(cacheKey(userId, message.chatId)) ?? null }, userId);
       }
@@ -1416,8 +1443,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!hasPermission("characters") || !hasPermission("generation")) throw new Error("Character and generation permissions are required to draft a seed.");
       const character = await spindle.characters.get(message.characterId, userId);
       if (!character) throw new Error("Character card not found.");
-      const seed = await generateSeedDraft({ character, settings: await getSettings(userId), userId,
-        fallbackConnectionId: chatId ? connectionByChat.get(cacheKey(userId, chatId)) : null,
+      const settings = await getSettings(userId);
+      const seed = await generateSeedDraft({ character, settings, userId,
+        fallbackConnectionId: await currentChatConnectionId(userId, chatId, settings.controllerConnectionId),
         onRun: (run) => send({ type: "controller_run", run }, userId) });
       send({ type: "seed_draft", characterId: message.characterId, seed }, userId);
       return;
@@ -1436,12 +1464,13 @@ spindle.onFrontendMessage(async (payload, userId) => {
         ? composeNpcCoreLore(cortexSource.description, cortexSource.facts, message.lore ?? "")
         : composeNpcCoreLore("", [], message.lore ?? "");
       if (!lore) throw new Error("Provide NPC lore, or choose a Cortex character with a description or facts.");
+      const settings = await getSettings(userId);
       const core = await generateNpcCoreDraft({
         actorName,
         lore,
-        fallbackConnectionId: connectionByChat.get(cacheKey(userId, message.chatId)),
+        fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, settings.controllerConnectionId),
         onRun: (run) => send({ type: "controller_run", run }, userId),
-        settings: await getSettings(userId),
+        settings,
         userId,
       });
       send({ type: "npc_core_draft", requestId: message.requestId, chatId: message.chatId, ...(actor ? { actorId: actor.id } : {}), core }, userId);
