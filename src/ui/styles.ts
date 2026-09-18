@@ -283,9 +283,12 @@ export const LUMI_MIND_CSS = `
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
 .lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
 .lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
-.lm-tidy-review { gap:9px; }
-.lm-tidy-proposal { display:grid; grid-template-columns:auto minmax(0,1fr); gap:9px; align-items:start; padding:10px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); cursor:pointer; }
-.lm-tidy-proposal input { margin-top:3px; accent-color:var(--lm-accent); }
+.lm-tidy-review { display:flex; flex-direction:column; gap:14px; }
+.lm-tidy-proposal { display:flex; flex-direction:column; gap:10px; padding:12px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); }
+.lm-tidy-proposal[data-decision="approve"] { border-color:var(--lm-success); }
+.lm-tidy-proposal[data-decision="decline"] { border-color:var(--lm-dim); }
+.lm-tidy-decisions .lm-button[aria-pressed="true"] { background:var(--lm-accent); color:var(--lm-accent-fg); border-color:var(--lm-accent); }
+.lm-feature-modal .lm-tidy-decisions { margin-bottom:0; }
 .lm-tidy-proposal-copy { display:flex; flex-direction:column; gap:3px; min-width:0; }
 .lm-tidy-proposal-copy strong { font-size:10px; text-transform:capitalize; }
 .lm-tidy-proposal-copy p { color:var(--lm-text); font-size:10px; line-height:1.45; overflow-wrap:anywhere; }

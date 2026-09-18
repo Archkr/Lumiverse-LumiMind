@@ -115,10 +115,10 @@ describe("controller fallbacks", () => {
   it("uses backups for invalid Tidy output and accepts an empty valid proposal list", async () => {
     const quiet = vi.fn().mockResolvedValueOnce(response({ proposals: [{ bad: true }] })).mockResolvedValue(response({ proposals: [] })); host(quiet);
     const actor = upsertActor(createTimeline("chat"), { name: "Mira", kind: "npc" });
-    expect(await generateMindTidyProposals({ actor, mind: makeBaseMind(actor.id), knownActors: [actor], recentContext: [], settings, userId: "fallback-test" })).toEqual([]);
+    expect(await generateMindTidyProposals({ actor, mind: makeBaseMind(actor.id), knownActors: [actor], history: [], settings, userId: "fallback-test" })).toEqual([]);
     expect(quiet).toHaveBeenCalledTimes(2);
     quiet.mockClear();
-    await expect(generateMindTidyProposals({ actor, mind: makeBaseMind(actor.id), knownActors: [actor], recentContext: [], settings: { ...settings, analysisStateTokenBudget: 1 }, userId: "fallback-test" })).rejects.toThrow("above");
+    await expect(generateMindTidyProposals({ actor, mind: makeBaseMind(actor.id), knownActors: [actor], history: [], settings: { ...settings, analysisStateTokenBudget: 1 }, userId: "fallback-test" })).rejects.toThrow("above");
     expect(quiet).not.toHaveBeenCalled();
   });
 

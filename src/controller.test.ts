@@ -912,7 +912,7 @@ describe("Mind Tidy proposals", () => {
       actor,
       mind,
       knownActors: [actor],
-      recentContext: [{ id: "m2", role: "assistant", content: "The gate shudders under an impact." }],
+      history: [{ id: "m2", role: "assistant", content: "The gate shudders under an impact." }],
       settings: { ...DEFAULT_SETTINGS, analysisStateTokenBudget: 0 },
       userId: "user",
     });

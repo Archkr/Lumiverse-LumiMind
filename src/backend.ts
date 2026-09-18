@@ -4,6 +4,7 @@ import type { CharacterDTO, PersonaDTO } from "lumiverse-spindle-types";
 import { analyzeMessages, composeNpcCoreLore, generateMindTidyProposals, generateNpcCoreDraft, generateSeedDraft, isAbortError, getLastControllerRun, testController } from "./controller";
 import { projectInjection } from "./injection";
 import { beginRepair, previewRepair } from "./repair";
+import { selectTidyHistory, tidyHistoryFingerprint, tidyHistoryScope, tidyApprovalsConflict } from "./tidy";
 import { mapWithConcurrency } from "./controller-scheduling";
 import {
   DEFAULT_SETTINGS,
@@ -98,6 +99,8 @@ const analysisProgress = new Map<string, AnalysisProgress>();
 const analysisAbortControllers = new Map<string, AbortController>();
 const tidyAbortControllers = new Map<string, { chatId: string; controller: AbortController }>();
 const tidyResults = new Map<string, {
+  historyFingerprint: string;
+  historyLimit: number;
   userId: string;
   chatId: string;
   baseRevision: number;
@@ -878,8 +881,9 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
     });
   }
   const completedMessages = selectCompletedAssistantTranscript(await getChatMessages(chatId, userId));
-  const recentLimit = Math.max(0, Math.floor(settings.analysisContextMessageLimit));
-  const recentContext = recentLimit > 0 ? completedMessages.slice(-recentLimit) : [];
+  const history = selectTidyHistory(completedMessages, settings.chatHistoryMessageLimit);
+  const historyFingerprint = tidyHistoryFingerprint(completedMessages);
+  const historyScope = tidyHistoryScope(history, settings.chatHistoryMessageLimit);
   const abortController = new AbortController();
   tidyAbortControllers.set(requestKey, { chatId, controller: abortController });
   const proposals: MindTidyProposal[] = [];
@@ -897,7 +901,7 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
           actor: snapshot.actor,
           mind: snapshot.mind,
           knownActors,
-          recentContext,
+          history,
           settings,
           userId,
           fallbackConnectionId: connectionByChat.get(cacheKey(userId, chatId)) ?? null,
@@ -924,8 +928,9 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
       proposals.push(...outcome.proposals);
       if (outcome.error) errors.push(outcome.error);
     }
-    tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, expiresAt: Date.now() + 15 * 60_000 });
-    send({ type: "tidy_result", requestId, chatId, baseRevision, proposals, errors }, userId);
+    abortController.signal.throwIfAborted();
+    tidyResults.set(requestKey, { userId, chatId, baseRevision, proposals, historyFingerprint, historyLimit: settings.chatHistoryMessageLimit, expiresAt: Date.now() + 15 * 60_000 });
+    send({ type: "tidy_result", requestId, chatId, baseRevision, history: historyScope, proposals, errors }, userId);
   } catch (error) {
     if (isAbortError(error)) {
       send({ type: "tidy_cancelled", requestId, chatId }, userId);
@@ -1480,14 +1485,25 @@ spindle.onFrontendMessage(async (payload, userId) => {
         tidyResults.delete(requestKey);
         throw new Error("That tidy review expired. Run tidy again.");
       }
+      const approvedIds = new Set(message.proposalIds);
+      if ([...approvedIds].some((id) => !cached.proposals.some((proposal) => proposal.id === id))) throw new Error("Unknown tidy proposal. Run Tidy again.");
+      const approved = cached.proposals.filter((proposal) => approvedIds.has(proposal.id));
+      if (tidyApprovalsConflict(approved)) throw new Error("Conflicting approvals affect the same entry or core. Approve only one of those suggestions.");
       let applied = 0;
-      await enqueue(userId, message.chatId, async () => {
+      if (approved.length) await enqueue(userId, message.chatId, async () => {
+        if (!hasPermission("chat_mutation")) throw new Error("Chat history permission is required to apply Tidy edits.");
         const timeline = await getTimeline(message.chatId, userId);
         if (timeline.revision !== cached.baseRevision) throw new Error("This timeline changed after the tidy scan. Run tidy again before applying changes.");
-        const selected = new Set(message.proposalIds);
-        applied = applyMindTidyProposals(timeline, cached.proposals.filter((proposal) => selected.has(proposal.id)));
-        const messages = hasPermission("chat_mutation") ? await getChatMessages(message.chatId, userId).catch(() => []) : [];
-        rebuildTimeline(timeline, selectCompletedAssistantTranscript(messages));
+        const settings = await getSettings(userId);
+        const messages = selectCompletedAssistantTranscript(await getChatMessages(message.chatId, userId));
+        if (settings.chatHistoryMessageLimit !== cached.historyLimit || tidyHistoryFingerprint(messages) !== cached.historyFingerprint) {
+          throw new Error("The reviewed chat history or Chat history setting changed. Run Tidy again before applying edits.");
+        }
+        const updated = cloneJson(timeline);
+        applied = applyMindTidyProposals(updated, approved);
+        if (applied !== approved.length) throw new Error("Some approved entries are no longer available. Run Tidy again.");
+        rebuildTimeline(updated, messages);
+        Object.assign(timeline, updated);
         await persistAndPublish(timeline, userId);
       });
       tidyResults.delete(requestKey);

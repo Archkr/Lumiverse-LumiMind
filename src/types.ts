@@ -111,6 +111,13 @@ export interface MindTidyActorError {
   message: string;
 }
 
+export interface TidyHistoryScope {
+  messageCount: number;
+  startMessageIndex: number | null;
+  endMessageIndex: number | null;
+  limit: number;
+}
+
 export interface ActorMentionDelta {
   ref: string;
   name: string;
@@ -468,7 +475,7 @@ export type BackendToFrontend =
   | { type: "npc_created"; requestId: string; chatId: string; actorId: string }
   | { type: "npc_create_error"; requestId: string; chatId: string; message: string }
   | { type: "tidy_progress"; requestId: string; chatId: string; completed: number; total: number; actorId: string }
-  | { type: "tidy_result"; requestId: string; chatId: string; baseRevision: number; proposals: MindTidyProposal[]; errors: MindTidyActorError[] }
+  | { type: "tidy_result"; requestId: string; chatId: string; baseRevision: number; history: TidyHistoryScope; proposals: MindTidyProposal[]; errors: MindTidyActorError[] }
   | { type: "tidy_applied"; requestId: string; chatId: string; applied: number }
   | { type: "tidy_cancelled"; requestId: string; chatId: string }
   | { type: "tidy_error"; requestId: string; chatId: string; message: string }

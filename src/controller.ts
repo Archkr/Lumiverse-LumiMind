@@ -1158,13 +1158,15 @@ export function composeNpcCoreLore(description: string, facts: string[], notes =
 }
 
 const TIDY_SYSTEM_PROMPT = [
-  "You review one actor's complete current LumiMind checkpoint and return optional cleanup proposals for explicit human approval.",
+  "Compare one actor's complete current LumiMind checkpoint against the supplied committed chat history and return all warranted edits as separate proposals for explicit human approval.",
   "Call the required result tool exactly once. Do not directly rewrite state and do not propose identity, alias, actor-merge, or Cortex-link changes.",
   "Use replace_core only for a complete improved enduring core; do not place temporary scene state in the core.",
   "Use add_item for strongly supported missing state, update_item for one existing entry, merge_items for two or more semantic duplicates, and remove_items only for entries that should not remain in the ledger.",
   "A status change or category correction is an update_item. Copy actor and item IDs exactly. Preserve target, concealment, intensity, and dimensions unless the evidence supports changing them.",
   "Locked, manual, seed, and pinned entries may be flagged because a human will review every proposal, but explain clearly why changing protected material is warranted.",
-  "Use the stored evidence and recent context only. Do not infer unsupported events or claim that this is a full-history audit.",
+  "Read the supplied history chronologically and compare its latest supported state against every current entry and the core. Find missing, outdated, contradictory, mislabeled, and duplicate state. Mark achieved goals resolved, renounced plans abandoned, and evolved state updated rather than deleted.",
+  "The history is selected using the user's Chat history setting: 0 means all committed history, otherwise only the latest N messages. Use its stated scope and stored evidence; do not infer unsupported events or treat absence from a limited window as proof an entry is wrong.",
+  "Return independently applicable, non-overlapping proposals. Do not propose multiple competing edits to the same entry or core. Explain the evidence and relevant message numbers in each rationale. No edit will be applied until the user approves it.",
 ].join("\n");
 
 function normalizeTidyItem(value: unknown, knownActorIds: Set<string>): MindTidyItemDraft | null {
@@ -1197,7 +1199,7 @@ async function generateMindTidyProposalsOnce(input: {
   actor: ActorRecord;
   mind: ActorMind;
   knownActors: ActorRecord[];
-  recentContext: ChatMessageLike[];
+  history: ChatMessageLike[];
   settings: LumiMindSettings;
   userId: string;
   fallbackConnectionId?: string | null;
@@ -1228,8 +1230,8 @@ async function generateMindTidyProposalsOnce(input: {
   const prompt = [
     "Actor registry and complete current checkpoint:",
     `<tidy_state>\n${stateJson}\n</tidy_state>`,
-    "Recent committed context (supporting context only):",
-    `<recent_context>\n${renderMessages(input.recentContext)}\n</recent_context>`,
+    `Review history: ${input.history.length} committed messages; Chat history setting: ${input.settings.chatHistoryMessageLimit === 0 ? "all committed history" : `latest ${input.settings.chatHistoryMessageLimit} messages`}. Message index attributes are zero-based; cite index + 1 as the message number in rationales.`,
+    `<chat_history>\n${renderMessages(input.history)}\n</chat_history>`,
     "Return only meaningful proposals. An empty proposals array is correct when the checkpoint is already coherent.",
   ].join("\n\n");
   const result = await quietJson(

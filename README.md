@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.3.3` hardens background state operations: existing state can be updated, resolved, or abandoned, while permanent deletion requires manual editing or Tidy approval. Invalid operations receive at most one corrective pass per connection, and Diagnostics reports emitted and accepted operation counts. Existing analysis remains compatible without a rebuild.
+LumiMind `0.3.3` hardens background state operations: existing state can be updated, resolved, or abandoned, while permanent deletion requires manual editing or Tidy approval. Invalid operations receive at most one corrective pass per connection, and Diagnostics reports emitted and accepted operation counts. Tidy also compares current minds against the history selected by **Chat history messages**, with individual **Approve** and **Decline** decisions before **Send** applies approved edits. Existing analysis remains compatible without a rebuild.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -229,7 +229,7 @@ Mind Lens is LumiMind’s main drawer interface.
 - Review core self-concept, values, desires, fears, and boundaries.
 - Add local or Cortex-linked NPCs before the story detects them. LumiMind drafts the enduring core first and creates the actor only after you save the reviewed core.
 - Generate an editable core for every timeline NPC, including Cortex imports. Cortex descriptions and facts can supply the source lore, with optional user notes; core changes stay timeline-local.
-- Run **Tidy selected** or **Tidy all** to review missing, mislabeled, outdated, duplicate, or inconsistent state. Tidy proposals show before/after details, rationale, and confidence, and never change anything until you apply selected items.
+- Run **Tidy selected** or **Tidy all** to review missing, mislabeled, outdated, duplicate, or inconsistent state. Tidy compares against the history selected by **Chat history messages** and shows before/after details, rationale, and confidence. Choose **Approve** or **Decline** for each edit, then **Send** to apply only approved edits.
 - Inspect beliefs, secrets, goals, plans, emotions, relationships, and awareness.
 - See confidence, evidence, source message, and swipe provenance.
 - Add or edit state manually; user-authored entries are locked and pinned by default.
@@ -370,7 +370,7 @@ LumiMind settings are user-scoped and apply across chats.
 | Analysis state tokens | `24,000` | Target token budget for unresolved mind entries sent to the controller. Actor registry stubs are always retained; `0` sends all unresolved state. |
 | Private injection tokens | `8,000` | Target token budget for state added to a roleplay prompt. All stored state remains in the timeline and Mind Lens; `0` injects all eligible state. |
 | Analysis context messages | `4` | Maximum number of earlier transcript messages supplied as context for each analysis batch; `0` disables prior-message context. |
-| Chat history messages | Unlimited | Maximum number of stored chat messages retained in the main generation prompt and the optional recent range offered on first activation; `0` keeps the full history. |
+| Chat history messages | Unlimited | Maximum chat messages used in roleplay prompts, Tidy reviews, and the optional recent range on first activation. For Tidy, a positive value selects the latest N committed messages; `0` includes all committed history. |
 
 LumiMind does not cap controller output. Model and provider limits still apply. The state-token, injection-token, analysis-context, and chat-history settings have no maximum value.
 
@@ -438,7 +438,11 @@ With three backups, one analysis operation is bounded to four connections and at
 
 Initial history is analyzed in batches of up to six committed messages. A 600-message full-history activation can therefore require roughly 100 controller calls; choosing configured-recent history intentionally checkpoints the older prefix without analyzing or deleting it. You can pause a timeline whenever you do not want background analysis costs.
 
-Mind Tidy is always explicit and review-first. It makes one primary request per selected actor, plus configured backup attempts on failure, with up to **Parallel requests** calls in flight at once and the configured **Requests per minute** cap shared across the provider. **Tidy all** confirms the request count before it starts and exposes progress and cancellation. Each request includes that actor's complete folded core, stored entries and statuses, stored evidence, the actor registry, and only the configured recent analysis context. It never sends the full transcript as a hidden re-analysis. Proposals expire after 15 minutes and are rejected if the timeline changed before application.
+Mind Tidy compares the current stored minds with the committed chat history selected by **Chat history messages**. A positive value reviews the latest N messages; `0` reviews all committed history. It does not use the smaller **Analysis context messages** setting. Each actor's request includes its complete folded core, stored entries and statuses, stored evidence, the actor registry, and the selected history in chronological order. A limited history window is not evidence that an older entry is wrong.
+
+Use **Tidy selected** or **Tidy all** to start a review. The popup shows the history range, every suggested edit, its rationale, and the full before/after state. Each proposal starts undecided: choose **Approve** or **Decline** for every row, then click **Send**. Only approved edits are applied, without another controller request. Closing the popup or declining everything changes nothing. Accepted entry edits become locked manual overrides, and core edits stay timeline-local. Competing edits to the same entry or core cannot both be approved.
+
+Tidy makes one primary request per actor plus configured backup attempts, respecting **Parallel requests**, **Requests per minute**, and request timeouts. **Tidy all** confirms the scope before starting; progress and cancellation remain available. Large or unlimited histories must fit the selected model's context window; reduce **Chat history messages** if the provider rejects the request. The history is not silently truncated. Proposals expire after 15 minutes and cannot be applied after the chat, saved state, or Chat history setting changes.
 
 The prompt interceptor itself makes **no model call**. It reads the latest valid checkpoint, counts tokens with the selected generation model's tokenizer, and injects a relevance-ranked projection in one system message at the configured prompt position. Target and context-relevant actors receive priority, while every present managed actor keeps a heading. Self-concept is retained for analysis and review but omitted from this generation-time block to avoid repeating the character card. Prompt Breakdown attributes the block as **LumiMind — Private Mind**.
 
@@ -482,7 +486,7 @@ LumiMind does **not** claim cryptographic secrecy. Anyone with direct access to 
 
 ### Controller data
 
-The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, all actor registry stubs, and the highest-ranked unresolved state that fits the analysis-state token budget. A budget of `0` sends all unresolved state. A user-started Tidy request instead sends one selected actor's complete folded core and stored state, including evidence, plus only that configured recent context. Treat that connection with the same privacy expectations as any model connection used for chat.
+The selected controller receives up to the configured number of previous transcript messages, the current analysis batch, all actor registry stubs, and the highest-ranked unresolved state that fits the analysis-state token budget. A budget of `0` sends all unresolved state. A user-started Tidy request sends one selected actor's complete folded core and stored state, including evidence, plus the committed history selected by **Chat history messages** (`0` means all committed history). Treat that connection with the same privacy expectations as any model connection used for chat.
 
 Diagnostics store counts, lengths, hashes, provider metadata, warning codes, and sanitized rejection reason codes—not raw controller responses or private story content.
 

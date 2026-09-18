@@ -551,9 +551,12 @@ var LUMI_MIND_CSS = `
 .lm-capability.granted .lm-capability-dot { background:var(--lm-success); }
 .lm-diagnostics-card { background:linear-gradient(135deg,color-mix(in srgb,var(--lm-accent) 5%,var(--lm-panel)),var(--lm-panel)); }
 .lm-diagnostics-safe-note { padding:7px 8px; border:1px solid color-mix(in srgb,var(--lm-success) 22%,var(--lm-line)); border-radius:7px; color:var(--lm-muted); background:color-mix(in srgb,var(--lm-success) 6%,transparent); font-size:9px; }
-.lm-tidy-review { gap:9px; }
-.lm-tidy-proposal { display:grid; grid-template-columns:auto minmax(0,1fr); gap:9px; align-items:start; padding:10px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); cursor:pointer; }
-.lm-tidy-proposal input { margin-top:3px; accent-color:var(--lm-accent); }
+.lm-tidy-review { display:flex; flex-direction:column; gap:14px; }
+.lm-tidy-proposal { display:flex; flex-direction:column; gap:10px; padding:12px; border:1px solid var(--lm-line); border-radius:var(--lm-radius); background:var(--lm-fill); }
+.lm-tidy-proposal[data-decision="approve"] { border-color:var(--lm-success); }
+.lm-tidy-proposal[data-decision="decline"] { border-color:var(--lm-dim); }
+.lm-tidy-decisions .lm-button[aria-pressed="true"] { background:var(--lm-accent); color:var(--lm-accent-fg); border-color:var(--lm-accent); }
+.lm-feature-modal .lm-tidy-decisions { margin-bottom:0; }
 .lm-tidy-proposal-copy { display:flex; flex-direction:column; gap:3px; min-width:0; }
 .lm-tidy-proposal-copy strong { font-size:10px; text-transform:capitalize; }
 .lm-tidy-proposal-copy p { color:var(--lm-text); font-size:10px; line-height:1.45; overflow-wrap:anywhere; }
@@ -634,6 +637,20 @@ var LUMI_MIND_CSS = `
   .lm-root *, .lm-root *::before, .lm-root *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }
 `;
+
+// src/tidy.ts
+function tidyApprovalsConflict(proposals) {
+  const affected = /* @__PURE__ */ new Set();
+  for (const proposal of proposals) {
+    const targets = proposal.operation === "replace_core" ? ["core"] : proposal.targetItemIds.map((id) => `item:${id}`);
+    for (const target of targets) {
+      const key = JSON.stringify([proposal.actorId, target]);
+      if (affected.has(key)) return true;
+      affected.add(key);
+    }
+  }
+  return false;
+}
 
 // src/diagnostics.ts
 function credentialField(key) {
@@ -781,6 +798,7 @@ function setup(ctx) {
   let tidyRunning = null;
   let tidyReviewModal = null;
   let tidyReviewRequestId = null;
+  let tidyReviewRefresh = null;
   let settingsRevision = 0;
   let settingsSaving = false;
   let settingsSavePromise = null;
@@ -1858,67 +1876,112 @@ function setup(ctx) {
   function tidyBeforeAfter(proposal) {
     const mind = currentState?.timeline?.minds[proposal.actorId];
     if (proposal.operation === "replace_core") {
-      const summarize = (core) => core ? [core.selfConcept, ...core.values, ...core.desires, ...core.fears, ...core.boundaries, ...core.notes].filter(Boolean).join(" \xB7 ") || "Empty core" : "Empty core";
+      const summarize = (core) => core ? Object.entries(core).map(([key, value]) => `${key === "selfConcept" ? "Self concept" : key.charAt(0).toUpperCase() + key.slice(1)}: ${Array.isArray(value) ? value.join("; ") || "None" : value || "None"}`).join("\n") : "Empty core";
       return { before: summarize(mind?.core), after: summarize(proposal.core) };
     }
-    const affected = proposal.targetItemIds.map((itemId) => mind?.items.find((item) => item.id === itemId)).filter((item) => !!item).map((item) => `${categoryLabel(item.category)} \xB7 ${item.status} \xB7 ${item.text}`);
-    const after = proposal.item ? `${categoryLabel(proposal.item.category)} \xB7 ${proposal.item.status} \xB7 ${proposal.item.text}` : proposal.operation === "remove_items" ? "Removed" : "No replacement";
+    const formatItem = (item) => {
+      const names = (ids) => ids.map((id) => currentState?.timeline?.actors.find((actor) => actor.id === id)?.canonicalName ?? id).join(", ") || "None";
+      return `${categoryLabel(item.category)} \xB7 ${item.status} \xB7 ${item.text}
+Targets: ${names(item.targetActorIds)}
+Concealed from: ${names(item.concealedFromActorIds)}
+Intensity: ${item.intensity ?? "None"} \xB7 Dimensions: ${Object.entries(item.dimensions).map(([key, value]) => `${key}: ${value}`).join(", ") || "None"}`;
+    };
+    const affected = proposal.targetItemIds.map((itemId) => mind?.items.find((item) => item.id === itemId)).filter((item) => !!item).map(formatItem);
+    const after = proposal.item ? formatItem(proposal.item) : proposal.operation === "remove_items" ? "Removed" : "No replacement";
     return {
       before: affected.length ? affected.join("\n") : "Missing entry",
       after
     };
   }
-  function showTidyReview(requestId, proposals, errors) {
+  function showTidyReview(review) {
     tidyReviewModal?.dismiss();
+    const { requestId, chatId, baseRevision, proposals, errors, history } = review;
     const modal = ctx.ui.showModal({ title: "Review Mind Tidy", width: 760, maxHeight: 820 });
     tidyReviewModal = modal;
     tidyReviewRequestId = requestId;
-    const content = element("div", "lm-modal-form lm-tidy-review");
-    content.appendChild(element("div", "lm-seed-hint", "Nothing changes until you apply selected findings. Accepted entry changes become locked manual overrides; core changes remain timeline-local."));
-    const selected = /* @__PURE__ */ new Set();
+    const content = element("div", "lm-root lm-feature-modal lm-tidy-review");
+    content.appendChild(element("p", "lm-view-copy", history.messageCount ? `Compared current minds with ${history.messageCount.toLocaleString()} committed messages (${history.startMessageIndex + 1}\u2013${history.endMessageIndex + 1}), using your saved Chat history setting.` : "Reviewed current minds and their stored evidence. No committed chat messages were available."));
+    content.appendChild(element("p", "lm-view-copy", "Approve or decline each suggested edit, then click Send. Nothing changes before sending. Approved entry edits become locked manual corrections; core edits stay in this timeline."));
+    const decisions = /* @__PURE__ */ new Map();
+    const decisionButtons = [];
+    const decisionStatus = element("p", "lm-view-copy");
+    decisionStatus.setAttribute("aria-live", "polite");
+    const apply = element("button", "lm-button lm-button-primary", "Send");
+    apply.type = "button";
+    let sending = false;
+    const approved = () => proposals.filter((proposal) => decisions.get(proposal.id) === "approve");
+    const stale = () => currentState?.activeChatId !== chatId || currentState?.timeline?.revision !== baseRevision || currentState?.settings.chatHistoryMessageLimit !== history.limit;
+    const refresh = () => {
+      const selected = approved();
+      const remaining = proposals.length - decisions.size;
+      const conflict = tidyApprovalsConflict(selected);
+      decisionStatus.textContent = stale() ? "The chat, saved state, or Chat history setting changed. Close this review and run Tidy again." : conflict ? "Two approved suggestions change the same entry or core. Decline one before sending." : `${selected.length} approved \xB7 ${decisions.size - selected.length} declined \xB7 ${remaining} undecided`;
+      apply.disabled = sending || stale() || conflict || remaining > 0 || proposals.length === 0;
+      decisionButtons.forEach((button) => {
+        button.disabled = sending || stale();
+      });
+    };
+    tidyReviewRefresh = refresh;
     for (const proposal of proposals) {
-      selected.add(proposal.id);
-      const row = element("label", "lm-tidy-proposal");
-      const checkbox = element("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = true;
-      checkbox.addEventListener("change", () => checkbox.checked ? selected.add(proposal.id) : selected.delete(proposal.id));
+      const row = element("section", "lm-tidy-proposal");
       const copy = element("div", "lm-tidy-proposal-copy");
       const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === proposal.actorId);
       const comparison = tidyBeforeAfter(proposal);
+      const targets = proposal.targetItemIds.map((id) => currentState?.timeline?.minds[proposal.actorId]?.items.find((item) => item.id === id));
       copy.append(
         element("strong", void 0, `${actor?.canonicalName ?? "Actor"} \xB7 ${proposal.finding}`),
         element("p", void 0, tidyProposalSummary(proposal)),
         element("small", "lm-tidy-value", `Before: ${comparison.before}`),
         element("small", "lm-tidy-value", `After: ${comparison.after}`),
-        element("small", "lm-tidy-affected", `${proposal.targetItemIds.length} affected ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}`),
+        element("small", "lm-tidy-affected", `${proposal.targetItemIds.length} affected ${proposal.targetItemIds.length === 1 ? "entry" : "entries"}${targets.some((item) => item?.locked) ? " \xB7 includes locked state" : ""}`),
         element("small", void 0, `${Math.round(proposal.confidence * 100)}% confidence \xB7 ${proposal.rationale}`)
       );
-      row.append(checkbox, copy);
+      const choices = element("div", "lm-inline-actions lm-tidy-decisions");
+      choices.setAttribute("role", "group");
+      choices.setAttribute("aria-label", `Decision for ${actor?.canonicalName ?? "actor"}: ${proposal.finding}`);
+      const decide = (decision) => {
+        if (sending || stale()) return;
+        decisions.set(proposal.id, decision);
+        row.dataset.decision = decision;
+        approve.setAttribute("aria-pressed", String(decision === "approve"));
+        decline.setAttribute("aria-pressed", String(decision === "decline"));
+        refresh();
+      };
+      const approve = textButton("Approve", () => decide("approve"));
+      const decline = textButton("Decline", () => decide("decline"));
+      approve.setAttribute("aria-pressed", "false");
+      decline.setAttribute("aria-pressed", "false");
+      decisionButtons.push(approve, decline);
+      choices.append(approve, decline);
+      row.append(copy, choices);
       content.appendChild(row);
     }
-    if (!proposals.length) content.appendChild(element("div", "lm-empty-inline", "No cleanup changes were proposed."));
+    if (!proposals.length) content.appendChild(element("div", "lm-empty-inline", "No edits were proposed for the reviewed history."));
     for (const error of errors) {
       const actor = currentState?.timeline?.actors.find((candidate) => candidate.id === error.actorId);
       content.appendChild(element("div", "lm-seed-hint warning", `${actor?.canonicalName ?? "Actor"}: ${error.message}`));
     }
     const actions = element("div", "lm-modal-actions");
-    const apply = element("button", "lm-button lm-button-primary", "Apply selected");
-    apply.type = "button";
-    apply.disabled = proposals.length === 0;
     apply.addEventListener("click", () => {
-      if (!selected.size || !currentState?.timeline) return;
-      apply.disabled = true;
-      apply.textContent = "Applying\u2026";
-      send({ type: "apply_tidy", chatId: currentState.timeline.chatId, requestId, proposalIds: [...selected] });
+      refresh();
+      if (apply.disabled) return;
+      const proposalIds = approved().map((proposal) => proposal.id);
+      sending = true;
+      apply.textContent = "Sending\u2026";
+      refresh();
+      send({ type: "apply_tidy", chatId, requestId, proposalIds });
     });
     actions.append(textButton("Close", () => modal.dismiss()), apply);
-    content.appendChild(actions);
+    content.append(decisionStatus, actions);
     modal.onDismiss(() => {
-      if (tidyReviewModal === modal) tidyReviewModal = null;
+      if (tidyReviewModal === modal) {
+        tidyReviewModal = null;
+        tidyReviewRefresh = null;
+      }
       if (tidyReviewRequestId === requestId) tidyReviewRequestId = null;
     });
     modal.root.appendChild(content);
+    refresh();
   }
   async function startTidy(actorIds, all) {
     const timeline = currentState?.timeline;
@@ -1926,14 +1989,14 @@ function setup(ctx) {
     if (all) {
       const result = await ctx.ui.showConfirm({
         title: `Tidy ${actorIds.length} minds?`,
-        message: `This scans ${actorIds.length} managed ${actorIds.length === 1 ? "actor" : "actors"} with one request each, plus up to ${currentState?.settings.controllerFallbacks.length ?? 0} backup attempts per actor if needed. Your parallel-request and rate limits apply. You can cancel the remaining scan at any time.`,
+        message: `This compares ${actorIds.length} managed ${actorIds.length === 1 ? "mind" : "minds"} against ${currentState?.settings.chatHistoryMessageLimit ? `the latest ${currentState.settings.chatHistoryMessageLimit} committed messages` : "all committed chat history"}, using your saved Chat history setting. Nothing changes until you approve edits and click Send. There is one request per actor, plus up to ${currentState?.settings.controllerFallbacks.length ?? 0} backup attempts per actor if needed. Your parallel-request and rate limits apply. You can cancel the remaining scan at any time.`,
         variant: "warning",
         confirmLabel: "Start tidy"
       });
       if (!result.confirmed) return;
     }
     const requestId = createRequestId();
-    tidyRunning = { requestId, completed: 0, total: actorIds.length };
+    tidyRunning = { requestId, chatId: timeline.chatId, completed: 0, total: actorIds.length };
     render();
     send({ type: "start_tidy", chatId: timeline.chatId, requestId, actorIds });
   }
@@ -1951,7 +2014,7 @@ function setup(ctx) {
       progress.setAttribute("aria-label", `Tidy progress: ${tidyRunning.completed} of ${tidyRunning.total} actors`);
       actions.append(progress, iconButton("close", "Cancel tidy", () => {
         const timeline = currentState?.timeline;
-        if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: timeline.chatId, requestId: tidyRunning.requestId });
+        if (timeline && tidyRunning) send({ type: "cancel_tidy", chatId: tidyRunning.chatId, requestId: tidyRunning.requestId });
       }));
     } else {
       const selected = actors.find((actor) => actor.id === selectedActorId) ?? null;
@@ -2806,7 +2869,7 @@ function setup(ctx) {
         0,
         null,
         1,
-        "Chat messages retained in roleplay prompts. 0 keeps the full history."
+        "Chat messages used in roleplay prompts and Tidy reviews. 0 uses all committed history for Tidy."
       )
     );
     controller.appendChild(numberGrid);
@@ -3167,6 +3230,7 @@ function setup(ctx) {
     if (message.type === "state") {
       if (currentState?.activeChatId !== message.state.activeChatId) closeInjectionPreview?.();
       currentState = message.state;
+      tidyReviewRefresh?.();
       if (!settingsDraft || !settingsDirty) {
         settingsDraft = cloneSettings(message.state.settings);
         settingsDirty = false;
@@ -3219,12 +3283,12 @@ function setup(ctx) {
       else pending.reject(new Error(message.message));
     } else if (message.type === "tidy_progress") {
       if (tidyRunning?.requestId !== message.requestId) return;
-      tidyRunning = { requestId: message.requestId, completed: message.completed, total: message.total };
+      tidyRunning = { requestId: message.requestId, chatId: message.chatId, completed: message.completed, total: message.total };
       render();
     } else if (message.type === "tidy_result") {
       if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
       render();
-      showTidyReview(message.requestId, message.proposals, message.errors);
+      if (currentState?.activeChatId === message.chatId) showTidyReview(message);
     } else if (message.type === "tidy_cancelled") {
       if (tidyRunning?.requestId === message.requestId) tidyRunning = null;
       render();
@@ -3305,7 +3369,7 @@ function setup(ctx) {
     }
     npcCreateRequests.clear();
     if (tidyRunning && currentState?.timeline) {
-      send({ type: "cancel_tidy", chatId: currentState.timeline.chatId, requestId: tidyRunning.requestId });
+      send({ type: "cancel_tidy", chatId: tidyRunning.chatId, requestId: tidyRunning.requestId });
     }
     tidyReviewModal?.dismiss();
     npcCoreGenerating.clear();

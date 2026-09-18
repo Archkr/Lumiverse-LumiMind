@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { addManualItem, createTimeline, DEFAULT_SETTINGS, materializeAnalysisRecords, rebuildTimeline, upsertActor } from "./engine";
-import type { BackendToFrontend, ChatMessageLike, ChatTimelineV1, ControllerBatchTelemetry, FrontendToBackend } from "./types";
+import type { BackendToFrontend, ChatMessageLike, ChatTimelineV1, ControllerBatchTelemetry, FrontendToBackend, LumiMindSettings } from "./types";
 
-async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[]) {
+async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], settings: Partial<LumiMindSettings> = {}) {
   vi.resetModules(); vi.useFakeTimers();
   let receive!: (message: FrontendToBackend, userId: string) => Promise<void>;
   let intercept!: (messages: unknown[], context: unknown) => Promise<unknown>;
-  const stored = new Map<string, unknown>([["timelines/chat.json", structuredClone(timeline)], ["global/settings.json", { ...DEFAULT_SETTINGS, cortexImportEnabled: false }]]);
+  const stored = new Map<string, unknown>([["timelines/chat.json", structuredClone(timeline)], ["global/settings.json", { ...DEFAULT_SETTINGS, cortexImportEnabled: false, ...settings }]]);
   const sent: BackendToFrontend[] = [];
   const permissions = new Set(["generation", "interceptor", "chat_mutation"]);
   const quiet = vi.fn().mockResolvedValue({ content: JSON.stringify({ actorMentions: [], changes: [] }) });
@@ -224,4 +224,127 @@ describe("first activation", () => {
     expect(host.quiet).toHaveBeenCalledTimes(1);
   });
 
+});
+
+
+describe("history-based Tidy review", () => {
+  function proposals(timeline: ChatTimelineV1) {
+    const actorId = "character:mira";
+    return [
+      { actorId, finding: "missing", operation: "add_item", rationale: "Mira decides to leave in the reviewed history.", confidence: 0.9, targetItemIds: [], core: null,
+        item: { category: "goal", text: "Leave the observatory", status: "active", targetActorIds: [], concealedFromActorIds: [], intensity: null, dimensions: {} } },
+      { actorId, finding: "outdated", operation: "remove_items", rationale: "Proposed cleanup of the old secret.", confidence: 0.8, targetItemIds: [timeline.minds[actorId].items[0].id], core: null, item: null },
+    ];
+  }
+  async function scan(host: Awaited<ReturnType<typeof backend>>) {
+    await host.receive({ type: "start_tidy", chatId: "chat", requestId: "tidy", actorIds: ["character:mira"] });
+    const result = host.sent.find((message) => message.type === "tidy_result");
+    if (result?.type !== "tidy_result") throw new Error(JSON.stringify(host.sent.at(-1)));
+    return result;
+  }
+
+  it.each([0, 6, 20])("uses Chat history limit %s independently of Analysis context messages", async (limit) => {
+    const { timeline } = fixture();
+    const transcript: ChatMessageLike[] = Array.from({ length: 8 }, (_, index) => ({ id: `h${index}`, role: "assistant", content: `History marker ${index}`, index_in_chat: index }));
+    transcript.push({ id: "pending", role: "user", content: "Uncommitted trailing user", index_in_chat: 8 });
+    const host = await backend(timeline, transcript, { chatHistoryMessageLimit: limit, analysisContextMessageLimit: 1 });
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [] }) });
+    const result = await scan(host);
+    const expected = limit === 6 ? 6 : 8;
+    expect(result.history).toMatchObject({ messageCount: expected, startMessageIndex: 8 - expected, endMessageIndex: 7, limit });
+    const prompt = host.quiet.mock.calls[0][0].messages[1].content;
+    const history = prompt.split("<chat_history>")[1].split("</chat_history>")[0];
+    expect(history).toContain(`History marker ${8 - expected}`);
+    expect(history).toContain("History marker 7");
+    expect(history).not.toContain("Uncommitted trailing user");
+    if (limit === 6) expect(history).not.toContain("History marker 1");
+    expect(prompt).toContain("Keeps the observatory key.");
+    expect(host.writes).not.toHaveBeenCalled();
+  });
+
+  it("applies only approved proposals as locked corrections, with no extra controller request", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: proposals(timeline) }) });
+    const result = await scan(host);
+    expect(result.proposals).toHaveLength(2);
+    expect(host.writes).not.toHaveBeenCalled();
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: [result.proposals[0].id] });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_applied", applied: 1 });
+    const saved = host.stored.get("timelines/chat.json") as ChatTimelineV1;
+    expect(saved.minds["character:mira"].items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: "Leave the observatory", locked: true }),
+      expect.objectContaining({ text: "Keeps the observatory key." }),
+    ]));
+    expect(host.quiet).toHaveBeenCalledTimes(1);
+  });
+
+  it("declining every proposal changes nothing and consumes the review", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: proposals(timeline) }) });
+    await scan(host);
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: [] });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_applied", applied: 0 });
+    expect(host.writes).not.toHaveBeenCalled();
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: [] });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_error" });
+  });
+
+  it.each(["edit", "swipe", "append", "setting", "revision", "permission", "unknown", "expired"] as const)("rejects a stale or invalid review after %s without applying edits", async (cause) => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages, { chatHistoryMessageLimit: 1 });
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: proposals(timeline) }) });
+    const result = await scan(host);
+    if (cause === "edit") messages[0].content = "Changed outside the selected history window";
+    if (cause === "swipe") messages[1].swipe_id = 2;
+    if (cause === "append") messages.push({ id: "new", role: "assistant", content: "Another completed reply", index_in_chat: 2 });
+    if (cause === "setting") await host.receive({ type: "save_settings", requestId: "settings", patch: { chatHistoryMessageLimit: 2 } });
+    if (cause === "revision") await host.receive({ type: "add_item", chatId: "chat", actorId: "character:mira", category: "goal", text: "A manual edit" });
+    if (cause === "permission") host.permissions.delete("chat_mutation");
+    if (cause === "expired") await vi.advanceTimersByTimeAsync(15 * 60_000 + 1);
+    host.writes.mockClear();
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: [cause === "unknown" ? "not-a-proposal" : result.proposals[0].id] });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_error" });
+    expect(host.writes).not.toHaveBeenCalled();
+  });
+
+  it.each(["entry", "core"])("rejects conflicting %s approvals without partially applying any edits", async (kind) => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    const suggestions = proposals(timeline);
+    const conflicting = kind === "entry" ? suggestions[1] : { ...suggestions[1], operation: "replace_core", targetItemIds: [], core: timeline.minds["character:mira"].core };
+    host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [suggestions[0], conflicting, { ...conflicting, rationale: "A conflicting edit" }] }) });
+    const result = await scan(host);
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: result.proposals.map((proposal) => proposal.id) });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_error", message: expect.stringContaining("Conflicting approvals") });
+    expect(host.writes).not.toHaveBeenCalled();
+  });
+
+  it("cancels an unresponsive scan without producing reviewable edits", async () => {
+    const { timeline, messages } = fixture(); const host = await backend(timeline, messages);
+    host.quiet.mockImplementation(() => new Promise(() => {}));
+    const scanning = host.receive({ type: "start_tidy", chatId: "chat", requestId: "tidy", actorIds: ["character:mira"] });
+    await vi.advanceTimersByTimeAsync(1);
+    await host.receive({ type: "cancel_tidy", chatId: "chat", requestId: "tidy" });
+    await scanning;
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_cancelled" });
+    expect(host.sent.some((message) => message.type === "tidy_result")).toBe(false);
+    expect(host.writes).not.toHaveBeenCalled();
+  });
+
+  it("keeps successful actors reviewable when another actor's request fails", async () => {
+    const { timeline, messages } = fixture();
+    const other = upsertActor(timeline, { id: "rowan", name: "Rowan", kind: "npc" });
+    rebuildTimeline(timeline, messages);
+    const host = await backend(timeline, messages);
+    host.quiet.mockRejectedValueOnce(new Error("Provider unavailable"))
+      .mockResolvedValueOnce({ content: JSON.stringify({ proposals: [{ ...proposals(timeline)[0], actorId: other.id }] }) });
+    await host.receive({ type: "start_tidy", chatId: "chat", requestId: "tidy", actorIds: ["character:mira", other.id] });
+    const result = host.sent.find((message) => message.type === "tidy_result");
+    if (result?.type !== "tidy_result") throw new Error("Missing review");
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0].actorId).toBe("character:mira");
+    expect(result.proposals).toHaveLength(1);
+    expect(host.writes).not.toHaveBeenCalled();
+    await host.receive({ type: "apply_tidy", chatId: "chat", requestId: "tidy", proposalIds: [result.proposals[0].id] });
+    expect(host.sent.at(-1)).toMatchObject({ type: "tidy_applied", applied: 1 });
+    expect(host.quiet).toHaveBeenCalledTimes(2);
+  });
 });
