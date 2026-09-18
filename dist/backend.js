@@ -2286,7 +2286,7 @@ ${message.content}`).join("\n"), connection.model);
 function controllerTokenCounter(connection, userId, signal) {
   return (value) => countTextTokens(value, connection, userId, signal);
 }
-async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal, onProgress) {
+async function quietJson(prompt, systemPrompt, schemaName, schema, settings, userId, fallbackConnectionId, resolvedConnection, signal, onProgress, chatId) {
   const connection = resolvedConnection ?? await resolveConnection(settings, userId, fallbackConnectionId, signal);
   onProgress?.("queued");
   const result = await withControllerSlot(userId, settings.controllerParallelRequests, signal, async () => {
@@ -2319,6 +2319,7 @@ async function quietJson(prompt, systemPrompt, schemaName, schema, settings, use
       }],
       reasoning: { source: "off" },
       ...connection.id ? { connection_id: connection.id } : {},
+      ...chatId ? { chat_id: chatId } : {},
       userId,
       signal: requestSignal
     }), signal, (settings.controllerTimeoutSeconds ?? 120) * 1e3);
@@ -2471,7 +2472,8 @@ async function analyzeMessagesOnce(input) {
     input.fallbackConnectionId,
     connection,
     input.signal,
-    input.onProgress
+    input.onProgress,
+    input.chatId
   );
   input.signal?.throwIfAborted();
   if (!result.parsed) throw new UnusableControllerOutput("The LumiMind controller returned no parseable structured result.");
@@ -2525,7 +2527,8 @@ Return a complete corrected result for this entire analysis_batch, including eve
         input.fallbackConnectionId,
         connection,
         input.signal,
-        input.onProgress
+        input.onProgress,
+        input.chatId
       );
       input.signal?.throwIfAborted();
       retryRaw = corrective.raw;
@@ -2607,7 +2610,7 @@ ${JSON.stringify(input.character)}
 </character_card>`,
     "Use schemaVersion 1 and updatedAt equal to the current Unix time in milliseconds."
   ].join("\n\n").slice(0, 8e4);
-  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal);
+  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal, input.onProgress, input.chatId);
   const normalized = normalizeSeed(result.parsed);
   if (!normalized || !Object.keys(asObject2(asObject2(result.parsed).core)).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid mind seed.");
   if (!normalized.core.selfConcept && ![
@@ -2641,7 +2644,7 @@ ${boundedLore}
 </npc_lore>`,
     "Return only characterization supported by this lore."
   ].join("\n\n");
-  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal);
+  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, void 0, input.signal, input.onProgress, input.chatId);
   const raw = asObject2(result.parsed);
   if (!Object.keys(raw).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid NPC core draft.");
   const core = normalizeCore(raw);
@@ -2740,7 +2743,9 @@ ${renderMessages(input.history)}
     input.userId,
     input.fallbackConnectionId,
     connection,
-    input.signal
+    input.signal,
+    input.onProgress,
+    input.chatId
   );
   input.signal?.throwIfAborted();
   const raw = asObject2(result.parsed);
@@ -2864,6 +2869,7 @@ async function testController(input) {
       settings,
       userId: input.userId,
       fallbackConnectionId: input.fallbackConnectionId,
+      chatId: input.chatId,
       messages: [{ id: "controller-test-scene", role: "assistant", index_in_chat: 0, content: "Mira stands alone outside a locked observatory. She believes her missing notebook is inside because she saw it through the window. She wants to retrieve it before the rain begins. Mira feels worried about the approaching storm and plans to ask the caretaker for a key. No other person is present." }],
       recentContext: [],
       compactState: []
@@ -3670,6 +3676,7 @@ async function reconcileChat(userId, chatId, force = false, updateNow = false) {
         settings.analysisContextMessageLimit
       );
       const result = await analyzeMessages({
+        chatId,
         messages: batch,
         recentContext,
         compactState: compactStateForController(timeline, settings),
@@ -3823,6 +3830,7 @@ async function runTidy(userId, chatId, requestId, requestedActorIds) {
       const snapshot = actorSnapshots.get(actor.id);
       try {
         const actorProposals = await generateMindTidyProposals({
+          chatId,
           actor: snapshot.actor,
           mind: snapshot.mind,
           knownActors,
@@ -4153,6 +4161,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
           target,
           settings,
           userId,
+          chatId: message.chatId,
           fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, target.connectionId)
         });
         send({ type: "test_controller_result", requestId: message.requestId, result }, userId);
@@ -4364,6 +4373,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!lore) throw new Error("Provide NPC lore, or choose a Cortex character with a description or facts.");
       const settings = await getSettings(userId);
       const core = await generateNpcCoreDraft({
+        chatId: message.chatId,
         actorName,
         lore,
         fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, settings.controllerConnectionId),

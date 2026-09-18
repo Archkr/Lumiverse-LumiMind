@@ -753,6 +753,7 @@ async function reconcileChat(userId: string, chatId: string, force = false, upda
         settings.analysisContextMessageLimit,
       );
       const result = await analyzeMessages({
+        chatId,
         messages: batch,
         recentContext,
         compactState: compactStateForController(timeline, settings),
@@ -921,6 +922,7 @@ async function runTidy(userId: string, chatId: string, requestId: string, reques
       const snapshot = actorSnapshots.get(actor.id)!;
       try {
         const actorProposals = await generateMindTidyProposals({
+          chatId,
           actor: snapshot.actor,
           mind: snapshot.mind,
           knownActors,
@@ -1260,7 +1262,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         const settings = normalizeSettings(message.settings);
         const target = { connectionId: typeof message.target.connectionId === "string" ? message.target.connectionId : null,
           model: typeof message.target.model === "string" ? message.target.model : null };
-        const result = await testController({ target, settings, userId,
+        const result = await testController({ target, settings, userId, chatId: message.chatId,
           fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, target.connectionId) });
         send({ type: "test_controller_result", requestId: message.requestId, result }, userId);
       } else if (message.type === "repair_preview") {
@@ -1466,6 +1468,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
       if (!lore) throw new Error("Provide NPC lore, or choose a Cortex character with a description or facts.");
       const settings = await getSettings(userId);
       const core = await generateNpcCoreDraft({
+        chatId: message.chatId,
         actorName,
         lore,
         fallbackConnectionId: await currentChatConnectionId(userId, message.chatId, settings.controllerConnectionId),

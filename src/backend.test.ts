@@ -69,7 +69,11 @@ describe("current controller connection", () => {
     host.quiet.mockResolvedValue({ content: JSON.stringify({ proposals: [], actorMentions: [], changes: [], core: { selfConcept: "A patient scout." }, selfConcept: "A patient scout." }) });
     await host.receive({ ...request, activeConnectionId: "zai-profile" });
     expect(host.quiet).toHaveBeenCalled();
-    for (const [call] of host.quiet.mock.calls) expect(call.connection_id).toBe("zai-profile");
+    for (const [call] of host.quiet.mock.calls) {
+      expect(call.connection_id).toBe("zai-profile");
+      if ("chatId" in request) expect(call.chat_id).toBe(request.chatId);
+      else expect(call).not.toHaveProperty("chat_id");
+    }
   });
 
   it.each([

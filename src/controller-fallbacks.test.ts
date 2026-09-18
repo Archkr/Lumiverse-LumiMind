@@ -59,13 +59,15 @@ describe("controller fallbacks", () => {
   it("isolates model overrides, counts with the backup tokenizer, and restarts at primary", async () => {
     const quiet = vi.fn().mockRejectedValueOnce(new Error("down")).mockResolvedValue(response(valid));
     const spindle = host(quiet);
-    const result = await analyze();
+    const result = await analyze({ chatId: "routing-chat" });
     expect(quiet.mock.calls.map(([call]) => [call.connection_id, call.parameters.model])).toEqual([["primary", "primary-override"], ["backup", ""]]);
+    expect(quiet.mock.calls.map(([call]) => call.chat_id)).toEqual(["routing-chat", "routing-chat"]);
     expect(result.meta).toMatchObject({ connectionId: "backup", model: "backup-default" });
     expect(spindle.tokens.countText.mock.calls.some(([, options]) => options.model === "backup-default")).toBe(true);
     expect(result.telemetry.connectionAttempts?.map((attempt) => attempt.outcome)).toEqual(["request_failed", "success"]);
-    await analyze();
+    await analyze({ chatId: "other-chat" });
     expect(quiet.mock.calls[2][0].connection_id).toBe("primary");
+    expect(quiet.mock.calls[2][0].chat_id).toBe("other-chat");
   });
 
   it("falls back on malformed structured output but accepts healthy no-change analysis", async () => {
@@ -80,8 +82,9 @@ describe("controller fallbacks", () => {
   it("bounds bootstrap corrections and retains the earliest partial result after exhaustion", async () => {
     const quiet = vi.fn().mockResolvedValue(response({ actorMentions: valid.actorMentions, changes: [] }));
     host(quiet);
-    const result = await analyze({ messages: [{ ...messages[0], content: "Mira waits for rescue. ".repeat(30) }] });
+    const result = await analyze({ chatId: "retry-chat", messages: [{ ...messages[0], content: "Mira waits for rescue. ".repeat(30) }] });
     expect(quiet).toHaveBeenCalledTimes(6);
+    expect(quiet.mock.calls.every(([call]) => call.chat_id === "retry-chat")).toBe(true);
     expect(result.meta.connectionId).toBe("primary");
     expect(result.telemetry.warningCodes).toContain("empty_nontrivial_batch");
     expect(result.telemetry.connectionAttempts).toHaveLength(3);

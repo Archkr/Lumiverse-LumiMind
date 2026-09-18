@@ -738,6 +738,7 @@ async function quietJson(
   resolvedConnection?: ResolvedConnection,
   signal?: AbortSignal,
   onProgress?: (phase: ControllerPhase) => void,
+  chatId?: string | null,
 ): Promise<{
   parsed: unknown;
   raw: string;
@@ -781,6 +782,7 @@ async function quietJson(
       }],
       reasoning: { source: "off" },
       ...(connection.id ? { connection_id: connection.id } : {}),
+      ...(chatId ? { chat_id: chatId } : {}),
       userId,
       signal: requestSignal,
     } as unknown as Parameters<typeof spindle.generate.quiet>[0]), signal, (settings.controllerTimeoutSeconds ?? 120) * 1000);
@@ -971,6 +973,7 @@ async function analyzeMessagesOnce(input: ControllerHooks & {
     connection,
     input.signal,
     input.onProgress,
+    input.chatId,
   );
   input.signal?.throwIfAborted();
   if (!result.parsed) throw new UnusableControllerOutput("The LumiMind controller returned no parseable structured result.");
@@ -1015,6 +1018,7 @@ async function analyzeMessagesOnce(input: ControllerHooks & {
         connection,
         input.signal,
         input.onProgress,
+        input.chatId,
       );
       input.signal?.throwIfAborted();
       retryRaw = corrective.raw;
@@ -1106,7 +1110,7 @@ async function generateSeedDraftOnce(input: ControllerHooks & {
     `<character_card>\n${JSON.stringify(input.character)}\n</character_card>`,
     "Use schemaVersion 1 and updatedAt equal to the current Unix time in milliseconds.",
   ].join("\n\n").slice(0, 80_000);
-  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal);
+  const result = await quietJson(prompt, SEED_SYSTEM_PROMPT, "lumi_mind_seed_v1", SEED_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal, input.onProgress, input.chatId);
   const normalized = normalizeSeed(result.parsed);
   if (!normalized || !Object.keys(asObject(asObject(result.parsed).core)).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid mind seed.");
   if (!normalized.core.selfConcept && ![...normalized.core.values, ...normalized.core.desires, ...normalized.core.fears, ...normalized.core.boundaries, ...normalized.core.notes,
@@ -1136,7 +1140,7 @@ async function generateNpcCoreDraftOnce(input: ControllerHooks & {
     `<npc_lore>\n${boundedLore}\n</npc_lore>`,
     "Return only characterization supported by this lore.",
   ].join("\n\n");
-  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal);
+  const result = await quietJson(prompt, NPC_CORE_SYSTEM_PROMPT, "lumi_mind_npc_core_v1", CORE_SCHEMA, input.settings, input.userId, input.fallbackConnectionId, undefined, input.signal, input.onProgress, input.chatId);
   const raw = asObject(result.parsed);
   if (!Object.keys(raw).length) throw new UnusableControllerOutput("The LumiMind controller returned an invalid NPC core draft.");
   const core = normalizeCore(raw);
@@ -1195,7 +1199,7 @@ function normalizeTidyItem(value: unknown, knownActorIds: Set<string>): MindTidy
   };
 }
 
-async function generateMindTidyProposalsOnce(input: {
+async function generateMindTidyProposalsOnce(input: ControllerHooks & {
   actor: ActorRecord;
   mind: ActorMind;
   knownActors: ActorRecord[];
@@ -1244,6 +1248,8 @@ async function generateMindTidyProposalsOnce(input: {
     input.fallbackConnectionId,
     connection,
     input.signal,
+    input.onProgress,
+    input.chatId,
   );
   input.signal?.throwIfAborted();
   const raw = asObject(result.parsed);
@@ -1294,6 +1300,7 @@ async function generateMindTidyProposalsOnce(input: {
 }
 
 interface ControllerHooks {
+  chatId?: string | null;
   onProgress?: (phase: ControllerPhase) => void;
   onRun?: (run: ControllerRun) => void;
   fallbackConnectionId?: string | null;
@@ -1389,7 +1396,7 @@ export function generateMindTidyProposals(input: Parameters<typeof generateMindT
 }
 
 export async function testController(input: {
-  target: ControllerTarget; settings: LumiMindSettings; userId: string; fallbackConnectionId?: string | null;
+  target: ControllerTarget; settings: LumiMindSettings; userId: string; fallbackConnectionId?: string | null; chatId?: string | null;
 }): Promise<ControllerTestResult> {
   const started = Date.now();
   const settings = { ...input.settings, controllerConnectionId: input.target.connectionId, controllerModel: input.target.model, controllerFallbacks: [], personaMindEnabled: true, characterCardDirectorMode: false };
@@ -1397,7 +1404,7 @@ export async function testController(input: {
   const meta = { connectionId: connection.id, provider: connection.provider, model: connection.model };
   try {
     const result = await analyzeMessagesOnce({
-      settings, userId: input.userId, fallbackConnectionId: input.fallbackConnectionId,
+      settings, userId: input.userId, fallbackConnectionId: input.fallbackConnectionId, chatId: input.chatId,
       messages: [{ id: "controller-test-scene", role: "assistant", index_in_chat: 0, content: "Mira stands alone outside a locked observatory. She believes her missing notebook is inside because she saw it through the window. She wants to retrieve it before the rain begins. Mira feels worried about the approaching storm and plans to ask the caretaker for a key. No other person is present." }],
       recentContext: [], compactState: [],
     });
