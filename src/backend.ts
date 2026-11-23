@@ -78,7 +78,7 @@ import {
 const INTERCEPTOR_PRIORITY = 125;
 const ANALYSIS_BATCH_SIZE = 6;
 const RECONCILE_DEBOUNCE_MS = 650;
-const EXTENSION_VERSION = "0.3.3";
+const EXTENSION_VERSION = "0.3.4";
 
 type GenerationContext = {
   generationId: string;
@@ -279,7 +279,7 @@ async function getTimeline(chatId: string, userId: string): Promise<ChatTimeline
 }
 
 function send(message: BackendToFrontend, userId: string): void {
-  (spindle.sendToFrontend as unknown as (payload: unknown, targetUserId?: string) => void)(message, userId);
+  spindle.sendToFrontend(message, userId);
 }
 
 function notice(userId: string, tone: "info" | "success" | "warning" | "error", message: string): void {
@@ -288,7 +288,7 @@ function notice(userId: string, tone: "info" | "success" | "warning" | "error", 
 
 function hasPermission(id: string): boolean {
   try {
-    return spindle.permissions.has(id as never);
+    return spindle.permissions.has(id);
   } catch {
     return false;
   }
@@ -377,7 +377,7 @@ async function buildDeveloperDiagnostics(userId: string, requestedChatId?: strin
     hasPermission("generation") ? spindle.connections.list(userId).catch(() => []) : Promise.resolve([]),
     chatId ? getTimeline(chatId, userId).catch(() => null) : Promise.resolve(null),
     chatId && hasPermission("chat_mutation")
-      ? (spindle as unknown as { chat: { getMessages(chatId: string, userId?: string): Promise<unknown> } }).chat.getMessages(chatId, userId).catch(() => null)
+      ? spindle.chat.getMessages(chatId).catch(() => null)
       : Promise.resolve(null),
     active.characterId && hasPermission("characters") ? spindle.characters.get(active.characterId, userId).catch(() => null) : Promise.resolve(null),
     hasPermission("personas") ? spindle.personas.getActive(userId).catch(() => null) : Promise.resolve(null),
@@ -428,9 +428,8 @@ function normalizeChatMessages(value: unknown): ChatMessageLike[] {
   });
 }
 
-async function getChatMessages(chatId: string, userId: string): Promise<ChatMessageLike[]> {
-  const api = (spindle as unknown as { chat: { getMessages(chatId: string, userId?: string): Promise<unknown> } }).chat;
-  return sortMessages(normalizeChatMessages(await api.getMessages(chatId, userId)));
+async function getChatMessages(chatId: string, _userId?: string): Promise<ChatMessageLike[]> {
+  return sortMessages(normalizeChatMessages(await spindle.chat.getMessages(chatId)));
 }
 
 function seedFromCharacter(character: CharacterDTO): MindSeedV1 {
@@ -1640,4 +1639,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
   }
 });
 
-spindle.log.info("LumiMind v0.3.3 loaded — subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.4 loaded — subjective timeline engine ready.");

@@ -16,6 +16,12 @@ async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], 
     list: vi.fn(async () => [{ id: "default", provider: "openrouter", model: "test-model", is_default: true }]),
   };
   const chatMetadata: Record<string, unknown> = {};
+  const getMessages = vi.fn(async (_chatId: string, options?: unknown) => {
+    if (options !== undefined && options !== null && (typeof options !== "object" || Array.isArray(options))) {
+      throw new Error("options must be an object");
+    }
+    return structuredClone(transcript);
+  });
   vi.stubGlobal("spindle", {
     onFrontendMessage: (callback: typeof receive) => { receive = callback; },
     registerInterceptor: (callback: typeof intercept) => { intercept = callback; },
@@ -23,7 +29,7 @@ async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], 
     rpcPool: { sync: vi.fn(), unregister: vi.fn() }, log: { info: vi.fn(), warn: vi.fn() },
     sendToFrontend: (message: BackendToFrontend) => sent.push(message),
     userStorage: { getJson: vi.fn(async (key: string, options: { fallback: unknown }) => structuredClone(stored.get(key) ?? options.fallback)), setJson: writes },
-    chat: { getMessages: vi.fn(async () => structuredClone(transcript)) },
+    chat: { getMessages },
     chats: { get: vi.fn(async () => ({ id: "chat", metadata: chatMetadata })) },
     characters: { get: vi.fn(async () => ({ id: "mira", name: "Mira", description: "A patient scout." })) },
     connections,
@@ -31,7 +37,7 @@ async function backend(timeline: ChatTimelineV1, transcript: ChatMessageLike[], 
     tokens: { countText: vi.fn(async (text: string) => ({ total_tokens: text.length, model: "test-model", tokenizer_name: "test", approximate: false })) },
   });
   await import("./backend");
-  return { receive: (message: FrontendToBackend, userId = "user") => receive(message, userId), intercept, stored, sent, permissions, quiet, writes, connections, chatMetadata };
+  return { receive: (message: FrontendToBackend, userId = "user") => receive(message, userId), intercept, stored, sent, permissions, quiet, writes, connections, chatMetadata, getMessages };
 }
 function fixture() {
   const timeline = createTimeline("chat"); timeline.active = true; timeline.updateMode = "manual";
@@ -259,6 +265,22 @@ describe("first activation", () => {
     expect(saved.lastValidMessageIndex).toBe(49);
     expect(saved.records).toHaveLength(50);
     expect(saved.health).toBe("ready");
+  });
+
+  it("reads chat history without passing a userId string as getMessages options", async () => {
+    const host = await backend(createTimeline("chat"), history());
+    await host.receive({ type: "activation_preview", chatId: "chat", requestId: "preview" });
+    expect(host.sent.at(-1)).toMatchObject({
+      type: "activation_preview",
+      requestId: "preview",
+      chatId: "chat",
+      messageCount: 50,
+    });
+    await host.receive({ type: "developer_report", chatId: "chat", requestId: "diag" });
+    expect(host.sent.at(-1)).toMatchObject({ type: "developer_report", requestId: "diag" });
+    for (const args of host.getMessages.mock.calls) {
+      expect(args).toEqual(["chat"]);
+    }
   });
 
   it.each(["update_now", "rebuild"] as const)("releases a stalled first request when %s cancels it, even without host acknowledgement", async (type) => {

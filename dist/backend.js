@@ -3093,7 +3093,7 @@ function redactDiagnosticCredentials(value) {
 var INTERCEPTOR_PRIORITY = 125;
 var ANALYSIS_BATCH_SIZE = 6;
 var RECONCILE_DEBOUNCE_MS = 650;
-var EXTENSION_VERSION = "0.3.3";
+var EXTENSION_VERSION = "0.3.4";
 var timelines = /* @__PURE__ */ new Map();
 var settingsCache = /* @__PURE__ */ new Map();
 var activeChats = /* @__PURE__ */ new Map();
@@ -3335,7 +3335,7 @@ async function buildDeveloperDiagnostics(userId, requestedChatId) {
     getSettings(userId),
     hasPermission("generation") ? spindle.connections.list(userId).catch(() => []) : Promise.resolve([]),
     chatId ? getTimeline(chatId, userId).catch(() => null) : Promise.resolve(null),
-    chatId && hasPermission("chat_mutation") ? spindle.chat.getMessages(chatId, userId).catch(() => null) : Promise.resolve(null),
+    chatId && hasPermission("chat_mutation") ? spindle.chat.getMessages(chatId).catch(() => null) : Promise.resolve(null),
     active.characterId && hasPermission("characters") ? spindle.characters.get(active.characterId, userId).catch(() => null) : Promise.resolve(null),
     hasPermission("personas") ? spindle.personas.getActive(userId).catch(() => null) : Promise.resolve(null)
   ]);
@@ -3379,9 +3379,8 @@ function normalizeChatMessages(value) {
     }];
   });
 }
-async function getChatMessages(chatId, userId) {
-  const api = spindle.chat;
-  return sortMessages(normalizeChatMessages(await api.getMessages(chatId, userId)));
+async function getChatMessages(chatId, _userId) {
+  return sortMessages(normalizeChatMessages(await spindle.chat.getMessages(chatId)));
 }
 function seedFromCharacter(character) {
   const extension = asObject3(character.extensions?.[EXTENSION_KEY]);
@@ -4544,4 +4543,4 @@ spindle.onFrontendMessage(async (payload, userId) => {
     spindle.log.warn(`LumiMind frontend action failed: ${detail}`);
   }
 });
-spindle.log.info("LumiMind v0.3.3 loaded \u2014 subjective timeline engine ready.");
+spindle.log.info("LumiMind v0.3.4 loaded \u2014 subjective timeline engine ready.");

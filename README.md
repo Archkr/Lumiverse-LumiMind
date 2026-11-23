@@ -6,7 +6,7 @@
 
 **Timeline-aware subjective minds for Lumiverse.**
 
-[![Version](https://img.shields.io/badge/version-0.3.3-8b7cf6)](./spindle.json)
+[![Version](https://img.shields.io/badge/version-0.3.4-8b7cf6)](./spindle.json)
 [![Lumiverse](https://img.shields.io/badge/Lumiverse-%E2%89%A5%201.0.6-d4a35a)](https://github.com/prolix-oc/Lumiverse)
 [![Status](https://img.shields.io/badge/status-stable-6f9f78)](https://github.com/Archkr/Lumiverse-LumiMind)
 [![License](https://img.shields.io/badge/license-Lumiverse%20Community%202.0-6f9f78)](./LICENSE.md)
@@ -21,7 +21,7 @@ One character can trust a lie. Another can notice the truth but keep it secret. 
 
 It supports ordinary single-card roleplay, group chats, player personas, and director-style cards that portray an entire cast.
 
-LumiMind `0.3.3` hardens background state operations: existing state can be updated, resolved, or abandoned, while permanent deletion requires manual editing or Tidy approval. Invalid operations receive at most one corrective pass per connection, and Diagnostics reports emitted and accepted operation counts. Tidy also compares current minds against the history selected by **Chat history messages**, with individual **Approve** and **Decline** decisions before **Send** applies approved edits. Existing analysis remains compatible without a rebuild.
+LumiMind `0.3.4` updates Spindle chat history reads for compatibility with `lumiverse-spindle-types` `0.6.80` and current Lumiverse hosts, alongside `0.3.3` background state hardening: existing state can be updated, resolved, or abandoned, while permanent deletion requires manual editing or Tidy approval. Invalid operations receive at most one corrective pass per connection, and Diagnostics reports emitted and accepted operation counts. Tidy also compares current minds against the history selected by **Chat history messages**, with individual **Approve** and **Decline** decisions before **Send** applies approved edits. Existing analysis remains compatible without a rebuild.
 
 > **Privacy note:** “Private” means hidden from normal story output and handled as private prompt context. Mind data is stored as ordinary JSON; it is not encrypted.
 
@@ -131,7 +131,7 @@ If a substantive batch leaves a genuinely uninitialized actor without usable men
 | Requirement | Value |
 |---|---|
 | Lumiverse | `1.0.6` or newer |
-| Extension version | `0.3.3` stable |
+| Extension version | `0.3.4` stable |
 | Required for automatic analysis | `generation`, `chat_mutation` |
 | Required for prompt injection | `interceptor` |
 | Controller connection | Dedicated connection, or the chat's pinned connection / current active Lumiverse connection |
